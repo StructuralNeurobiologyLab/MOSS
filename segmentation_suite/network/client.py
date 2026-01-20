@@ -429,6 +429,14 @@ class SyncClient(QObject):
                     self.model_requested.emit(requester)
                 return
 
+            elif msg_type == "session_info":
+                # Host sent session info (e.g., architecture)
+                architecture = payload.get("architecture", "")
+                if architecture:
+                    _log(f"Received session architecture: {architecture}")
+                    self.architecture_received.emit(architecture)
+                return
+
             elif msg_type == "error":
                 error_msg = payload.get("error", "Unknown error")
                 self.error.emit(error_msg)
@@ -553,6 +561,36 @@ class SyncClient(QObject):
                 self.sync_status.emit("Global model received")
             except Exception as e:
                 self.error.emit(f"Failed to deserialize weights: {e}")
+
+    def send_architecture(self, architecture: str):
+        """
+        Send architecture info to the room (host only, for new joiners).
+
+        Args:
+            architecture: Architecture identifier (e.g., 'unet', 'unet_deep_dice')
+        """
+        if not self._connected or not self._loop:
+            return
+
+        asyncio.run_coroutine_threadsafe(
+            self._send_architecture_async(architecture),
+            self._loop
+        )
+
+    async def _send_architecture_async(self, architecture: str):
+        """Async implementation of send_architecture."""
+        if not self._websocket:
+            return
+
+        try:
+            msg = Message(
+                type="session_info",
+                payload={"architecture": architecture}
+            )
+            await self._websocket.send(msg.to_json())
+            _log(f"Sent architecture info: {architecture}")
+        except Exception as e:
+            _log(f"Failed to send architecture: {e}")
 
     def send_weights(self, weights: dict, epoch: int, loss: float,
                     num_samples: int = 1):

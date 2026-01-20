@@ -679,6 +679,7 @@ class TrainingWizard(QMainWindow):
         self._session_client.error.connect(self._on_session_error)
         self._session_client.user_list_updated.connect(self._on_user_list_updated)
         self._session_client.sync_status.connect(self._on_sync_status)
+        self._session_client.architecture_received.connect(self._on_architecture_received)
 
         self._session_client.connect_relay(code, name.strip(), DEFAULT_RELAY_URL)
         self.session_create_btn.setEnabled(False)
@@ -694,6 +695,8 @@ class TrainingWizard(QMainWindow):
         self._update_session_ui(connected=False)
         # Disable multi-user on training page
         self.training_page.disable_multi_user()
+        # Unlock architecture
+        self.training_page.unlock_architecture()
 
     def _on_room_created(self, room_code: str):
         """Handle room created."""
@@ -702,6 +705,10 @@ class TrainingWizard(QMainWindow):
         self._update_session_ui(connected=True)
         # Enable multi-user on training page as host
         self.training_page.set_multi_user_state(None, self._session_client, is_relay_host=True)
+        # Lock architecture - host's current architecture becomes the session architecture
+        current_arch = self.training_page.current_architecture
+        self.training_page.lock_architecture(current_arch)
+        print(f"[Wizard] Locked architecture to: {current_arch}")
 
     def _on_room_joined(self, room_code: str):
         """Handle room joined."""
@@ -710,12 +717,19 @@ class TrainingWizard(QMainWindow):
         self._update_session_ui(connected=True)
         # Enable multi-user on training page as joinee
         self.training_page.set_multi_user_state(None, self._session_client, is_relay_host=False)
+        # Architecture will be locked when architecture_received signal fires
+
+    def _on_architecture_received(self, architecture: str):
+        """Handle architecture received from host - lock to that architecture."""
+        print(f"[Wizard] Received session architecture: {architecture}")
+        self.training_page.lock_architecture(architecture)
 
     def _on_session_disconnected(self):
         """Handle disconnection."""
         print("[Wizard] Disconnected from session")
         self._update_session_ui(connected=False)
         self.training_page.disable_multi_user()
+        self.training_page.unlock_architecture()
 
     def _on_session_error(self, error: str):
         """Handle session error."""

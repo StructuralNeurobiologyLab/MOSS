@@ -2729,13 +2729,16 @@ class InteractiveTrainingPage(QWidget):
         """
         Handle when a user joins the relay room (host only).
 
-        Share current weights with the new user so they can start from the same model.
+        Share architecture info and current weights with the new user.
         """
         if not self._is_host or not self._sync_client:
             return
 
-        print(f"[MultiUser] User '{display_name}' joined - sharing current weights...")
+        print(f"[MultiUser] User '{display_name}' joined - sharing architecture and weights...")
         self._show_temp_status(f"{display_name} joined - sharing model...")
+
+        # Send architecture info first so joinee can lock to it
+        self._sync_client.send_architecture(self.current_architecture)
 
         # Share current checkpoint weights
         self._share_current_weights_to_relay()
@@ -2744,13 +2747,16 @@ class InteractiveTrainingPage(QWidget):
         """
         Handle when a user requests the global model (host only, relay mode).
 
-        Share current weights with the requesting user.
+        Share architecture and current weights with the requesting user.
         """
         if not self._is_host or not self._sync_client:
             return
 
-        print(f"[MultiUser] User '{requester_id}' requested model - sharing current weights...")
+        print(f"[MultiUser] User '{requester_id}' requested model - sharing architecture and weights...")
         self._show_temp_status("Sharing model with user...")
+
+        # Send architecture info first
+        self._sync_client.send_architecture(self.current_architecture)
 
         # Share current checkpoint weights
         self._share_current_weights_to_relay()
