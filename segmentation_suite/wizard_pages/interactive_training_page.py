@@ -1074,11 +1074,7 @@ class InteractiveTrainingPage(QWidget):
             self.image_files = []
             self.image_source = None
             self.current_index = 0
-            # Clear the canvas
-            if hasattr(self, 'canvas') and self.canvas:
-                self.canvas.clear_all_layers()
-            # Force reload on next showEvent
-            self._pending_images_dir = None
+            # Canvas will be updated when new images are loaded via scan_and_load_initial
 
         self.config = config
         self.project_dir = new_project_dir
