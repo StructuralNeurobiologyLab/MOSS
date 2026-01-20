@@ -32,9 +32,6 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 # Install MOSS
-pip install segmentation_suite-1.0.0-py3-none-any.whl
-
-# Or install from source:
 pip install -e .
 ```
 
