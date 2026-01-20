@@ -2388,9 +2388,13 @@ class InteractiveTrainingPage(QWidget):
         self._sync_interval_epochs = self.config.get('multi_user_sync_interval', 5)
         self._blend_ratio = self.config.get('multi_user_blend_ratio', 0.5)
 
-        # Update train worker export interval if it exists
+        # Update train worker export interval and connect signal if it exists
         if self.train_worker:
             self.train_worker.set_weights_export_interval(self._sync_interval_epochs)
+            try:
+                self.train_worker.weights_exported.connect(self._on_weights_exported)
+            except TypeError:
+                pass  # Already connected
 
         # If host, initialize server with current model weights (so joiners receive them)
         if is_host and server:
