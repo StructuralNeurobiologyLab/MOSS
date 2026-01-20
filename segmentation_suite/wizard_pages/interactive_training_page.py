@@ -1875,6 +1875,11 @@ class InteractiveTrainingPage(QWidget):
         if not self.project_dir:
             return
 
+        # Don't save if image_source is not set (project not fully loaded)
+        if not self.image_source:
+            print("[SaveConfig] Skipping save - no image_source set")
+            return
+
         config = self._build_project_config()
         save_project_config(str(self.project_dir), config)
 
