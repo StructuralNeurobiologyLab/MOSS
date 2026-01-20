@@ -37,10 +37,10 @@ dependencies = [
 ]
 
 [project.scripts]
-segmentation-suite = "segmentation_suite.launcher:main"
+moss = "segmentation_suite.launcher:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/segmentation-suite"
+Homepage = "https://github.com/nelsmedina/MOSS"
 
 [tool.setuptools.packages.find]
 where = ["."]

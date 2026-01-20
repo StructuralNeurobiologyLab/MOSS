@@ -18,8 +18,8 @@ A PyQt6-based interactive segmentation tool with U-Net training, prediction, and
 
 ```bash
 # Create a virtual environment (recommended)
-python -m venv segmentation-env
-source segmentation-env/bin/activate  # On Windows: segmentation-env\Scripts\activate
+python -m venv moss-env
+source moss-env/bin/activate  # On Windows: moss-env\Scripts\activate
 
 # Install PyTorch first (select appropriate version for your platform)
 # For Mac (CPU/MPS):
@@ -31,7 +31,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 # For CPU only:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-# Install segmentation-suite
+# Install MOSS
 pip install segmentation_suite-1.0.0-py3-none-any.whl
 
 # Or install from source:
@@ -45,7 +45,7 @@ pip install -e .
 conda env create -f environment.yml
 
 # Activate environment
-conda activate segmentation-suite
+conda activate moss
 
 # Install the package
 pip install -e .
@@ -66,7 +66,7 @@ pip install -e .
 After installation, run:
 
 ```bash
-segmentation-suite
+moss
 ```
 
 Or run as a Python module:
