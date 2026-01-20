@@ -2809,7 +2809,37 @@ class InteractiveTrainingPage(QWidget):
                 import traceback
                 traceback.print_exc()
         else:
-            print(f"[MultiUser] No checkpoint to share - new user will start from scratch")
+            # No checkpoint exists - create fresh initialized model and share it
+            # This ensures everyone starts from the same random weights
+            print(f"[MultiUser] No checkpoint found - creating fresh {self.current_architecture} model...")
+            try:
+                from ..models.architectures import get_model_class
+
+                # Create fresh model with random initialization
+                model_class = get_model_class(self.current_architecture)
+                fresh_model = model_class()
+                weights = fresh_model.state_dict()
+
+                # Save as initial checkpoint so host uses same weights
+                initial_checkpoint = {
+                    'model_state': weights,
+                    'epoch': 0,
+                    'train_loss': 0.0,
+                    'architecture': self.current_architecture
+                }
+                torch.save(initial_checkpoint, checkpoint_path)
+                print(f"[MultiUser] Saved initial checkpoint to {checkpoint_path}")
+
+                # Share the fresh weights with all users
+                print(f"[MultiUser] Sharing fresh initialized weights...")
+                self._sync_client.send_weights(weights, 0, 0.0, 1)
+                self._last_model_share_time = now
+                self._show_temp_status("Shared fresh model with session")
+
+            except Exception as e:
+                print(f"[MultiUser] Error creating fresh model: {e}")
+                import traceback
+                traceback.print_exc()
 
     def _create_session(self):
         """Create a multi-user session from the Training page."""
