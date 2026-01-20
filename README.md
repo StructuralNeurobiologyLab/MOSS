@@ -145,6 +145,20 @@ Reduce batch size in the training settings or use a smaller tile size.
 
 Supported formats: TIFF (.tif, .tiff), PNG, JPEG. For best results, use single-channel grayscale TIFF images.
 
+## Author
+
+**Nelson Medina** - Creator and primary developer
+GitHub: [@nelsmedina](https://github.com/nelsmedina)
+
+## Citation
+
+If you use MOSS in your research, please cite:
+
+```
+Medina, N. (2025). MOSS: Microscopy Oriented Segmentation with Supervision [Computer software].
+https://github.com/nelsmedina/MOSS
+```
+
 ## License
 
 MIT License
