@@ -1,0 +1,52 @@
+# User configuration (contains personal relay URLs)
+segmentation_suite/network/relay_config.txt
+
+# Node.js (relay server)
+node_modules/
+relay_server/node_modules/
+.wrangler/
+relay_server/.wrangler/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PyTorch
+*.pth
+*.pt
+
+# Logs
+*.log

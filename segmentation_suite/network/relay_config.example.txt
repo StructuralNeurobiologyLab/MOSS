@@ -1,0 +1,12 @@
+# Relay Server URL Configuration
+#
+# To enable internet-based multi-user sessions:
+# 1. Copy this file to: relay_config.txt
+# 2. Deploy your own relay server following: relay_server/SETUP_GUIDE.md
+# 3. Paste your relay URL below (uncomment the line)
+#
+# Format: wss://segmentation-relay.YOURSUBDOMAIN.workers.dev/ws
+#
+# Leave blank or keep commented to disable relay mode (LAN-only).
+
+# wss://segmentation-relay.yoursubdomain.workers.dev/ws

@@ -1,0 +1,24 @@
+# Core dependencies
+PyQt6>=6.4.0
+numpy>=1.24.0
+scipy>=1.10.0
+Pillow>=9.0.0
+
+# PyTorch - install appropriate version for your platform
+# For CPU only: pip install torch torchvision
+# For CUDA: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# For Mac MPS: pip install torch torchvision (default pip install works)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image processing
+opencv-python>=4.7.0
+scikit-image>=0.20.0
+tifffile>=2023.1.0
+
+# Utilities
+matplotlib>=3.7.0
+tqdm>=4.65.0
+
+# Multi-user networking (optional)
+websockets>=12.0

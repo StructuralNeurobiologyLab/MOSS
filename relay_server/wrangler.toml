@@ -1,0 +1,15 @@
+# Cloudflare Workers configuration for Segmentation Suite Relay
+name = "segmentation-relay"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Durable Objects for WebSocket room management
+[durable_objects]
+bindings = [
+  { name = "ROOMS", class_name = "Room" }
+]
+
+# Required for Durable Objects (free plan requires new_sqlite_classes)
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]

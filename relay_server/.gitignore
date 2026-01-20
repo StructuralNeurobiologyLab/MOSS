@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Wrangler local development files
+.wrangler/
+
+# Build artifacts
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files (none needed, but good practice)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
