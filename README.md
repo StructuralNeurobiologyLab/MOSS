@@ -16,22 +16,30 @@ A PyQt6-based interactive segmentation tool with U-Net training, prediction, and
 
 ### Option 1: pip install (recommended)
 
+#### Mac (Apple Silicon or Intel)
+
 ```bash
-# Create a virtual environment (recommended)
+python -m venv moss-env
+source moss-env/bin/activate
+pip install torch torchvision
+pip install -e .
+```
+
+#### Linux with NVIDIA GPU (CUDA)
+
+```bash
+python -m venv moss-env
+source moss-env/bin/activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install -e .
+```
+
+#### Linux/Windows CPU only
+
+```bash
 python -m venv moss-env
 source moss-env/bin/activate  # On Windows: moss-env\Scripts\activate
-
-# Install PyTorch first (select appropriate version for your platform)
-# For Mac (CPU/MPS):
-pip install torch torchvision
-
-# For Linux/Windows with CUDA:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-
-# For CPU only:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-
-# Install MOSS
 pip install -e .
 ```
 
