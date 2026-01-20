@@ -156,25 +156,4 @@ MIT License
 
 
 
-  To install on your MacBook:
-
-  Option 1: Just the wheel (simplest)
-  # Copy the wheel file, then:
-  pip install torch torchvision  # Install PyTorch first
-  pip install segmentation_suite-1.0.0-py3-none-any.whl
-  segmentation-suite  # Run it
-
-  Option 2: Full source (for development)
-  # Copy the entire segmentation_suite folder, then:
-  cd segmentation_suite
-  pip install -e .
-  segmentation-suite
-
-  Option 3: Conda environment
-  # Copy the folder, then:
-  cd segmentation_suite
-  conda env create -f environment.yml
-  conda activate segmentation-suite
-  pip install -e .
-  segmentation-suite
 
