@@ -696,8 +696,8 @@ class TrainWorker(QThread):
             # Initialize threading lock for pending data
             self._pending_data_lock = threading.Lock()
 
-            # Initialize snapshot timing
-            self._last_snapshot_time = time.time()
+            # Initialize snapshot timing (0 so first snapshot happens on epoch 1)
+            self._last_snapshot_time = 0
             self._global_batch_count = 0  # Track total batches for loss plot
 
             # Extract config
@@ -934,7 +934,7 @@ class TrainWorker(QThread):
                     if device.type == 'mps':
                         torch.mps.synchronize()
 
-                    # Time-based snapshot check (every N seconds)
+                    # Time-based snapshot for live predictions (every N seconds)
                     if self.snapshot_interval > 0:
                         current_time = time.time()
                         if current_time - self._last_snapshot_time >= self.snapshot_interval:

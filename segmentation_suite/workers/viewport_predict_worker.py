@@ -29,7 +29,8 @@ class ViewportPredictWorker(QThread):
     prediction_ready = pyqtSignal(np.ndarray, tuple)  # prediction, viewport_bounds
 
     # Only reload model every N seconds (avoids conflicts with training)
-    RELOAD_INTERVAL = 15.0  # Increased to reduce reload frequency
+    # Reduced to 5 seconds for more responsive live predictions during training
+    RELOAD_INTERVAL = 5.0
 
     # Minimum file size to consider checkpoint valid (avoid partial writes)
     MIN_CHECKPOINT_SIZE = 1000  # bytes
@@ -66,11 +67,19 @@ class ViewportPredictWorker(QThread):
         self._gpu_available = torch.cuda.is_available()
 
     def set_checkpoint(self, checkpoint_path: str):
-        """Set the model checkpoint to use for predictions."""
+        """Set the model checkpoint to use for predictions.
+
+        Forces a reload if the path changes (not just the same file being modified).
+        """
         self.mutex.lock()
         if checkpoint_path != self.checkpoint_path:
             self.checkpoint_path = checkpoint_path
-            # Don't force reload - let the periodic check handle it safely
+            # Force reload when PATH changes - this is different from a file modification
+            # which is already handled by the periodic mtime check
+            self._force_reload = True
+            # Reset mtime tracking since this is a new file
+            self._last_checkpoint_mtime = 0
+            self._last_checkpoint_size = 0
         self.mutex.unlock()
 
     def set_architecture(self, architecture: str):
@@ -223,7 +232,9 @@ class ViewportPredictWorker(QThread):
             device_info = f"{self.device}"
             if self.device.type == 'cpu':
                 device_info += f" using {torch.get_num_threads()} threads"
-            print(f"Predictor: Loaded model ({self.architecture}) on {device_info}")
+            # Show which checkpoint file was loaded (helps debug snapshot vs main checkpoint)
+            checkpoint_name = os.path.basename(self.checkpoint_path)
+            print(f"Predictor: Loaded {checkpoint_name} ({self.architecture}) on {device_info}")
             return True
 
         except Exception as e:
