@@ -580,6 +580,12 @@ class SyncClient(QObject):
         """Handle binary weight data from the server."""
         # Check if we're in chunked receive mode
         if self._chunk_transfer_id:
+            received = len(self._chunk_buffer)
+            # Only accept chunks until we have the expected number
+            # This prevents chunks from overlapping transfers from mixing in
+            if received >= self._chunk_total:
+                _log(f"Ignoring extra binary chunk (already have {received}/{self._chunk_total})")
+                return
             self._chunk_buffer.append(data)
             received = len(self._chunk_buffer)
             if received % 2 == 0 or received == self._chunk_total:
