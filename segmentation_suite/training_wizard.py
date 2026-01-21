@@ -266,6 +266,26 @@ class TrainingWizard(QMainWindow):
 
         layout.addSpacing(scaled(10))
 
+        # Loss plot section
+        loss_label = QLabel("Training Loss")
+        loss_label.setStyleSheet(f"""
+            QLabel {{
+                color: #aaaaaa;
+                font-size: {scaled(11)}px;
+                padding: {scaled(10)}px {scaled(15)}px {scaled(5)}px {scaled(15)}px;
+            }}
+        """)
+        layout.addWidget(loss_label)
+        self._loss_label = loss_label
+        self._loss_label.setVisible(False)  # Hidden until training starts
+
+        from .widgets import LossPlotWidget
+        self.loss_plot = LossPlotWidget(max_points=500)
+        self.loss_plot.setVisible(False)  # Hidden until training starts
+        layout.addWidget(self.loss_plot)
+
+        layout.addSpacing(scaled(10))
+
         # Close button
         btn_pad = scaled(15)
         close_btn = QPushButton("Close Wizard")
@@ -294,6 +314,8 @@ class TrainingWizard(QMainWindow):
 
         # Training page signals
         self.training_page.training_complete.connect(self._on_training_complete)
+        self.training_page.training_started.connect(self._on_training_started)
+        self.training_page.training_stopped.connect(self._on_training_stopped)
 
         # Reslice page signals
         self.reslice_page.reslice_complete.connect(self._on_reslice_complete)
@@ -338,6 +360,30 @@ class TrainingWizard(QMainWindow):
         self.next_btn.setEnabled(not busy)
         self.skip_btn.setEnabled(not busy)
         self.back_btn.setEnabled(not busy)
+
+    def _on_training_started(self):
+        """Handle training started signal."""
+        # Show loss plot and connect signal
+        self._loss_label.setVisible(True)
+        self.loss_plot.setVisible(True)
+        self.loss_plot.clear()
+
+        # Connect loss updates from training page
+        try:
+            self.training_page.loss_updated.connect(self.loss_plot.add_point)
+        except TypeError:
+            pass  # Already connected
+
+    def _on_training_stopped(self):
+        """Handle training stopped signal."""
+        # Disconnect loss updates
+        try:
+            self.training_page.loss_updated.disconnect(self.loss_plot.add_point)
+        except TypeError:
+            pass  # Already disconnected or never connected
+
+        # Keep the plot visible so user can see final results
+        # It will be cleared on next training start
 
     def _on_step_clicked(self, row: int):
         """Handle step list click."""

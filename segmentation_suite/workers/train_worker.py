@@ -415,6 +415,10 @@ class TrainWorker(QThread):
     sam2_extraction_progress = pyqtSignal(int, int, str)  # current, total, message
     weights_exported = pyqtSignal(dict, int, float)  # weights, epoch, loss - for multi-user sync
 
+    # New signals for multi-user redesign
+    snapshot_created = pyqtSignal(dict, int)  # weights, snapshot_id - time-based snapshot for predictions
+    loss_updated = pyqtSignal(float, int)  # loss_value, batch_number - for live plot
+
     def __init__(self, config: dict):
         super().__init__()
         self.config = config
@@ -426,6 +430,16 @@ class TrainWorker(QThread):
         # Multi-user sync settings
         self.weights_export_interval = config.get('weights_export_interval', 5)  # Export every N epochs
         self._last_export_epoch = -1
+
+        # Time-based snapshot settings (for multi-user redesign)
+        self.snapshot_interval = config.get('snapshot_interval', 30.0)  # seconds
+        self._last_snapshot_time = 0.0
+        self._snapshot_id = 0
+        self._snapshot_checkpoint_path = None  # Path for snapshot checkpoint
+
+        # Hot-reload support for training data from clients
+        self._pending_training_data = []  # List of (image_bytes, mask_bytes, metadata) tuples
+        self._pending_data_lock = None  # Will be initialized in run()
 
     def stop(self):
         """Request the worker to stop."""
@@ -442,6 +456,33 @@ class TrainWorker(QThread):
     def request_dataset_reload(self):
         """Request the dataset to be reloaded (e.g., when new files are added)."""
         self._reload_requested = True
+
+    def set_snapshot_interval(self, interval: float):
+        """
+        Set the interval for creating model snapshots (for multi-user predictions).
+
+        Args:
+            interval: Create snapshot every N seconds. Set to 0 to disable.
+        """
+        self.snapshot_interval = interval
+
+    def add_training_data(self, image_bytes: bytes, mask_bytes: bytes, metadata: dict):
+        """
+        Add training data received from a client (host only).
+
+        This data will be hot-loaded into the dataset during training.
+
+        Args:
+            image_bytes: PNG/TIFF encoded image data
+            mask_bytes: PNG/TIFF encoded mask data
+            metadata: Dict with sender_id, crop_size, slice_index, timestamp
+        """
+        if self._pending_data_lock:
+            import threading
+            with self._pending_data_lock:
+                self._pending_training_data.append((image_bytes, mask_bytes, metadata))
+        else:
+            self._pending_training_data.append((image_bytes, mask_bytes, metadata))
 
     def set_weights_export_interval(self, interval: int):
         """
@@ -645,10 +686,19 @@ class TrainWorker(QThread):
 
     def run(self):
         """Main training loop."""
+        import time
+        import threading
         from ..models.unet import get_device, get_model_class
 
         try:
             self.started.emit()
+
+            # Initialize threading lock for pending data
+            self._pending_data_lock = threading.Lock()
+
+            # Initialize snapshot timing
+            self._last_snapshot_time = time.time()
+            self._global_batch_count = 0  # Track total batches for loss plot
 
             # Extract config
             train_images = self.config.get('train_images')
@@ -873,12 +923,23 @@ class TrainWorker(QThread):
                         loss.backward()
                         optimizer.step()
 
-                    train_loss += loss.item()
+                    batch_loss = loss.item()
+                    train_loss += batch_loss
+
+                    # Emit loss for live plot (every batch)
+                    self._global_batch_count += 1
+                    self.loss_updated.emit(batch_loss, self._global_batch_count)
 
                     # MPS requires sync after every batch to prevent queue buildup/hangs
                     if device.type == 'mps':
                         torch.mps.synchronize()
 
+                    # Time-based snapshot check (every N seconds)
+                    if self.snapshot_interval > 0:
+                        current_time = time.time()
+                        if current_time - self._last_snapshot_time >= self.snapshot_interval:
+                            self._create_snapshot(model, checkpoint_path)
+                            self._last_snapshot_time = current_time
 
                 avg_train = train_loss / len(train_loader)
 
@@ -941,3 +1002,93 @@ class TrainWorker(QThread):
         except Exception as e:
             self.log.emit(f"Training error: {e}")
             self.finished.emit(False, str(e))
+
+    def _create_snapshot(self, model, checkpoint_path: str):
+        """
+        Create a time-based snapshot for predictions.
+
+        Snapshots are saved separately from the main checkpoint and are used
+        for predictions while training continues on the main model.
+
+        Args:
+            model: The current model
+            checkpoint_path: Base checkpoint path (snapshot uses _snapshot suffix)
+        """
+        import torch
+
+        try:
+            # Create snapshot path
+            if checkpoint_path.endswith('.pth'):
+                snapshot_path = checkpoint_path.replace('.pth', '_snapshot.pth')
+            else:
+                snapshot_path = checkpoint_path + '_snapshot'
+
+            self._snapshot_checkpoint_path = snapshot_path
+            self._snapshot_id += 1
+
+            # Deep copy weights
+            weights_copy = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+            # Save snapshot checkpoint
+            torch.save({
+                "snapshot_id": self._snapshot_id,
+                "model_state": weights_copy,
+            }, snapshot_path)
+
+            # Emit signal with weights for multi-user broadcast
+            self.snapshot_created.emit(weights_copy, self._snapshot_id)
+
+            self.log.emit(f"Created snapshot #{self._snapshot_id}")
+
+        except Exception as e:
+            self.log.emit(f"Error creating snapshot: {e}")
+
+    def _process_pending_training_data(self, train_images_dir: str, train_masks_dir: str):
+        """
+        Process pending training data received from clients.
+
+        Saves the data to disk and requests dataset reload.
+
+        Args:
+            train_images_dir: Directory for training images
+            train_masks_dir: Directory for training masks
+        """
+        import io
+        from PIL import Image
+
+        if not self._pending_training_data:
+            return 0
+
+        processed = 0
+        with self._pending_data_lock:
+            pending = self._pending_training_data[:]
+            self._pending_training_data.clear()
+
+        for image_bytes, mask_bytes, metadata in pending:
+            try:
+                # Decode images
+                img = Image.open(io.BytesIO(image_bytes))
+                mask = Image.open(io.BytesIO(mask_bytes))
+
+                # Generate filename
+                sender_id = metadata.get('sender_id', 'unknown')[:8]
+                timestamp = metadata.get('timestamp', 0)
+                crop_id = f"remote_{sender_id}_{timestamp}"
+
+                # Save to training directories
+                img_path = os.path.join(train_images_dir, f"{crop_id}.tif")
+                mask_path = os.path.join(train_masks_dir, f"{crop_id}.tif")
+
+                img.save(img_path, compression='tiff_lzw')
+                mask.save(mask_path, compression='tiff_lzw')
+
+                processed += 1
+                self.log.emit(f"Received training data from {sender_id}")
+
+            except Exception as e:
+                self.log.emit(f"Error processing remote training data: {e}")
+
+        if processed > 0:
+            self._reload_requested = True
+
+        return processed

@@ -72,6 +72,9 @@ class InteractiveTrainingPage(QWidget):
     # Signals
     training_complete = pyqtSignal(str)  # checkpoint_path
     architecture_changed = pyqtSignal(str)  # architecture id - emitted when user changes architecture
+    training_started = pyqtSignal()  # emitted when training starts
+    training_stopped = pyqtSignal()  # emitted when training stops
+    loss_updated = pyqtSignal(float, int)  # loss_value, batch_number - forwarded from train_worker
 
     # Sliding window parameters
     WINDOW_SIZE = 200  # Keep this many images in memory
@@ -572,14 +575,30 @@ class InteractiveTrainingPage(QWidget):
             self._request_viewport_prediction()
 
     def _get_prediction_checkpoint_path(self):
-        """Get the checkpoint path for the prediction architecture."""
+        """Get the checkpoint path for the prediction architecture.
+
+        When training is active and prediction architecture matches training,
+        returns the snapshot checkpoint for real-time preview.
+        """
         from ..models.unet import get_checkpoint_filename
 
         if not self.project_dir:
             return None
 
         filename = get_checkpoint_filename(self.prediction_architecture)
-        return self.project_dir / filename
+        checkpoint_path = self.project_dir / filename
+
+        # Use snapshot checkpoint if training is active and architectures match
+        training_active = (hasattr(self, 'train_worker') and
+                          self.train_worker is not None and
+                          self.train_worker.isRunning())
+
+        if training_active and self.prediction_architecture == self.current_architecture:
+            snapshot_path = self.project_dir / filename.replace('.pth', '_snapshot.pth')
+            if snapshot_path.exists():
+                return snapshot_path
+
+        return checkpoint_path
 
     def _on_viewport_changed(self):
         """Handle viewport pan/zoom changes."""
@@ -1744,6 +1763,15 @@ class InteractiveTrainingPage(QWidget):
             if saved_25d:
                 status_msg += f", {count_25d} 2.5D"
             status_msg += " training samples"
+
+            # Multi-user mode: send crop to host
+            if self._multi_user_enabled and self._sync_client and self._sync_client.is_connected:
+                if not self._is_host:
+                    # Client sends crop to host
+                    self._sync_client.send_training_data(img_crop_uint8, mask_after_crop, idx)
+                    status_msg += " (sent to host)"
+                # Host doesn't need to send - crop is already saved locally
+
             self.status_label.setText(status_msg)
 
             # Clear paint bounds so user can start fresh
@@ -2214,6 +2242,11 @@ class InteractiveTrainingPage(QWidget):
             # Notify predict worker that training stopped - can use GPU now
             if self.predict_worker:
                 self.predict_worker.set_training_active(False)
+            # Emit training stopped signal
+            self.training_stopped.emit()
+            # Request fresh prediction with main checkpoint
+            if self.show_predictions:
+                self._request_viewport_prediction(immediate=True)
             return
 
         # Get architecture-specific checkpoint path
@@ -2255,11 +2288,18 @@ class InteractiveTrainingPage(QWidget):
         self.train_worker.progress.connect(self._on_training_progress)
         self.train_worker.finished.connect(self._on_training_finished)
         self.train_worker.log.connect(self._on_training_log)
+        # Forward loss updates for live plot
+        self.train_worker.loss_updated.connect(self.loss_updated.emit)
+        # Use snapshots for predictions during training (dual checkpoint system)
+        self.train_worker.snapshot_created.connect(self._on_local_snapshot_created)
 
         # Connect multi-user sync signal
         if self._multi_user_enabled:
             self.train_worker.set_weights_export_interval(self._sync_interval_epochs)
             self.train_worker.weights_exported.connect(self._on_weights_exported)
+            # Host: connect snapshot signal to broadcast to clients
+            if self._is_host:
+                self.train_worker.snapshot_created.connect(self._on_snapshot_created)
 
         # Connect SAM2 extraction progress signal if this is a SAM2 architecture
         if 'sam2' in self.current_architecture.lower():
@@ -2292,6 +2332,9 @@ class InteractiveTrainingPage(QWidget):
         self.train_progress.setVisible(True)
         self.arch_combo.setEnabled(False)  # Disable architecture selection during training
 
+        # Emit training started signal
+        self.training_started.emit()
+
         arch_name = self._arch_id_to_name.get(self.current_architecture, self.current_architecture)
         if resume_checkpoint:
             self._show_temp_status(f"Resuming {arch_name} training...")
@@ -2311,6 +2354,13 @@ class InteractiveTrainingPage(QWidget):
         # Notify predict worker that training stopped - can use GPU now
         if self.predict_worker:
             self.predict_worker.set_training_active(False)
+
+        # Emit training stopped signal
+        self.training_stopped.emit()
+
+        # Request fresh prediction with main checkpoint
+        if self.show_predictions:
+            self._request_viewport_prediction(immediate=True)
 
         if success:
             self.status_label.setText("Training complete!")
@@ -2375,6 +2425,11 @@ class InteractiveTrainingPage(QWidget):
                 if is_host:
                     client.user_joined_room.connect(self._on_user_joined_relay)
                     client.model_requested.connect(self._on_model_requested_relay)
+                    # Host receives training data from clients
+                    client.training_data_received.connect(self._on_training_data_received)
+                else:
+                    # Client receives snapshots from host
+                    client.snapshot_received.connect(self._on_snapshot_received)
             except TypeError:
                 pass  # Already connected
 
@@ -2395,6 +2450,12 @@ class InteractiveTrainingPage(QWidget):
                 self.train_worker.weights_exported.connect(self._on_weights_exported)
             except TypeError:
                 pass  # Already connected
+            # Host: connect snapshot signal to broadcast to clients
+            if is_host:
+                try:
+                    self.train_worker.snapshot_created.connect(self._on_snapshot_created)
+                except TypeError:
+                    pass  # Already connected
 
         # If host, initialize server with current model weights (so joiners receive them)
         if is_host and server:
@@ -2521,6 +2582,14 @@ class InteractiveTrainingPage(QWidget):
                 self._sync_client.model_requested.disconnect(self._on_model_requested_relay)
             except TypeError:
                 pass  # Already disconnected or never connected
+            try:
+                self._sync_client.training_data_received.disconnect(self._on_training_data_received)
+            except TypeError:
+                pass  # Already disconnected or never connected
+            try:
+                self._sync_client.snapshot_received.disconnect(self._on_snapshot_received)
+            except TypeError:
+                pass  # Already disconnected or never connected
 
         if self._aggregation_server:
             try:
@@ -2531,9 +2600,13 @@ class InteractiveTrainingPage(QWidget):
         self._sync_client = None
         self._aggregation_server = None
 
-        # Disable weight export in train worker
+        # Disable weight export and disconnect signals in train worker
         if self.train_worker:
             self.train_worker.set_weights_export_interval(0)
+            try:
+                self.train_worker.snapshot_created.disconnect(self._on_snapshot_created)
+            except TypeError:
+                pass  # Already disconnected or never connected
 
         self._show_temp_status("Multi-user mode disabled")
         print("[MultiUser] Disabled")
@@ -2844,6 +2917,126 @@ class InteractiveTrainingPage(QWidget):
                 print(f"[MultiUser] Error creating fresh model: {e}")
                 import traceback
                 traceback.print_exc()
+
+    def _on_training_data_received(self, image_bytes: bytes, mask_bytes: bytes, metadata: dict):
+        """
+        Handle training data received from a client (host only).
+
+        Saves the crop to the training directory and optionally triggers dataset reload.
+        """
+        if not self._is_host:
+            return
+
+        sender = metadata.get("display_name", "Unknown")
+        crop_size = metadata.get("crop_size", 0)
+        timestamp = metadata.get("timestamp", 0)
+        sender_id = metadata.get("user_id", "unknown")[:8]
+
+        print(f"[MultiUser] Received training crop from {sender} ({crop_size}x{crop_size})")
+
+        if not self.train_images_dir or not self.train_masks_dir:
+            print("[MultiUser] No training directories set, cannot save received crop")
+            return
+
+        try:
+            import io
+            from PIL import Image
+
+            # Decode images
+            img = Image.open(io.BytesIO(image_bytes))
+            mask = Image.open(io.BytesIO(mask_bytes))
+
+            # Generate filename
+            crop_id = f"remote_{sender_id}_{timestamp}"
+
+            # Save to training directories
+            img_path = self.train_images_dir / f"{crop_id}.tif"
+            mask_path = self.train_masks_dir / f"{crop_id}.tif"
+
+            img.save(img_path, compression='tiff_lzw')
+            mask.save(mask_path, compression='tiff_lzw')
+
+            print(f"[MultiUser] Saved training crop from {sender} to {crop_id}.tif")
+            self._show_temp_status(f"Received crop from {sender}")
+
+            # Request dataset reload in train worker
+            if self.train_worker and self.train_worker.isRunning():
+                self.train_worker.request_dataset_reload()
+
+        except Exception as e:
+            print(f"[MultiUser] Error saving training crop: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _on_snapshot_received(self, weights: dict, snapshot_id: int):
+        """
+        Handle snapshot model received from host (client only).
+
+        Updates the prediction worker to use the new snapshot model.
+        """
+        if self._is_host:
+            return
+
+        print(f"[MultiUser] Received snapshot #{snapshot_id}")
+
+        try:
+            import torch
+
+            # Get checkpoint path
+            checkpoint_path = self._get_checkpoint_path()
+            if not checkpoint_path:
+                print("[MultiUser] No checkpoint path set, cannot save snapshot")
+                return
+
+            # Save snapshot to checkpoint
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            new_checkpoint = {
+                'epoch': 0,
+                'model_state_dict': weights,
+                'snapshot_id': snapshot_id,
+            }
+            torch.save(new_checkpoint, checkpoint_path)
+            print(f"[MultiUser] Saved snapshot #{snapshot_id} to {checkpoint_path}")
+
+            # Notify prediction worker to reload
+            if self.predict_worker:
+                self.predict_worker.set_checkpoint(str(checkpoint_path))
+                self.predict_worker.set_architecture(self.current_architecture)
+
+            self._show_temp_status(f"Snapshot #{snapshot_id} applied")
+
+        except Exception as e:
+            print(f"[MultiUser] Error applying snapshot: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _on_local_snapshot_created(self, weights: dict, snapshot_id: int):
+        """
+        Handle snapshot created by local train worker.
+
+        Triggers a prediction request if predictions are enabled,
+        so user sees updated model results immediately.
+        """
+        print(f"[Training] Snapshot #{snapshot_id} created")
+
+        # Request new prediction immediately if predictions are enabled
+        if self.show_predictions:
+            self._request_viewport_prediction(immediate=True)
+
+    def _on_snapshot_created(self, weights: dict, snapshot_id: int):
+        """
+        Handle snapshot created by local train worker (host only).
+
+        Broadcasts the snapshot to all connected clients.
+        """
+        if not self._is_host:
+            return
+
+        if not self._sync_client or not self._sync_client.is_connected:
+            return
+
+        print(f"[MultiUser] Broadcasting snapshot #{snapshot_id} to clients")
+        self._sync_client.send_snapshot(weights, snapshot_id)
 
     def _create_session(self):
         """Create a multi-user session from the Training page."""

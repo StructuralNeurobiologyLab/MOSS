@@ -22,3 +22,6 @@ tqdm>=4.65.0
 
 # Multi-user networking (optional)
 websockets>=12.0
+
+# Real-time visualization
+pyqtgraph>=0.13.0

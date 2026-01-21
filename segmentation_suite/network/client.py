@@ -25,6 +25,8 @@ from .protocol import (
     Message, MessageType, serialize_weights, deserialize_weights,
     create_hello_message, create_weights_push_message, create_goodbye_message,
     create_chunk_start_message, create_chunk_end_message,
+    create_training_data_message, create_snapshot_model_message,
+    serialize_training_data,
     chunk_data, needs_chunking, MAX_CHUNK_SIZE
 )
 from .session import UserInfo, generate_user_id
@@ -87,6 +89,10 @@ class SyncClient(QObject):
     model_requested = pyqtSignal(str)  # user_id - emitted when another user requests model (relay mode)
     user_joined_room = pyqtSignal(str)  # display_name - emitted when a user joins (relay mode)
 
+    # New signals for multi-user redesign
+    training_data_received = pyqtSignal(bytes, bytes, dict)  # image_bytes, mask_bytes, metadata (host only)
+    snapshot_received = pyqtSignal(dict, int)  # weights, snapshot_id (clients only)
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -126,6 +132,15 @@ class SyncClient(QObject):
         self.reconnect_delay = 5.0  # seconds
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 10
+
+        # Training data reception state (multi-user redesign)
+        self._expecting_training_data = False
+        self._training_data_metadata: Optional[dict] = None
+        self._training_data_buffer: list = []  # Holds [image_bytes, mask_bytes]
+
+        # Snapshot model reception state
+        self._expecting_snapshot = False
+        self._snapshot_id: int = 0
 
     def connect_direct(self, host_ip: str, port: int, user_name: str) -> bool:
         """
@@ -442,6 +457,25 @@ class SyncClient(QObject):
                 self.error.emit(error_msg)
                 return
 
+            # Handle training data messages (multi-user redesign)
+            elif msg_type == "training_data":
+                self._expecting_training_data = True
+                self._training_data_metadata = payload
+                self._training_data_buffer = []
+                sender = payload.get("display_name", "Unknown")
+                crop_size = payload.get("crop_size", 0)
+                _log(f"Receiving training data from {sender} ({crop_size}x{crop_size})")
+                self.sync_status.emit(f"Receiving crop from {sender}...")
+                return
+
+            # Handle snapshot model messages (multi-user redesign)
+            elif msg_type == "snapshot_model":
+                self._expecting_snapshot = True
+                self._snapshot_id = payload.get("snapshot_id", 0)
+                _log(f"Receiving snapshot model #{self._snapshot_id}")
+                self.sync_status.emit(f"Receiving snapshot #{self._snapshot_id}...")
+                return
+
             # Handle relay-forwarded weight messages
             elif msg_type == "weights_push":
                 self._expecting_weights = True
@@ -552,7 +586,35 @@ class SyncClient(QObject):
                 _log(f"Received chunk {received}/{self._chunk_total}")
             return
 
-        # Regular (non-chunked) binary message
+        # Handle training data (two binary messages: image then mask)
+        if self._expecting_training_data:
+            self._training_data_buffer.append(data)
+            if len(self._training_data_buffer) == 2:
+                # Got both image and mask
+                img_bytes, mask_bytes = self._training_data_buffer
+                metadata = self._training_data_metadata or {}
+                self._expecting_training_data = False
+                self._training_data_buffer = []
+                self._training_data_metadata = None
+                _log(f"Training data received: {len(img_bytes)}+{len(mask_bytes)} bytes")
+                self.training_data_received.emit(img_bytes, mask_bytes, metadata)
+                self.sync_status.emit("Training crop received")
+            return
+
+        # Handle snapshot model
+        if self._expecting_snapshot:
+            try:
+                weights = deserialize_weights(data)
+                snapshot_id = self._snapshot_id
+                self._expecting_snapshot = False
+                _log(f"Snapshot #{snapshot_id} received")
+                self.snapshot_received.emit(weights, snapshot_id)
+                self.sync_status.emit(f"Snapshot #{snapshot_id} received")
+            except Exception as e:
+                self.error.emit(f"Failed to deserialize snapshot: {e}")
+            return
+
+        # Regular (non-chunked) binary message (weights)
         if self._expecting_weights:
             try:
                 weights = deserialize_weights(data)
@@ -708,6 +770,138 @@ class SyncClient(QObject):
             await self._websocket.send(msg.to_json())
         except Exception as e:
             _log(f"Error requesting global model: {e}")
+
+    def send_training_data(self, image_array, mask_array, slice_index: int = 0):
+        """
+        Send training crop data to the host (client only).
+
+        In the new multi-user architecture, clients send training crops
+        to the host instead of model weights.
+
+        Args:
+            image_array: numpy array of the image crop (uint8)
+            mask_array: numpy array of the mask crop (uint8)
+            slice_index: Source slice index for metadata
+        """
+        if not self._connected or not self._loop:
+            self.error.emit("Not connected")
+            return
+
+        asyncio.run_coroutine_threadsafe(
+            self._send_training_data_async(image_array, mask_array, slice_index),
+            self._loop
+        )
+
+    async def _send_training_data_async(self, image_array, mask_array, slice_index: int):
+        """Async implementation of send_training_data."""
+        if not self._websocket:
+            return
+
+        try:
+            # Serialize the training data
+            img_bytes, mask_bytes = serialize_training_data(image_array, mask_array)
+
+            # Get crop size
+            crop_size = image_array.shape[0] if len(image_array.shape) >= 2 else 256
+
+            # Create message header
+            header = create_training_data_message(
+                user_id=self.user_id,
+                display_name=self.display_name,
+                crop_size=crop_size,
+                slice_index=slice_index
+            )
+
+            # Send header
+            await self._websocket.send(header.to_json())
+
+            # Send image bytes then mask bytes
+            await self._websocket.send(img_bytes)
+            await self._websocket.send(mask_bytes)
+
+            total_kb = (len(img_bytes) + len(mask_bytes)) / 1024
+            self.sync_status.emit(f"Sent training crop ({total_kb:.1f}KB)")
+            _log(f"Sent training data: {crop_size}x{crop_size}, {total_kb:.1f}KB")
+
+        except Exception as e:
+            self.error.emit(f"Failed to send training data: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def send_snapshot(self, weights: dict, snapshot_id: int):
+        """
+        Send model snapshot to clients (host only).
+
+        Called when a time-based snapshot is created during training.
+
+        Args:
+            weights: Model state dict
+            snapshot_id: Unique snapshot identifier
+        """
+        if not self._connected or not self._loop:
+            return
+
+        asyncio.run_coroutine_threadsafe(
+            self._send_snapshot_async(weights, snapshot_id),
+            self._loop
+        )
+
+    async def _send_snapshot_async(self, weights: dict, snapshot_id: int):
+        """Async implementation of send_snapshot."""
+        if not self._websocket:
+            return
+
+        try:
+            # Serialize weights
+            weights_data = serialize_weights(weights)
+            _log(f"Serialized snapshot: {len(weights_data)} bytes")
+
+            # Check if chunking needed
+            if needs_chunking(weights_data):
+                await self._send_chunked_snapshot(weights_data, snapshot_id)
+            else:
+                # Create header
+                header = create_snapshot_model_message(snapshot_id, self.user_id)
+                await self._websocket.send(header.to_json())
+
+                # Send weights as binary
+                await self._websocket.send(weights_data)
+
+            self.sync_status.emit(f"Broadcast snapshot #{snapshot_id}")
+
+        except Exception as e:
+            _log(f"Failed to send snapshot: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def _send_chunked_snapshot(self, weights_data: bytes, snapshot_id: int):
+        """Send snapshot in chunks for large models."""
+        import uuid
+
+        transfer_id = str(uuid.uuid4())[:8]
+        chunks = chunk_data(weights_data)
+        total_chunks = len(chunks)
+
+        _log(f"Sending snapshot in {total_chunks} chunks")
+
+        # Send chunk start
+        start_msg = create_chunk_start_message(
+            transfer_id=transfer_id,
+            total_chunks=total_chunks,
+            total_size=len(weights_data),
+            original_type="snapshot_model"
+        )
+        start_msg.payload["snapshot_id"] = snapshot_id
+        start_msg.payload["user_id"] = self.user_id
+        await self._websocket.send(start_msg.to_json())
+
+        # Send chunks
+        for i, chunk in enumerate(chunks):
+            await self._websocket.send(chunk)
+
+        # Send chunk end
+        end_msg = create_chunk_end_message(transfer_id)
+        await self._websocket.send(end_msg.to_json())
 
     @property
     def is_connected(self) -> bool:

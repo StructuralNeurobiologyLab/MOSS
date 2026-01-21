@@ -39,6 +39,13 @@ class MessageType(Enum):
     # Errors
     ERROR = "error"                  # Error message
 
+    # Training data transfer (multi-user redesign)
+    TRAINING_DATA = "training_data"        # Client -> Host: image+mask crop
+    TRAINING_DATA_ACK = "training_data_ack"  # Host -> Client: received confirmation
+
+    # Snapshot model (multi-user redesign)
+    SNAPSHOT_MODEL = "snapshot_model"  # Host -> All: model snapshot (every 30s)
+
 
 # Maximum chunk size for WebSocket messages (16MB to stay under Cloudflare's 32MB limit)
 MAX_CHUNK_SIZE = 16 * 1024 * 1024
@@ -306,3 +313,101 @@ def chunk_data(data: bytes, chunk_size: int = MAX_CHUNK_SIZE) -> list:
 def needs_chunking(data: bytes) -> bool:
     """Check if data needs to be chunked."""
     return len(data) > MAX_CHUNK_SIZE
+
+
+def create_training_data_message(user_id: str, display_name: str,
+                                  crop_size: int, slice_index: int,
+                                  chunk_index: int = 0, total_chunks: int = 1) -> Message:
+    """
+    Create a TRAINING_DATA message header.
+
+    Note: The actual image and mask data are sent as binary following the JSON message.
+    """
+    import time
+    return Message(
+        type=MessageType.TRAINING_DATA,
+        payload={
+            "user_id": user_id,
+            "display_name": display_name,
+            "crop_size": crop_size,
+            "slice_index": slice_index,
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "timestamp": int(time.time() * 1000)
+        }
+    )
+
+
+def create_training_data_ack_message(user_id: str, received: bool,
+                                      message: str = "") -> Message:
+    """Create a TRAINING_DATA_ACK message."""
+    return Message(
+        type=MessageType.TRAINING_DATA_ACK,
+        payload={
+            "user_id": user_id,
+            "received": received,
+            "message": message
+        }
+    )
+
+
+def create_snapshot_model_message(snapshot_id: int, user_id: str) -> Message:
+    """
+    Create a SNAPSHOT_MODEL message header.
+
+    Note: The actual weights are sent as binary data following the JSON message.
+    """
+    return Message(
+        type=MessageType.SNAPSHOT_MODEL,
+        payload={
+            "snapshot_id": snapshot_id,
+            "user_id": user_id
+        }
+    )
+
+
+def serialize_training_data(image_array, mask_array) -> tuple:
+    """
+    Serialize image and mask arrays to compressed bytes.
+
+    Args:
+        image_array: numpy array of the image crop (uint8)
+        mask_array: numpy array of the mask crop (uint8)
+
+    Returns:
+        Tuple of (image_bytes, mask_bytes)
+    """
+    import io
+    from PIL import Image
+
+    # Convert to PIL and save as PNG (lossless compression)
+    img_buffer = io.BytesIO()
+    Image.fromarray(image_array).save(img_buffer, format='PNG', compress_level=6)
+    img_bytes = img_buffer.getvalue()
+
+    mask_buffer = io.BytesIO()
+    Image.fromarray(mask_array).save(mask_buffer, format='PNG', compress_level=6)
+    mask_bytes = mask_buffer.getvalue()
+
+    return img_bytes, mask_bytes
+
+
+def deserialize_training_data(image_bytes: bytes, mask_bytes: bytes) -> tuple:
+    """
+    Deserialize image and mask bytes to numpy arrays.
+
+    Args:
+        image_bytes: PNG encoded image data
+        mask_bytes: PNG encoded mask data
+
+    Returns:
+        Tuple of (image_array, mask_array) as numpy arrays
+    """
+    import io
+    import numpy as np
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(image_bytes))
+    mask = Image.open(io.BytesIO(mask_bytes))
+
+    return np.array(img), np.array(mask)
