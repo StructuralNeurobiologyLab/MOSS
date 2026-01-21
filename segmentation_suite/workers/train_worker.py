@@ -882,6 +882,15 @@ class TrainWorker(QThread):
                     self.msleep(100)
 
                 model.train()
+
+                # Freeze BatchNorm running stats for stable live predictions
+                # Only when resuming from a checkpoint (stats are already good).
+                # When training from scratch, let stats adapt normally.
+                if resume_checkpoint:
+                    for module in model.modules():
+                        if isinstance(module, nn.BatchNorm2d):
+                            module.eval()  # Freeze running_mean/running_var updates
+
                 train_loss = 0.0
                 batch_count = 0
 
