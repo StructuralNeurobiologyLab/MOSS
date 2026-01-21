@@ -2297,9 +2297,9 @@ class InteractiveTrainingPage(QWidget):
         if self._multi_user_enabled:
             self.train_worker.set_weights_export_interval(self._sync_interval_epochs)
             self.train_worker.weights_exported.connect(self._on_weights_exported)
-            # Host: connect snapshot signal to broadcast to clients
-            if self._is_host:
-                self.train_worker.snapshot_created.connect(self._on_snapshot_created)
+            # Note: We only send epoch-based weights to clients (via weights_exported),
+            # NOT time-based snapshots. Snapshots are for local live predictions only.
+            # This ensures clients receive stable, fully-trained epoch checkpoints.
 
         # Connect SAM2 extraction progress signal if this is a SAM2 architecture
         if 'sam2' in self.current_architecture.lower():
@@ -2450,12 +2450,8 @@ class InteractiveTrainingPage(QWidget):
                 self.train_worker.weights_exported.connect(self._on_weights_exported)
             except TypeError:
                 pass  # Already connected
-            # Host: connect snapshot signal to broadcast to clients
-            if is_host:
-                try:
-                    self.train_worker.snapshot_created.connect(self._on_snapshot_created)
-                except TypeError:
-                    pass  # Already connected
+            # Note: We only send epoch-based weights to clients, not time-based snapshots.
+            # Snapshots are for local live predictions only.
 
         # If host, initialize server with current model weights (so joiners receive them)
         if is_host and server:
@@ -2603,10 +2599,6 @@ class InteractiveTrainingPage(QWidget):
         # Disable weight export and disconnect signals in train worker
         if self.train_worker:
             self.train_worker.set_weights_export_interval(0)
-            try:
-                self.train_worker.snapshot_created.disconnect(self._on_snapshot_created)
-            except TypeError:
-                pass  # Already disconnected or never connected
 
         self._show_temp_status("Multi-user mode disabled")
         print("[MultiUser] Disabled")
