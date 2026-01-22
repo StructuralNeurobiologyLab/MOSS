@@ -43,9 +43,6 @@ class MessageType(Enum):
     TRAINING_DATA = "training_data"        # Client -> Host: image+mask crop
     TRAINING_DATA_ACK = "training_data_ack"  # Host -> Client: received confirmation
 
-    # Snapshot model (multi-user redesign)
-    SNAPSHOT_MODEL = "snapshot_model"  # Host -> All: model snapshot (every 30s)
-
 
 # Maximum chunk size for WebSocket messages (16MB to stay under Cloudflare's 32MB limit)
 MAX_CHUNK_SIZE = 16 * 1024 * 1024
@@ -347,21 +344,6 @@ def create_training_data_ack_message(user_id: str, received: bool,
             "user_id": user_id,
             "received": received,
             "message": message
-        }
-    )
-
-
-def create_snapshot_model_message(snapshot_id: int, user_id: str) -> Message:
-    """
-    Create a SNAPSHOT_MODEL message header.
-
-    Note: The actual weights are sent as binary data following the JSON message.
-    """
-    return Message(
-        type=MessageType.SNAPSHOT_MODEL,
-        payload={
-            "snapshot_id": snapshot_id,
-            "user_id": user_id
         }
     )
 

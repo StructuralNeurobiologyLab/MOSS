@@ -577,8 +577,7 @@ class InteractiveTrainingPage(QWidget):
     def _get_prediction_checkpoint_path(self):
         """Get the checkpoint path for the prediction architecture.
 
-        When training is active and prediction architecture matches training,
-        returns the snapshot checkpoint for real-time preview.
+        Always returns the main (epoch-end) checkpoint for stable predictions.
         """
         from ..models.unet import get_checkpoint_filename
 
@@ -586,19 +585,7 @@ class InteractiveTrainingPage(QWidget):
             return None
 
         filename = get_checkpoint_filename(self.prediction_architecture)
-        checkpoint_path = self.project_dir / filename
-
-        # Use snapshot checkpoint if training is active and architectures match
-        training_active = (hasattr(self, 'train_worker') and
-                          self.train_worker is not None and
-                          self.train_worker.isRunning())
-
-        if training_active and self.prediction_architecture == self.current_architecture:
-            snapshot_path = self.project_dir / filename.replace('.pth', '_snapshot.pth')
-            if snapshot_path.exists():
-                return snapshot_path
-
-        return checkpoint_path
+        return self.project_dir / filename
 
     def _on_viewport_changed(self):
         """Handle viewport pan/zoom changes."""
@@ -2290,16 +2277,15 @@ class InteractiveTrainingPage(QWidget):
         self.train_worker.log.connect(self._on_training_log)
         # Forward loss updates for live plot
         self.train_worker.loss_updated.connect(self.loss_updated.emit)
-        # Use snapshots for predictions during training (dual checkpoint system)
-        self.train_worker.snapshot_created.connect(self._on_local_snapshot_created)
+        # Batch progress for detailed status (epoch %, time per epoch)
+        self.train_worker.batch_progress.connect(self._on_batch_progress)
+        # Predictions use epoch checkpoints (updated after each epoch completes)
 
         # Connect multi-user sync signal
         if self._multi_user_enabled:
             self.train_worker.set_weights_export_interval(self._sync_interval_epochs)
             self.train_worker.weights_exported.connect(self._on_weights_exported)
-            # Note: We only send epoch-based weights to clients (via weights_exported),
-            # NOT time-based snapshots. Snapshots are for local live predictions only.
-            # This ensures clients receive stable, fully-trained epoch checkpoints.
+            # Clients receive stable epoch checkpoints
 
         # Connect SAM2 extraction progress signal if this is a SAM2 architecture
         if 'sam2' in self.current_architecture.lower():
@@ -2343,8 +2329,23 @@ class InteractiveTrainingPage(QWidget):
 
     def _on_training_progress(self, epoch, total, train_loss, val_loss):
         self.train_progress.setValue(int(100 * epoch / total))
-        self._last_progress_message = f"Training: Epoch {epoch}/{total}, Loss: {train_loss:.4f}"
+        self._last_progress_message = f"Epoch {epoch}/{total} complete, Loss: {train_loss:.4f}"
         self.status_label.setText(self._last_progress_message)
+        # Store last epoch time for display
+        if hasattr(self, '_last_epoch_time') and self._last_epoch_time > 0:
+            self._last_progress_message += f" ({self._last_epoch_time:.1f}s/epoch)"
+            self.status_label.setText(self._last_progress_message)
+
+    def _on_batch_progress(self, batch, total_batches, epoch, epoch_elapsed):
+        """Update status with batch-level progress within epoch."""
+        pct = int(100 * batch / total_batches) if total_batches > 0 else 0
+        # Estimate time remaining for this epoch
+        if batch > 0:
+            eta = (epoch_elapsed / batch) * (total_batches - batch)
+            self._last_epoch_time = (epoch_elapsed / batch) * total_batches
+            self.status_label.setText(f"Epoch {epoch}: {pct}% ({batch}/{total_batches}) - {eta:.0f}s left")
+        else:
+            self.status_label.setText(f"Epoch {epoch}: {pct}% ({batch}/{total_batches})")
 
     def _on_training_finished(self, success, result):
         self.train_btn.setText("Start Training")
@@ -2427,9 +2428,6 @@ class InteractiveTrainingPage(QWidget):
                     client.model_requested.connect(self._on_model_requested_relay)
                     # Host receives training data from clients
                     client.training_data_received.connect(self._on_training_data_received)
-                else:
-                    # Client receives snapshots from host
-                    client.snapshot_received.connect(self._on_snapshot_received)
             except TypeError:
                 pass  # Already connected
 
@@ -2450,8 +2448,6 @@ class InteractiveTrainingPage(QWidget):
                 self.train_worker.weights_exported.connect(self._on_weights_exported)
             except TypeError:
                 pass  # Already connected
-            # Note: We only send epoch-based weights to clients, not time-based snapshots.
-            # Snapshots are for local live predictions only.
 
         # If host, initialize server with current model weights (so joiners receive them)
         if is_host and server:
@@ -2580,10 +2576,6 @@ class InteractiveTrainingPage(QWidget):
                 pass  # Already disconnected or never connected
             try:
                 self._sync_client.training_data_received.disconnect(self._on_training_data_received)
-            except TypeError:
-                pass  # Already disconnected or never connected
-            try:
-                self._sync_client.snapshot_received.disconnect(self._on_snapshot_received)
             except TypeError:
                 pass  # Already disconnected or never connected
 
@@ -2959,76 +2951,6 @@ class InteractiveTrainingPage(QWidget):
             print(f"[MultiUser] Error saving training crop: {e}")
             import traceback
             traceback.print_exc()
-
-    def _on_snapshot_received(self, weights: dict, snapshot_id: int):
-        """
-        Handle snapshot model received from host (client only).
-
-        Updates the prediction worker to use the new snapshot model.
-        """
-        if self._is_host:
-            return
-
-        print(f"[MultiUser] Received snapshot #{snapshot_id}")
-
-        try:
-            import torch
-
-            # Get checkpoint path
-            checkpoint_path = self._get_checkpoint_path()
-            if not checkpoint_path:
-                print("[MultiUser] No checkpoint path set, cannot save snapshot")
-                return
-
-            # Save snapshot to checkpoint
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            new_checkpoint = {
-                'epoch': 0,
-                'model_state_dict': weights,
-                'snapshot_id': snapshot_id,
-            }
-            torch.save(new_checkpoint, checkpoint_path)
-            print(f"[MultiUser] Saved snapshot #{snapshot_id} to {checkpoint_path}")
-
-            # Notify prediction worker to reload
-            if self.predict_worker:
-                self.predict_worker.set_checkpoint(str(checkpoint_path))
-                self.predict_worker.set_architecture(self.current_architecture)
-
-            self._show_temp_status(f"Snapshot #{snapshot_id} applied")
-
-        except Exception as e:
-            print(f"[MultiUser] Error applying snapshot: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _on_local_snapshot_created(self, weights: dict, snapshot_id: int):
-        """
-        Handle snapshot created by local train worker.
-
-        Triggers a prediction request if predictions are enabled,
-        so user sees updated model results immediately.
-        """
-        print(f"[Training] Snapshot #{snapshot_id} created")
-
-        # Request new prediction immediately if predictions are enabled
-        if self.show_predictions:
-            self._request_viewport_prediction(immediate=True)
-
-    def _on_snapshot_created(self, weights: dict, snapshot_id: int):
-        """
-        Handle snapshot created by local train worker (host only).
-
-        Broadcasts the snapshot to all connected clients.
-        """
-        if not self._is_host:
-            return
-
-        if not self._sync_client or not self._sync_client.is_connected:
-            return
-
-        print(f"[MultiUser] Broadcasting snapshot #{snapshot_id} to clients")
-        self._sync_client.send_snapshot(weights, snapshot_id)
 
     def _create_session(self):
         """Create a multi-user session from the Training page."""

@@ -3,6 +3,7 @@
 Real-time loss plot widget using PyQtGraph.
 
 Displays training loss over time for visualization in the wizard sidebar.
+Shows individual points (faded) with a smoothed trend line.
 """
 
 from collections import deque
@@ -20,11 +21,14 @@ except ImportError:
 class LossPlotWidget(QWidget):
     """Real-time loss plot for training visualization."""
 
-    def __init__(self, max_points: int = 500, parent=None):
+    def __init__(self, max_points: int = 500, smoothing_window: int = 50, parent=None):
         super().__init__(parent)
         self.max_points = max_points
+        self.smoothing_window = smoothing_window
         self.loss_history = deque(maxlen=max_points)
         self.batch_history = deque(maxlen=max_points)
+        self.smoothed_history = deque(maxlen=max_points)
+        self._ema_value = None  # Exponential moving average
 
         self._setup_ui()
 
@@ -39,7 +43,8 @@ class LossPlotWidget(QWidget):
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(label)
             self.plot_widget = None
-            self.loss_curve = None
+            self.raw_curve = None
+            self.smooth_curve = None
             return
 
         # Configure pyqtgraph for dark theme
@@ -58,8 +63,17 @@ class LossPlotWidget(QWidget):
         self.plot_widget.getAxis('left').setPen('#444')
         self.plot_widget.getAxis('bottom').setPen('#444')
 
-        # Create plot line with green color
-        self.loss_curve = self.plot_widget.plot(
+        # Raw data points - faded green dots
+        self.raw_curve = self.plot_widget.plot(
+            pen=None,  # No line connecting dots
+            symbol='o',
+            symbolSize=3,
+            symbolBrush=pg.mkBrush(76, 175, 80, 60),  # Green with low alpha
+            symbolPen=None
+        )
+
+        # Smoothed trend line - solid green
+        self.smooth_curve = self.plot_widget.plot(
             pen=pg.mkPen(color='#4CAF50', width=2)
         )
 
@@ -67,36 +81,59 @@ class LossPlotWidget(QWidget):
         self.setMinimumHeight(150)
         self.setMaximumHeight(200)
 
+    def _update_ema(self, value: float) -> float:
+        """Update exponential moving average."""
+        alpha = 2.0 / (self.smoothing_window + 1)
+        if self._ema_value is None:
+            self._ema_value = value
+        else:
+            self._ema_value = alpha * value + (1 - alpha) * self._ema_value
+        return self._ema_value
+
     @pyqtSlot(float, int)
     def add_point(self, loss: float, batch: int):
         """Add a new loss point to the plot."""
-        if self.loss_curve is None:
+        if self.raw_curve is None:
             return
 
         self.loss_history.append(loss)
         self.batch_history.append(batch)
-        self.loss_curve.setData(
-            list(self.batch_history),
-            list(self.loss_history)
-        )
+
+        # Update smoothed value
+        smoothed = self._update_ema(loss)
+        self.smoothed_history.append(smoothed)
+
+        # Update plots
+        batches = list(self.batch_history)
+        self.raw_curve.setData(batches, list(self.loss_history))
+        self.smooth_curve.setData(batches, list(self.smoothed_history))
 
     @pyqtSlot(int, int, float, float)
     def add_epoch_point(self, epoch: int, total_epochs: int, train_loss: float, val_loss: float):
         """Add a point using epoch-based progress signal format."""
-        if self.loss_curve is None:
+        if self.raw_curve is None:
             return
 
         self.loss_history.append(train_loss)
         self.batch_history.append(epoch)
-        self.loss_curve.setData(
-            list(self.batch_history),
-            list(self.loss_history)
-        )
+
+        # Update smoothed value
+        smoothed = self._update_ema(train_loss)
+        self.smoothed_history.append(smoothed)
+
+        # Update plots
+        batches = list(self.batch_history)
+        self.raw_curve.setData(batches, list(self.loss_history))
+        self.smooth_curve.setData(batches, list(self.smoothed_history))
 
     def clear(self):
         """Clear the plot."""
         self.loss_history.clear()
         self.batch_history.clear()
-        if self.loss_curve is not None:
-            self.loss_curve.setData([], [])
+        self.smoothed_history.clear()
+        self._ema_value = None
+        if self.raw_curve is not None:
+            self.raw_curve.setData([], [])
+        if self.smooth_curve is not None:
+            self.smooth_curve.setData([], [])
 

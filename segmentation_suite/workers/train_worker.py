@@ -152,10 +152,15 @@ class NucleiPatchDataset(Dataset):
         print(f"Cached {len(self._img_cache)} pairs successfully.")
 
     def __len__(self):
-        # Linux: 50x for thorough training, macOS: 10x for faster interactive feedback
-        import platform
-        multiplier = 50 if platform.system() == 'Linux' else 10
-        return len(self.images) * multiplier
+        # Dynamic multiplier: target ~1000 batches per epoch for interactive feedback
+        # With batch_size=2, that's ~2000 samples per epoch
+        # This gives frequent epoch updates while still being meaningful training
+        num_images = len(self.images)
+        if num_images == 0:
+            return 0
+        target_samples = 2000  # ~1000 batches with batch_size=2
+        multiplier = max(1, target_samples // num_images)
+        return num_images * multiplier
 
     def _random_crop(self, img, mask, y, x):
         t = self.tile
@@ -325,10 +330,14 @@ class NucleiPatchDatasetSAM2(Dataset):
         print(f"Cached {len(self._img_cache)} pairs, {loaded_sam2} SAM2 features")
 
     def __len__(self):
-        # Linux: 50x for thorough training, macOS: 10x for faster interactive feedback
-        import platform
-        multiplier = 50 if platform.system() == 'Linux' else 10
-        return len(self.images) * multiplier
+        # Dynamic multiplier: target ~1000 batches per epoch for interactive feedback
+        # With batch_size=2, that's ~2000 samples per epoch
+        num_images = len(self.images)
+        if num_images == 0:
+            return 0
+        target_samples = 2000
+        multiplier = max(1, target_samples // num_images)
+        return num_images * multiplier
 
     def _augment(self, img, mask):
         """Apply geometric augmentations and track state for SAM2 sync."""
@@ -415,9 +424,9 @@ class TrainWorker(QThread):
     sam2_extraction_progress = pyqtSignal(int, int, str)  # current, total, message
     weights_exported = pyqtSignal(dict, int, float)  # weights, epoch, loss - for multi-user sync
 
-    # New signals for multi-user redesign
-    snapshot_created = pyqtSignal(dict, int)  # weights, snapshot_id - time-based snapshot for predictions
+    # Signals for live training feedback
     loss_updated = pyqtSignal(float, int)  # loss_value, batch_number - for live plot
+    batch_progress = pyqtSignal(int, int, int, float)  # batch, total_batches, epoch, epoch_elapsed_secs
 
     def __init__(self, config: dict):
         super().__init__()
@@ -430,12 +439,6 @@ class TrainWorker(QThread):
         # Multi-user sync settings
         self.weights_export_interval = config.get('weights_export_interval', 5)  # Export every N epochs
         self._last_export_epoch = -1
-
-        # Time-based snapshot settings (for multi-user redesign)
-        self.snapshot_interval = config.get('snapshot_interval', 30.0)  # seconds
-        self._last_snapshot_time = 0.0
-        self._snapshot_id = 0
-        self._snapshot_checkpoint_path = None  # Path for snapshot checkpoint
 
         # Hot-reload support for training data from clients
         self._pending_training_data = []  # List of (image_bytes, mask_bytes, metadata) tuples
@@ -456,15 +459,6 @@ class TrainWorker(QThread):
     def request_dataset_reload(self):
         """Request the dataset to be reloaded (e.g., when new files are added)."""
         self._reload_requested = True
-
-    def set_snapshot_interval(self, interval: float):
-        """
-        Set the interval for creating model snapshots (for multi-user predictions).
-
-        Args:
-            interval: Create snapshot every N seconds. Set to 0 to disable.
-        """
-        self.snapshot_interval = interval
 
     def add_training_data(self, image_bytes: bytes, mask_bytes: bytes, metadata: dict):
         """
@@ -696,8 +690,6 @@ class TrainWorker(QThread):
             # Initialize threading lock for pending data
             self._pending_data_lock = threading.Lock()
 
-            # Initialize snapshot timing (0 so first snapshot happens on epoch 1)
-            self._last_snapshot_time = 0
             self._global_batch_count = 0  # Track total batches for loss plot
 
             # Extract config
@@ -832,6 +824,15 @@ class TrainWorker(QThread):
             print(f"  Device:          {device}")
             print(f"  Input channels:  {n_channels} ({'2.5D mode' if is_25d else '2D mode'})")
 
+            # Dataset info
+            num_images = len(train_ds.images)
+            samples_per_epoch = len(train_ds)
+            multiplier = samples_per_epoch // num_images if num_images > 0 else 0
+            batches_per_epoch = len(train_loader)
+            print(f"  Training images: {num_images}")
+            print(f"  Epoch multiplier: {multiplier}x ({samples_per_epoch} samples)")
+            print(f"  Batches/epoch:   {batches_per_epoch}")
+
             # Checkpoint
             print(f"  Checkpoint:      {checkpoint_path}")
 
@@ -893,6 +894,8 @@ class TrainWorker(QThread):
 
                 train_loss = 0.0
                 batch_count = 0
+                total_batches = len(train_loader)
+                epoch_start_time = time.time()
 
                 for batch in train_loader:
                     batch_count += 1
@@ -939,16 +942,14 @@ class TrainWorker(QThread):
                     self._global_batch_count += 1
                     self.loss_updated.emit(batch_loss, self._global_batch_count)
 
+                    # Emit batch progress (every 10 batches to reduce overhead)
+                    if batch_count % 10 == 0 or batch_count == total_batches:
+                        epoch_elapsed = time.time() - epoch_start_time
+                        self.batch_progress.emit(batch_count, total_batches, epoch + 1, epoch_elapsed)
+
                     # MPS requires sync after every batch to prevent queue buildup/hangs
                     if device.type == 'mps':
                         torch.mps.synchronize()
-
-                    # Time-based snapshot for live predictions (every N seconds)
-                    if self.snapshot_interval > 0:
-                        current_time = time.time()
-                        if current_time - self._last_snapshot_time >= self.snapshot_interval:
-                            self._create_snapshot(model, checkpoint_path)
-                            self._last_snapshot_time = current_time
 
                 avg_train = train_loss / len(train_loader)
 
@@ -1011,46 +1012,6 @@ class TrainWorker(QThread):
         except Exception as e:
             self.log.emit(f"Training error: {e}")
             self.finished.emit(False, str(e))
-
-    def _create_snapshot(self, model, checkpoint_path: str):
-        """
-        Create a time-based snapshot for predictions.
-
-        Snapshots are saved separately from the main checkpoint and are used
-        for predictions while training continues on the main model.
-
-        Args:
-            model: The current model
-            checkpoint_path: Base checkpoint path (snapshot uses _snapshot suffix)
-        """
-        import torch
-
-        try:
-            # Create snapshot path
-            if checkpoint_path.endswith('.pth'):
-                snapshot_path = checkpoint_path.replace('.pth', '_snapshot.pth')
-            else:
-                snapshot_path = checkpoint_path + '_snapshot'
-
-            self._snapshot_checkpoint_path = snapshot_path
-            self._snapshot_id += 1
-
-            # Deep copy weights
-            weights_copy = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-            # Save snapshot checkpoint
-            torch.save({
-                "snapshot_id": self._snapshot_id,
-                "model_state": weights_copy,
-            }, snapshot_path)
-
-            # Emit signal with weights for multi-user broadcast
-            self.snapshot_created.emit(weights_copy, self._snapshot_id)
-
-            self.log.emit(f"Created snapshot #{self._snapshot_id}")
-
-        except Exception as e:
-            self.log.emit(f"Error creating snapshot: {e}")
 
     def _process_pending_training_data(self, train_images_dir: str, train_masks_dir: str):
         """
