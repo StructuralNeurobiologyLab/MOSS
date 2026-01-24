@@ -35,6 +35,7 @@ class MessageType(Enum):
 
     # Session info
     USER_LIST = "user_list"          # Server sends list of connected users
+    SESSION_INFO = "session_info"    # Host sends session info (e.g., architecture)
 
     # Errors
     ERROR = "error"                  # Error message

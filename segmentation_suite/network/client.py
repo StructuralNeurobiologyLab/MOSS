@@ -626,7 +626,7 @@ class SyncClient(QObject):
 
         try:
             msg = Message(
-                type="session_info",
+                type=MessageType.SESSION_INFO,
                 payload={"architecture": architecture}
             )
             await self._websocket.send(msg.to_json())

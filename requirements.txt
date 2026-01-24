@@ -15,6 +15,7 @@ torchvision>=0.15.0
 opencv-python>=4.7.0
 scikit-image>=0.20.0
 tifffile>=2023.1.0
+imagecodecs>=2023.1.0
 
 # Utilities
 matplotlib>=3.7.0
