@@ -59,12 +59,13 @@ class TrainingDataReviewer(QDialog):
         self._init_ui()
 
     def _load_image_list(self):
-        """Load list of training images."""
+        """Load list of training images, sorted by modification time (newest first)."""
         extensions = {'.png', '.jpg', '.jpeg', '.tif', '.tiff'}
-        self.image_files = sorted([
-            f for f in self.train_images_dir.iterdir()
-            if f.suffix.lower() in extensions
-        ])
+        self.image_files = sorted(
+            [f for f in self.train_images_dir.iterdir() if f.suffix.lower() in extensions],
+            key=lambda f: f.stat().st_mtime,
+            reverse=True
+        )
 
     def _init_ui(self):
         """Initialize the UI."""
