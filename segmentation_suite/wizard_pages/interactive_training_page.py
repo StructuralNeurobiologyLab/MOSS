@@ -908,6 +908,7 @@ class InteractiveTrainingPage(QWidget):
             "Paint edits, then press Tab to capture crops for training."
         )
         self.refiner_btn.clicked.connect(self._toggle_refiner_mode)
+        self.refiner_btn.setVisible(False)  # Feature not ready yet
         layout.addWidget(self.refiner_btn)
 
         # Reset Refiner button
