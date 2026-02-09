@@ -2,7 +2,7 @@
 
 A PyQt6-based interactive segmentation tool with U-Net training, prediction, and mask editing capabilities. MOSS provides an intuitive interface for training deep learning models on microscopy images through direct annotation and real-time feedback.
 
-MOSS-lite is the virst version of MOSS and my personal copy. All future work and updates will be reflected in https://github.com/StructuralNeurobiologyLab/MOSS . 
+MOSS-lite is the first version of MOSS and my personal copy. All future work and updates will be reflected in https://github.com/StructuralNeurobiologyLab/MOSS . 
 
 ## Features
 
