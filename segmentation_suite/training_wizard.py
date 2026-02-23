@@ -262,6 +262,7 @@ class TrainingWizard(QMainWindow):
 
         # Session state
         self._session_client = None
+        self._aggregation_server = None
         self._is_session_host = False
 
         layout.addSpacing(scaled(10))
@@ -627,7 +628,7 @@ class TrainingWizard(QMainWindow):
     # =========================================================================
 
     def _create_session(self):
-        """Create a multi-user session."""
+        """Create a multi-user session — ask LAN vs Relay."""
         from PyQt6.QtWidgets import QInputDialog
         try:
             from .network import SyncClient, DEFAULT_RELAY_URL
@@ -637,6 +638,109 @@ class TrainingWizard(QMainWindow):
                 f"Multi-user networking requires the 'websockets' library.\n"
                 f"Install with: pip install websockets\n\nError: {e}"
             )
+            return
+
+        # Ask LAN vs Relay
+        choices = ["LAN (same network)", "Relay (internet)"]
+        choice, ok = QInputDialog.getItem(
+            self, "Create Session",
+            "How should clients connect?",
+            choices, 0, False
+        )
+        if not ok:
+            return
+
+        if choice == choices[0]:
+            self._create_lan_session()
+        else:
+            self._create_relay_session()
+
+    def _create_lan_session(self):
+        """Create a LAN session from the wizard sidebar."""
+        from PyQt6.QtWidgets import QInputDialog
+        try:
+            from .network import AggregationServer, SyncClient, get_local_ip
+        except ImportError as e:
+            QMessageBox.warning(
+                self, "Missing Dependency",
+                f"Multi-user networking requires the 'websockets' library.\n"
+                f"Install with: pip install websockets\n\nError: {e}"
+            )
+            return
+
+        # Get display name
+        default_name = os.environ.get('USER', os.environ.get('USERNAME', 'user'))
+        name, ok = QInputDialog.getText(
+            self, "Host LAN Session",
+            "Enter your display name:",
+            text=default_name + "_host"
+        )
+        if not ok or not name.strip():
+            return
+
+        name = name.strip()
+
+        try:
+            # Start aggregation server
+            self._aggregation_server = AggregationServer(parent=self)
+            self._aggregation_server.user_connected.connect(self._on_user_list_lan)
+            self._aggregation_server.user_disconnected.connect(self._on_user_disconnected_lan)
+            self._aggregation_server.error.connect(self._on_session_error)
+
+            current_arch = self.training_page.current_architecture
+            connection_string = self._aggregation_server.start(
+                port=8765, architecture=current_arch
+            )
+
+            # Create host client that connects back to local server
+            self._session_client = SyncClient(parent=self)
+            self._session_client.display_name = name
+            self._session_client.disconnected.connect(self._on_session_disconnected)
+            self._session_client.error.connect(self._on_session_error)
+            self._session_client.sync_status.connect(self._on_sync_status)
+            self._session_client.connect_direct(
+                host_ip="127.0.0.1", port=8765, user_name=name
+            )
+
+            # Pass state to training page
+            self.training_page.set_multi_user_state(
+                self._aggregation_server, self._session_client, is_relay_host=False
+            )
+            self.training_page.lock_architecture(current_arch)
+
+            # Update UI
+            local_ip = get_local_ip()
+            self.session_status_label.setText(f"LAN: {local_ip}:8765")
+            self._update_session_ui(connected=True)
+            self._is_session_host = True
+
+            print(f"[Wizard] LAN session started on {local_ip}:8765 (arch: {current_arch})")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start LAN session:\n{e}")
+
+    def _on_user_list_lan(self, user_id: str, display_name: str):
+        """Handle user connected in LAN mode."""
+        count = self._aggregation_server.client_count if self._aggregation_server else 0
+        current_text = self.session_status_label.text().split(" (")[0]
+        if count > 1:
+            self.session_status_label.setText(f"{current_text} ({count} users)")
+
+    def _on_user_disconnected_lan(self, user_id: str):
+        """Handle user disconnected in LAN mode."""
+        count = self._aggregation_server.client_count if self._aggregation_server else 0
+        current_text = self.session_status_label.text().split(" (")[0]
+        if count > 1:
+            self.session_status_label.setText(f"{current_text} ({count} users)")
+        else:
+            self.session_status_label.setText(current_text)
+
+    def _create_relay_session(self):
+        """Create a relay session (internet) from the wizard sidebar."""
+        from PyQt6.QtWidgets import QInputDialog
+        try:
+            from .network import SyncClient, DEFAULT_RELAY_URL
+        except ImportError:
             return
 
         if not DEFAULT_RELAY_URL:
@@ -673,7 +777,7 @@ class TrainingWizard(QMainWindow):
         self._is_session_host = True
 
     def _join_session(self):
-        """Join an existing session."""
+        """Join an existing session — ask LAN vs Relay."""
         from PyQt6.QtWidgets import QInputDialog
         try:
             from .network import SyncClient, DEFAULT_RELAY_URL
@@ -683,6 +787,96 @@ class TrainingWizard(QMainWindow):
                 f"Multi-user networking requires the 'websockets' library.\n"
                 f"Install with: pip install websockets\n\nError: {e}"
             )
+            return
+
+        # Ask LAN vs Relay
+        choices = ["LAN (enter IP address)", "Relay (enter session code)"]
+        choice, ok = QInputDialog.getItem(
+            self, "Join Session",
+            "How is the host connected?",
+            choices, 0, False
+        )
+        if not ok:
+            return
+
+        if choice == choices[0]:
+            self._join_lan_session()
+        else:
+            self._join_relay_session()
+
+    def _join_lan_session(self):
+        """Join a LAN session by IP address."""
+        from PyQt6.QtWidgets import QInputDialog
+        try:
+            from .network import SyncClient
+        except ImportError:
+            return
+
+        # Get host address
+        address, ok = QInputDialog.getText(
+            self, "Join LAN Session",
+            "Enter host IP address (e.g. 192.168.1.5:8765):"
+        )
+        if not ok or not address.strip():
+            return
+
+        address = address.strip()
+
+        # Parse host and port
+        if ':' in address:
+            host_ip, port_str = address.rsplit(':', 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                QMessageBox.warning(self, "Invalid Address", f"Invalid port: {port_str}")
+                return
+        else:
+            host_ip = address
+            port = 8765  # Default
+
+        # Get display name
+        default_name = os.environ.get('USER', os.environ.get('USERNAME', 'user'))
+        name, ok = QInputDialog.getText(
+            self, "Join LAN Session",
+            "Enter your display name:",
+            text=default_name
+        )
+        if not ok or not name.strip():
+            return
+
+        # Connect directly
+        self._session_client = SyncClient(parent=self)
+        self._session_client.display_name = name.strip()
+        self._session_client.connected.connect(lambda: self._on_lan_join_connected())
+        self._session_client.disconnected.connect(self._on_session_disconnected)
+        self._session_client.error.connect(self._on_session_error)
+        self._session_client.sync_status.connect(self._on_sync_status)
+        self._session_client.architecture_received.connect(self._on_architecture_received)
+
+        self._session_client.connect_direct(
+            host_ip=host_ip, port=port, user_name=name.strip()
+        )
+        self.session_create_btn.setEnabled(False)
+        self.session_join_btn.setEnabled(False)
+        self._is_session_host = False
+
+        print(f"[Wizard] Joining LAN session at {host_ip}:{port}")
+
+    def _on_lan_join_connected(self):
+        """Handle successful LAN join connection."""
+        self.session_status_label.setText("Connected (LAN)")
+        self._update_session_ui(connected=True)
+        # Enable multi-user on training page as joinee
+        self.training_page.set_multi_user_state(
+            None, self._session_client, is_relay_host=False
+        )
+
+    def _join_relay_session(self):
+        """Join a relay session by room code."""
+        from PyQt6.QtWidgets import QInputDialog
+        try:
+            from .network import SyncClient, DEFAULT_RELAY_URL
+        except ImportError:
             return
 
         if not DEFAULT_RELAY_URL:
@@ -737,6 +931,9 @@ class TrainingWizard(QMainWindow):
         if self._session_client:
             self._session_client.disconnect()
             self._session_client = None
+        if self._aggregation_server:
+            self._aggregation_server.stop()
+            self._aggregation_server = None
         self._is_session_host = False
         self._update_session_ui(connected=False)
         # Disable multi-user on training page
@@ -811,6 +1008,9 @@ class TrainingWizard(QMainWindow):
         if self._session_client:
             self._session_client.disconnect()
             self._session_client = None
+        if self._aggregation_server:
+            self._aggregation_server.stop()
+            self._aggregation_server = None
         # Emit signal to return to welcome page (when embedded in launcher)
         self.wizard_closed.emit()
 
@@ -819,6 +1019,8 @@ class TrainingWizard(QMainWindow):
         # Disconnect from session if connected
         if self._session_client:
             self._session_client.disconnect()
+        if self._aggregation_server:
+            self._aggregation_server.stop()
         self.wizard_closed.emit()
         event.accept()
 

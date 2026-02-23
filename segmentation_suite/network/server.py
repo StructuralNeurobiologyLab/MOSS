@@ -25,7 +25,7 @@ from .protocol import (
     Message, MessageType, serialize_weights, deserialize_weights,
     create_welcome_message, create_weights_ack_message,
     create_global_model_message, create_user_list_message,
-    create_error_message
+    create_error_message, create_training_data_ack_message
 )
 from .session import MultiUserSession, UserInfo, get_local_ip
 from .aggregator import FedAvgAggregator
@@ -81,6 +81,9 @@ class AggregationServer(QObject):
         # Connected clients
         self._clients: Dict[str, WebSocketServerProtocol] = {}  # user_id -> websocket
         self._websocket_to_user: Dict[WebSocketServerProtocol, str] = {}  # websocket -> user_id
+
+        # Pending training data (per-user binary chunk tracking)
+        self._pending_training_data = {}  # user_id -> {"json_header": str, "chunks": []}
 
         # Aggregation settings
         self.min_contributors = 1  # Minimum clients needed to trigger aggregation
@@ -244,6 +247,8 @@ class AggregationServer(QObject):
                 await self._handle_goodbye(websocket, msg)
             elif msg.type == MessageType.REQUEST_MODEL:
                 await self._handle_request_model(websocket, msg)
+            elif msg.type == MessageType.TRAINING_DATA:
+                await self._handle_training_data_header(websocket, msg, data)
             else:
                 print(f"[Server] Unknown message type: {msg.type}")
 
@@ -317,7 +322,14 @@ class AggregationServer(QObject):
         }
 
     async def _handle_binary_message(self, user_id: str, data: bytes):
-        """Handle binary weight data from a client."""
+        """Handle binary data from a client (training data PNGs or weight data)."""
+
+        # Check if we're expecting training data chunks from this user
+        if user_id in self._pending_training_data:
+            await self._handle_training_data_chunk(user_id, data)
+            return
+
+        # Otherwise, handle as weight data
         try:
             # Deserialize weights
             weights = deserialize_weights(data)
@@ -351,6 +363,53 @@ class AggregationServer(QObject):
         except Exception as e:
             print(f"[Server] Error handling weights from {user_id}: {e}")
 
+    async def _handle_training_data_chunk(self, user_id: str, data: bytes):
+        """
+        Handle a training data binary chunk (image or mask PNG).
+
+        Accumulates chunks until both image and mask are received,
+        then forwards the complete training data to all other clients.
+        """
+        pending = self._pending_training_data[user_id]
+        pending["chunks"].append(data)
+
+        if len(pending["chunks"]) < 2:
+            # Still waiting for the second chunk (mask)
+            return
+
+        # Got both image and mask — forward to all other clients
+        json_header = pending["json_header"]
+        img_data = pending["chunks"][0]
+        mask_data = pending["chunks"][1]
+
+        # Clean up pending state
+        del self._pending_training_data[user_id]
+
+        sender_ws = self._clients.get(user_id)
+        display_name = Message.from_json(json_header).payload.get("display_name", "Unknown")
+        _log(f"Forwarding training data from {display_name} to other clients "
+             f"({len(img_data)}+{len(mask_data)} bytes)")
+
+        # Forward to all clients except the sender
+        for uid, ws in list(self._clients.items()):
+            if ws == sender_ws:
+                continue
+            try:
+                await ws.send(json_header)
+                await ws.send(img_data)
+                await ws.send(mask_data)
+            except Exception as e:
+                _log(f"Error forwarding training data to {uid}: {e}")
+
+        # Send ACK to sender
+        if sender_ws:
+            try:
+                ack = create_training_data_ack_message(user_id, received=True,
+                                                        message="Forwarded to host")
+                await sender_ws.send(ack.to_json())
+            except Exception:
+                pass
+
     async def _handle_goodbye(self, websocket: WebSocketServerProtocol, msg: Message):
         """Handle a GOODBYE message (graceful disconnect)."""
         user_id = msg.payload.get("user_id")
@@ -372,6 +431,29 @@ class AggregationServer(QObject):
             await self._send_global_model_to_client(websocket)
         else:
             _log(f"No global model available to send to {user_id}")
+
+    async def _handle_training_data_header(self, websocket: WebSocketServerProtocol,
+                                            msg: Message, raw_json: str):
+        """
+        Handle a TRAINING_DATA message header.
+
+        Stores metadata and prepares to receive 2 binary messages (image + mask PNGs).
+        Once both arrive, forwards the complete training data to all other clients
+        (including the HostClient which processes the crops for training).
+        """
+        user_id = msg.payload.get("user_id")
+        display_name = msg.payload.get("display_name", "Unknown")
+        crop_size = msg.payload.get("crop_size", 0)
+
+        if not user_id:
+            return
+
+        _log(f"TRAINING_DATA from {display_name} ({crop_size}x{crop_size})")
+
+        self._pending_training_data[user_id] = {
+            "json_header": raw_json,
+            "chunks": []
+        }
 
     async def _broadcast_user_list(self):
         """Broadcast updated user list to all clients."""

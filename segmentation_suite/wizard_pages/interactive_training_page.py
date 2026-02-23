@@ -1133,6 +1133,13 @@ class InteractiveTrainingPage(QWidget):
             self.scan_and_load_initial(self._pending_images_dir)
             self._pending_images_dir = None  # Clear so we don't reload on re-show
 
+        # Network host mode: show status when no images are loaded
+        if not self.image_files and self._multi_user_enabled and self._is_host:
+            self.status_label.setText(
+                "Hosting session \u2014 awaiting crops from clients. "
+                "Click Start Training when ready."
+            )
+
     def load_images(self):
         """Open file dialog to load images."""
         dirpath = QFileDialog.getExistingDirectory(self, "Select Image Directory")
@@ -2601,9 +2608,14 @@ class InteractiveTrainingPage(QWidget):
         Handle weights exported from training worker.
 
         Called every sync_interval epochs during training.
-        Sends weights to the server for aggregation.
+        Only the host sends weights to the server for broadcast.
+        Clients send training crops instead (centralized training mode).
         """
         if not self._multi_user_enabled or not self._sync_client:
+            return
+
+        # Only host broadcasts weights — clients send crops, not weights
+        if not self._is_host:
             return
 
         # Count training samples (approximate from dataset)

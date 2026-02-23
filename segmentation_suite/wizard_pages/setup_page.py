@@ -247,6 +247,7 @@ class SetupPage(QWidget):
         self._sync_client = None
         self._room_code = None
         self._is_relay_mode = False
+        self._is_network_host_mode = False  # True when hosting without local images
         self._is_relay_host = False  # True if user created the relay room
         self._current_architecture = ""  # Set by interactive_training_page
 
@@ -320,6 +321,10 @@ class SetupPage(QWidget):
 
     def validate(self) -> tuple[bool, str]:
         """Validate the configuration."""
+        # Network host mode: no local images required
+        if self._is_network_host_mode:
+            return True, ""
+
         if not self.train_images.text():
             return False, "Please select a training images folder"
         if not os.path.isdir(self.train_images.text()):
@@ -1098,8 +1103,47 @@ class SetupPage(QWidget):
             # Lock the host's architecture while hosting
             self.architecture_locked.emit(self._current_architecture)
 
+            # If no project loaded, create a minimal project and auto-advance
+            has_project = hasattr(self, '_loaded_project_dir') and self._loaded_project_dir
+            if not has_project:
+                self._create_network_host_project()
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start server:\n{e}")
+
+    def _create_network_host_project(self):
+        """Create a minimal project directory for network host mode and auto-advance."""
+        import time
+
+        output_base = os.path.expanduser("~/segmentation_projects")
+        os.makedirs(output_base, exist_ok=True)
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        project_name = f"network_host_{timestamp}"
+        project_dir = os.path.join(output_base, project_name)
+        os.makedirs(project_dir, exist_ok=True)
+
+        # Create necessary subdirectories
+        train_images_dir = os.path.join(project_dir, "train_images")
+        train_masks_dir = os.path.join(project_dir, "train_masks")
+        masks_dir = os.path.join(project_dir, "masks")
+        os.makedirs(train_images_dir, exist_ok=True)
+        os.makedirs(train_masks_dir, exist_ok=True)
+        os.makedirs(masks_dir, exist_ok=True)
+
+        # Fill in setup fields so get_config() works
+        self.project_name.setText(project_name)
+        self.output_dir.setText(output_base)
+        self.train_images.setText(train_images_dir)
+        self._loaded_project_dir = project_dir
+
+        # Mark as network host mode (bypasses validation)
+        self._is_network_host_mode = True
+
+        print(f"[Setup] Created network host project: {project_dir}")
+
+        # Auto-advance to training page
+        self.project_loaded.emit()
 
     def get_multi_user_state(self) -> tuple:
         """Return the current multi-user state (server, client, is_relay_host)."""
