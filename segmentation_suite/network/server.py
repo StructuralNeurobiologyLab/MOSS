@@ -365,30 +365,30 @@ class AggregationServer(QObject):
 
     async def _handle_training_data_chunk(self, user_id: str, data: bytes):
         """
-        Handle a training data binary chunk (image or mask PNG).
+        Handle a training data binary chunk (image, mask, or 2.5D stack PNG).
 
-        Accumulates chunks until both image and mask are received,
+        Accumulates chunks until expected count is reached (2 for 2D, 3 if 2.5D),
         then forwards the complete training data to all other clients.
         """
         pending = self._pending_training_data[user_id]
         pending["chunks"].append(data)
 
-        if len(pending["chunks"]) < 2:
-            # Still waiting for the second chunk (mask)
+        expected = pending.get("expected_chunks", 2)
+        if len(pending["chunks"]) < expected:
             return
 
-        # Got both image and mask — forward to all other clients
+        # Got all chunks — forward to all other clients
         json_header = pending["json_header"]
-        img_data = pending["chunks"][0]
-        mask_data = pending["chunks"][1]
+        chunks = pending["chunks"]
 
         # Clean up pending state
         del self._pending_training_data[user_id]
 
         sender_ws = self._clients.get(user_id)
         display_name = Message.from_json(json_header).payload.get("display_name", "Unknown")
+        sizes = "+".join(str(len(c)) for c in chunks)
         _log(f"Forwarding training data from {display_name} to other clients "
-             f"({len(img_data)}+{len(mask_data)} bytes)")
+             f"({sizes} bytes, {len(chunks)} chunks)")
 
         # Forward to all clients except the sender
         for uid, ws in list(self._clients.items()):
@@ -396,8 +396,8 @@ class AggregationServer(QObject):
                 continue
             try:
                 await ws.send(json_header)
-                await ws.send(img_data)
-                await ws.send(mask_data)
+                for chunk in chunks:
+                    await ws.send(chunk)
             except Exception as e:
                 _log(f"Error forwarding training data to {uid}: {e}")
 
@@ -437,21 +437,25 @@ class AggregationServer(QObject):
         """
         Handle a TRAINING_DATA message header.
 
-        Stores metadata and prepares to receive 2 binary messages (image + mask PNGs).
-        Once both arrive, forwards the complete training data to all other clients
-        (including the HostClient which processes the crops for training).
+        Stores metadata and prepares to receive binary messages (image + mask PNGs,
+        and optionally a 2.5D stack PNG). The expected_chunks field in the payload
+        determines how many binary messages to buffer (2 or 3).
         """
         user_id = msg.payload.get("user_id")
         display_name = msg.payload.get("display_name", "Unknown")
         crop_size = msg.payload.get("crop_size", 0)
+        expected_chunks = msg.payload.get("expected_chunks", 2)
+        has_25d = msg.payload.get("has_25d", False)
 
         if not user_id:
             return
 
-        _log(f"TRAINING_DATA from {display_name} ({crop_size}x{crop_size})")
+        suffix = " +2.5D" if has_25d else ""
+        _log(f"TRAINING_DATA from {display_name} ({crop_size}x{crop_size}{suffix}, {expected_chunks} chunks)")
 
         self._pending_training_data[user_id] = {
             "json_header": raw_json,
+            "expected_chunks": expected_chunks,
             "chunks": []
         }
 

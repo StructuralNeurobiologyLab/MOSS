@@ -90,7 +90,7 @@ class SyncClient(QObject):
     user_joined_room = pyqtSignal(str)  # display_name - emitted when a user joins (relay mode)
 
     # New signals for multi-user redesign
-    training_data_received = pyqtSignal(bytes, bytes, dict)  # image_bytes, mask_bytes, metadata (host only)
+    training_data_received = pyqtSignal(bytes, bytes, bytes, dict)  # image_bytes, mask_bytes, image_25d_bytes, metadata (host only)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -579,18 +579,21 @@ class SyncClient(QObject):
                 _log(f"Received chunk {received}/{self._chunk_total}")
             return
 
-        # Handle training data (two binary messages: image then mask)
+        # Handle training data (2 or 3 binary messages: image, mask, optional 2.5D stack)
         if self._expecting_training_data:
             self._training_data_buffer.append(data)
-            if len(self._training_data_buffer) == 2:
-                # Got both image and mask
-                img_bytes, mask_bytes = self._training_data_buffer
-                metadata = self._training_data_metadata or {}
+            metadata = self._training_data_metadata or {}
+            expected = metadata.get("expected_chunks", 2)
+            if len(self._training_data_buffer) >= expected:
+                img_bytes = self._training_data_buffer[0]
+                mask_bytes = self._training_data_buffer[1]
+                img_25d_bytes = self._training_data_buffer[2] if expected >= 3 else b""
                 self._expecting_training_data = False
                 self._training_data_buffer = []
                 self._training_data_metadata = None
-                _log(f"Training data received: {len(img_bytes)}+{len(mask_bytes)} bytes")
-                self.training_data_received.emit(img_bytes, mask_bytes, metadata)
+                _log(f"Training data received: {len(img_bytes)}+{len(mask_bytes)} bytes"
+                     f"{f'+{len(img_25d_bytes)} 2.5D' if img_25d_bytes else ''}")
+                self.training_data_received.emit(img_bytes, mask_bytes, img_25d_bytes, metadata)
                 self.sync_status.emit("Training crop received")
             return
 
@@ -751,7 +754,8 @@ class SyncClient(QObject):
         except Exception as e:
             _log(f"Error requesting global model: {e}")
 
-    def send_training_data(self, image_array, mask_array, slice_index: int = 0):
+    def send_training_data(self, image_array, mask_array, slice_index: int = 0,
+                           image_25d_array=None):
         """
         Send training crop data to the host (client only).
 
@@ -762,24 +766,33 @@ class SyncClient(QObject):
             image_array: numpy array of the image crop (uint8)
             mask_array: numpy array of the mask crop (uint8)
             slice_index: Source slice index for metadata
+            image_25d_array: optional numpy array of 2.5D stack (uint8, shape (3, H, W))
         """
         if not self._connected or not self._loop:
             self.error.emit("Not connected")
             return
 
         asyncio.run_coroutine_threadsafe(
-            self._send_training_data_async(image_array, mask_array, slice_index),
+            self._send_training_data_async(image_array, mask_array, slice_index,
+                                           image_25d_array),
             self._loop
         )
 
-    async def _send_training_data_async(self, image_array, mask_array, slice_index: int):
+    async def _send_training_data_async(self, image_array, mask_array, slice_index: int,
+                                        image_25d_array=None):
         """Async implementation of send_training_data."""
         if not self._websocket:
             return
 
         try:
             # Serialize the training data
-            img_bytes, mask_bytes = serialize_training_data(image_array, mask_array)
+            has_25d = image_25d_array is not None
+            serialized = serialize_training_data(image_array, mask_array, image_25d_array)
+            if has_25d:
+                img_bytes, mask_bytes, img_25d_bytes = serialized
+            else:
+                img_bytes, mask_bytes = serialized
+                img_25d_bytes = None
 
             # Get crop size
             crop_size = image_array.shape[0] if len(image_array.shape) >= 2 else 256
@@ -789,7 +802,8 @@ class SyncClient(QObject):
                 user_id=self.user_id,
                 display_name=self.display_name,
                 crop_size=crop_size,
-                slice_index=slice_index
+                slice_index=slice_index,
+                has_25d=has_25d
             )
 
             # Send header
@@ -799,9 +813,16 @@ class SyncClient(QObject):
             await self._websocket.send(img_bytes)
             await self._websocket.send(mask_bytes)
 
+            # Send 2.5D stack if available
+            if img_25d_bytes:
+                await self._websocket.send(img_25d_bytes)
+
             total_kb = (len(img_bytes) + len(mask_bytes)) / 1024
-            self.sync_status.emit(f"Sent training crop ({total_kb:.1f}KB)")
-            _log(f"Sent training data: {crop_size}x{crop_size}, {total_kb:.1f}KB")
+            if img_25d_bytes:
+                total_kb += len(img_25d_bytes) / 1024
+            suffix = " +2.5D" if has_25d else ""
+            self.sync_status.emit(f"Sent training crop{suffix} ({total_kb:.1f}KB)")
+            _log(f"Sent training data: {crop_size}x{crop_size}, {total_kb:.1f}KB{suffix}")
 
         except Exception as e:
             self.error.emit(f"Failed to send training data: {e}")

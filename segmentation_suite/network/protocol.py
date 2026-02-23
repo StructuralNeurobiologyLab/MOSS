@@ -315,13 +315,16 @@ def needs_chunking(data: bytes) -> bool:
 
 def create_training_data_message(user_id: str, display_name: str,
                                   crop_size: int, slice_index: int,
+                                  has_25d: bool = False,
                                   chunk_index: int = 0, total_chunks: int = 1) -> Message:
     """
     Create a TRAINING_DATA message header.
 
     Note: The actual image and mask data are sent as binary following the JSON message.
+    Binary messages: image PNG, mask PNG, and optionally 2.5D stack PNG (if has_25d=True).
     """
     import time
+    expected_chunks = 3 if has_25d else 2
     return Message(
         type=MessageType.TRAINING_DATA,
         payload={
@@ -329,6 +332,8 @@ def create_training_data_message(user_id: str, display_name: str,
             "display_name": display_name,
             "crop_size": crop_size,
             "slice_index": slice_index,
+            "has_25d": has_25d,
+            "expected_chunks": expected_chunks,
             "chunk_index": chunk_index,
             "total_chunks": total_chunks,
             "timestamp": int(time.time() * 1000)
@@ -349,16 +354,17 @@ def create_training_data_ack_message(user_id: str, received: bool,
     )
 
 
-def serialize_training_data(image_array, mask_array) -> tuple:
+def serialize_training_data(image_array, mask_array, image_25d_array=None) -> tuple:
     """
     Serialize image and mask arrays to compressed bytes.
 
     Args:
-        image_array: numpy array of the image crop (uint8)
-        mask_array: numpy array of the mask crop (uint8)
+        image_array: numpy array of the image crop (uint8, 2D)
+        mask_array: numpy array of the mask crop (uint8, 2D)
+        image_25d_array: optional numpy array of 2.5D stack (uint8, shape (3, H, W))
 
     Returns:
-        Tuple of (image_bytes, mask_bytes)
+        Tuple of (image_bytes, mask_bytes) or (image_bytes, mask_bytes, image_25d_bytes)
     """
     import io
     from PIL import Image
@@ -372,19 +378,29 @@ def serialize_training_data(image_array, mask_array) -> tuple:
     Image.fromarray(mask_array).save(mask_buffer, format='PNG', compress_level=6)
     mask_bytes = mask_buffer.getvalue()
 
+    if image_25d_array is not None:
+        # 2.5D stack is (3, H, W) — transpose to (H, W, 3) for RGB PNG
+        import numpy as np
+        stack_hwc = np.transpose(image_25d_array, (1, 2, 0))
+        buf_25d = io.BytesIO()
+        Image.fromarray(stack_hwc, mode='RGB').save(buf_25d, format='PNG', compress_level=6)
+        return img_bytes, mask_bytes, buf_25d.getvalue()
+
     return img_bytes, mask_bytes
 
 
-def deserialize_training_data(image_bytes: bytes, mask_bytes: bytes) -> tuple:
+def deserialize_training_data(image_bytes: bytes, mask_bytes: bytes,
+                               image_25d_bytes: bytes = None) -> tuple:
     """
     Deserialize image and mask bytes to numpy arrays.
 
     Args:
         image_bytes: PNG encoded image data
         mask_bytes: PNG encoded mask data
+        image_25d_bytes: optional PNG encoded 2.5D stack (RGB, channels = z-3, z, z+3)
 
     Returns:
-        Tuple of (image_array, mask_array) as numpy arrays
+        Tuple of (image_array, mask_array) or (image_array, mask_array, image_25d_array)
     """
     import io
     import numpy as np
@@ -392,5 +408,11 @@ def deserialize_training_data(image_bytes: bytes, mask_bytes: bytes) -> tuple:
 
     img = Image.open(io.BytesIO(image_bytes))
     mask = Image.open(io.BytesIO(mask_bytes))
+
+    if image_25d_bytes:
+        img_25d = Image.open(io.BytesIO(image_25d_bytes))
+        # Convert from (H, W, 3) RGB back to (3, H, W)
+        arr_25d = np.transpose(np.array(img_25d), (2, 0, 1))
+        return np.array(img), np.array(mask), arr_25d
 
     return np.array(img), np.array(mask)

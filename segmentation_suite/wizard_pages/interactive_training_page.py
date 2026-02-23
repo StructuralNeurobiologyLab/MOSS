@@ -814,7 +814,7 @@ class InteractiveTrainingPage(QWidget):
         row2.addWidget(self.pred_model_combo)
 
         # Prediction toggle
-        self.show_pred_check = QCheckBox("Show")
+        self.show_pred_check = QCheckBox("Predict")
         self.show_pred_check.setChecked(False)
         self.show_pred_check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.show_pred_check.stateChanged.connect(self.on_show_predictions_changed)
@@ -1762,9 +1762,37 @@ class InteractiveTrainingPage(QWidget):
             # Multi-user mode: send crop to host
             if self._multi_user_enabled and self._sync_client and self._sync_client.is_connected:
                 if not self._is_host:
+                    # Compute 2.5D stack for sending (client has the volume data)
+                    stack_25d = None
+                    adjacent = self._load_adjacent_slices(idx)
+                    if adjacent is not None and len(adjacent) == 3:
+                        try:
+                            crops_25d = []
+                            for slice_img in adjacent:
+                                sh, sw = slice_img.shape
+                                if crop_y + crop_h <= sh and crop_x + crop_w <= sw:
+                                    c = slice_img[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w].copy()
+                                    c_min, c_max = c.min(), c.max()
+                                    if c_max > c_min:
+                                        c = ((c - c_min) / (c_max - c_min) * 255).astype(np.uint8)
+                                    else:
+                                        c = c.astype(np.uint8)
+                                    crops_25d.append(c)
+                                else:
+                                    crops_25d = None
+                                    break
+                            if crops_25d and len(crops_25d) == 3:
+                                stack_25d = np.stack(crops_25d, axis=0)  # (3, H, W)
+                        except Exception as e:
+                            print(f"[MultiUser] Failed to compute 2.5D stack for sending: {e}")
+
                     # Client sends crop to host
-                    self._sync_client.send_training_data(img_crop_uint8, mask_after_crop, idx)
-                    status_msg += " (sent to host)"
+                    self._sync_client.send_training_data(
+                        img_crop_uint8, mask_after_crop, idx,
+                        image_25d_array=stack_25d
+                    )
+                    suffix = " +2.5D" if stack_25d is not None else ""
+                    status_msg += f" (sent to host{suffix})"
                 # Host doesn't need to send - crop is already saved locally
 
             self.status_label.setText(status_msg)
@@ -2915,11 +2943,13 @@ class InteractiveTrainingPage(QWidget):
                 import traceback
                 traceback.print_exc()
 
-    def _on_training_data_received(self, image_bytes: bytes, mask_bytes: bytes, metadata: dict):
+    def _on_training_data_received(self, image_bytes: bytes, mask_bytes: bytes,
+                                    image_25d_bytes: bytes, metadata: dict):
         """
         Handle training data received from a client (host only).
 
-        Saves the crop to the training directory and optionally triggers dataset reload.
+        Saves the crop to the training directory (2D and optionally 2.5D)
+        and optionally triggers dataset reload.
         """
         if not self._is_host:
             return
@@ -2928,8 +2958,10 @@ class InteractiveTrainingPage(QWidget):
         crop_size = metadata.get("crop_size", 0)
         timestamp = metadata.get("timestamp", 0)
         sender_id = metadata.get("user_id", "unknown")[:8]
+        has_25d = metadata.get("has_25d", False)
 
-        print(f"[MultiUser] Received training crop from {sender} ({crop_size}x{crop_size})")
+        suffix = " +2.5D" if has_25d else ""
+        print(f"[MultiUser] Received training crop from {sender} ({crop_size}x{crop_size}{suffix})")
 
         if not self.train_images_dir or not self.train_masks_dir:
             print("[MultiUser] No training directories set, cannot save received crop")
@@ -2946,15 +2978,40 @@ class InteractiveTrainingPage(QWidget):
             # Generate filename
             crop_id = f"remote_{sender_id}_{timestamp}"
 
-            # Save to training directories
+            # Save 2D crop to training directories
             img_path = self.train_images_dir / f"{crop_id}.tif"
             mask_path = self.train_masks_dir / f"{crop_id}.tif"
 
             img.save(img_path, compression='tiff_lzw')
             mask.save(mask_path, compression='tiff_lzw')
 
+            # Save 2.5D crop if received
+            saved_25d = False
+            if has_25d and image_25d_bytes and self.train_images_25d_dir and self.train_masks_25d_dir:
+                try:
+                    import tifffile
+
+                    # Decode 2.5D RGB PNG back to (3, H, W) stack
+                    img_25d = Image.open(io.BytesIO(image_25d_bytes))
+                    arr_25d = np.transpose(np.array(img_25d), (2, 0, 1))  # (H,W,3) -> (3,H,W)
+
+                    # Save as multi-channel TIFF
+                    tifffile.imwrite(
+                        str(self.train_images_25d_dir / f"{crop_id}.tif"),
+                        arr_25d, compression='lzw'
+                    )
+                    # Mask is same for 2D and 2.5D
+                    mask.save(self.train_masks_25d_dir / f"{crop_id}.tif", compression='tiff_lzw')
+                    saved_25d = True
+                    print(f"[MultiUser] Saved 2.5D crop {crop_id}.tif (stack shape {arr_25d.shape})")
+                except Exception as e:
+                    print(f"[MultiUser] Failed to save 2.5D crop: {e}")
+
+            status = f"Received crop from {sender}"
+            if saved_25d:
+                status += " (2D+2.5D)"
             print(f"[MultiUser] Saved training crop from {sender} to {crop_id}.tif")
-            self._show_temp_status(f"Received crop from {sender}")
+            self._show_temp_status(status)
 
             # Request dataset reload in train worker
             if self.train_worker and self.train_worker.isRunning():
