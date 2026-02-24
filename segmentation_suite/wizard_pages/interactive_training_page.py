@@ -2992,7 +2992,7 @@ class InteractiveTrainingPage(QWidget):
                     import tifffile
 
                     # Decode 2.5D RGB PNG back to (3, H, W) stack
-                    img_25d = Image.open(io.BytesIO(image_25d_bytes))
+                    img_25d = Image.open(io.BytesIO(image_25d_bytes)).convert('RGB')
                     arr_25d = np.transpose(np.array(img_25d), (2, 0, 1))  # (H,W,3) -> (3,H,W)
 
                     # Save as multi-channel TIFF
@@ -3003,7 +3003,6 @@ class InteractiveTrainingPage(QWidget):
                     # Mask is same for 2D and 2.5D
                     mask.save(self.train_masks_25d_dir / f"{crop_id}.tif", compression='tiff_lzw')
                     saved_25d = True
-                    print(f"[MultiUser] Saved 2.5D crop {crop_id}.tif (stack shape {arr_25d.shape})")
                 except Exception as e:
                     print(f"[MultiUser] Failed to save 2.5D crop: {e}")
 
