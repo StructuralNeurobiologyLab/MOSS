@@ -375,7 +375,7 @@ class AggregationServer(QObject):
 
             # Check if we should aggregate
             if self.aggregator.update_count >= self.min_contributors:
-                await self._aggregate_and_broadcast()
+                await self._aggregate_and_broadcast(exclude_user=user_id)
 
         except Exception as e:
             print(f"[Server] Error handling weights from {user_id}: {e}")
@@ -537,8 +537,8 @@ class AggregationServer(QObject):
             except Exception:
                 pass
 
-    async def _aggregate_and_broadcast(self):
-        """Aggregate weights and broadcast to all clients."""
+    async def _aggregate_and_broadcast(self, exclude_user: str = None):
+        """Aggregate weights and broadcast to all clients except the sender."""
         # Perform aggregation
         global_weights = self.aggregator.aggregate(min_updates=1)
         if global_weights is None:
@@ -550,10 +550,10 @@ class AggregationServer(QObject):
         # Emit signal with new weights
         self.aggregation_complete.emit(global_weights)
 
-        # Broadcast to all clients
-        await self._broadcast_global_model()
+        # Broadcast to all clients except the one who sent the weights
+        await self._broadcast_global_model(exclude_user=exclude_user)
 
-    async def _broadcast_global_model(self):
+    async def _broadcast_global_model(self, exclude_user: str = None):
         """Broadcast global model to all connected clients."""
         if self.aggregator.global_weights is None:
             return
@@ -561,12 +561,14 @@ class AggregationServer(QObject):
         # Serialize weights once
         weights_data = serialize_weights(self.aggregator.global_weights)
 
-        # Send to all clients (using chunking if needed)
-        for websocket in list(self._clients.values()):
+        # Send to all clients (skip the sender who already has these weights)
+        for uid, websocket in list(self._clients.items()):
+            if uid == exclude_user:
+                continue
             try:
                 await self._send_weights_to_client(websocket, weights_data)
             except Exception as e:
-                print(f"[Server] Error broadcasting to client: {e}")
+                print(f"[Server] Error broadcasting to client {uid}: {e}")
 
     async def _send_global_model_to_client(self, websocket: WebSocketServerProtocol):
         """Send current global model to a specific client."""
@@ -601,6 +603,8 @@ class AggregationServer(QObject):
                 self.session.aggregation_round if self.session else 0
             )
             start_msg.payload["contributor_count"] = len(self._clients)
+            start_msg.payload["display_name"] = "Host"
+            start_msg.payload["epoch"] = self.session.aggregation_round if self.session else 0
             await websocket.send(start_msg.to_json())
 
             # Send chunks
