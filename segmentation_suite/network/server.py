@@ -25,7 +25,9 @@ from .protocol import (
     Message, MessageType, serialize_weights, deserialize_weights,
     create_welcome_message, create_weights_ack_message,
     create_global_model_message, create_user_list_message,
-    create_error_message, create_training_data_ack_message
+    create_error_message, create_training_data_ack_message,
+    create_chunk_start_message, create_chunk_end_message,
+    chunk_data, needs_chunking, MAX_CHUNK_SIZE
 )
 from .session import MultiUserSession, UserInfo, get_local_ip
 from .aggregator import FedAvgAggregator
@@ -84,6 +86,10 @@ class AggregationServer(QObject):
 
         # Pending training data (per-user binary chunk tracking)
         self._pending_training_data = {}  # user_id -> {"json_header": str, "chunks": []}
+
+        # Pending chunked weight transfers (per-user)
+        self._pending_chunks = {}  # user_id -> {"transfer_id": str, "chunks": [], "total_chunks": int}
+        self._pending_weights = {}  # user_id -> {"epoch": int, "loss": float, "num_samples": int}
 
         # Aggregation settings
         self.min_contributors = 1  # Minimum clients needed to trigger aggregation
@@ -243,6 +249,10 @@ class AggregationServer(QObject):
                 await self._handle_hello(websocket, msg)
             elif msg.type == MessageType.WEIGHTS_PUSH:
                 await self._handle_weights_push_header(websocket, msg)
+            elif msg.type == MessageType.CHUNK_START:
+                await self._handle_chunk_start(websocket, msg)
+            elif msg.type == MessageType.CHUNK_END:
+                await self._handle_chunk_end(websocket, msg)
             elif msg.type == MessageType.GOODBYE:
                 await self._handle_goodbye(websocket, msg)
             elif msg.type == MessageType.REQUEST_MODEL:
@@ -311,10 +321,6 @@ class AggregationServer(QObject):
         if not user_id:
             return
 
-        # Store metadata for when binary data arrives
-        if not hasattr(self, '_pending_weights'):
-            self._pending_weights = {}
-
         self._pending_weights[user_id] = {
             "epoch": epoch,
             "loss": loss,
@@ -322,20 +328,31 @@ class AggregationServer(QObject):
         }
 
     async def _handle_binary_message(self, user_id: str, data: bytes):
-        """Handle binary data from a client (training data PNGs or weight data)."""
+        """Handle binary data from a client (training data, weight chunks, or complete weights)."""
 
         # Check if we're expecting training data chunks from this user
         if user_id in self._pending_training_data:
             await self._handle_training_data_chunk(user_id, data)
             return
 
-        # Otherwise, handle as weight data
+        # Check if this is part of a chunked weight transfer
+        if user_id in self._pending_chunks:
+            pending = self._pending_chunks[user_id]
+            pending["chunks"].append(data)
+            received = len(pending["chunks"])
+            if received % 2 == 0 or received == pending["total_chunks"]:
+                _log(f"Received weight chunk {received}/{pending['total_chunks']} from {user_id}")
+            return
+
+        # Otherwise, handle as complete (non-chunked) weight data
+        await self._process_complete_weights(user_id, data)
+
+    async def _process_complete_weights(self, user_id: str, data: bytes):
+        """Process complete (reassembled or non-chunked) weight data."""
         try:
-            # Deserialize weights
             weights = deserialize_weights(data)
 
-            # Get metadata
-            metadata = getattr(self, '_pending_weights', {}).get(user_id, {})
+            metadata = self._pending_weights.get(user_id, {})
             epoch = metadata.get("epoch", 0)
             loss = metadata.get("loss", 0.0)
             num_samples = metadata.get("num_samples", 1)
@@ -409,6 +426,53 @@ class AggregationServer(QObject):
                 await sender_ws.send(ack.to_json())
             except Exception:
                 pass
+
+    async def _handle_chunk_start(self, websocket: WebSocketServerProtocol, msg: Message):
+        """Handle CHUNK_START — begin buffering a chunked weight transfer."""
+        user_id = self._websocket_to_user.get(websocket)
+        if not user_id:
+            return
+
+        transfer_id = msg.payload.get("transfer_id", "")
+        total_chunks = msg.payload.get("total_chunks", 0)
+        original_type = msg.payload.get("original_type", "")
+        total_size = msg.payload.get("total_size", 0)
+
+        _log(f"CHUNK_START from {user_id}: {total_chunks} chunks, "
+             f"{total_size} bytes, type={original_type}")
+
+        self._pending_chunks[user_id] = {
+            "transfer_id": transfer_id,
+            "chunks": [],
+            "total_chunks": total_chunks,
+            "original_type": original_type
+        }
+
+        # Store weights metadata from the chunk_start payload
+        self._pending_weights[user_id] = {
+            "epoch": msg.payload.get("epoch", 0),
+            "loss": msg.payload.get("loss", 0.0),
+            "num_samples": msg.payload.get("num_samples", 1)
+        }
+
+    async def _handle_chunk_end(self, websocket: WebSocketServerProtocol, msg: Message):
+        """Handle CHUNK_END — reassemble chunks and process as complete weights."""
+        user_id = self._websocket_to_user.get(websocket)
+        if not user_id:
+            return
+
+        transfer_id = msg.payload.get("transfer_id", "")
+        pending = self._pending_chunks.get(user_id)
+        if not pending or pending["transfer_id"] != transfer_id:
+            _log(f"CHUNK_END: no matching transfer for {transfer_id}")
+            return
+
+        _log(f"CHUNK_END from {user_id}: reassembling {len(pending['chunks'])} chunks")
+        reassembled = b''.join(pending["chunks"])
+        del self._pending_chunks[user_id]
+
+        _log(f"Reassembled {len(reassembled)} bytes from {user_id}")
+        await self._process_complete_weights(user_id, reassembled)
 
     async def _handle_goodbye(self, websocket: WebSocketServerProtocol, msg: Message):
         """Handle a GOODBYE message (graceful disconnect)."""
@@ -494,21 +558,13 @@ class AggregationServer(QObject):
         if self.aggregator.global_weights is None:
             return
 
-        # Create message header
-        msg = create_global_model_message(
-            aggregation_round=self.session.aggregation_round if self.session else 0,
-            contributor_count=len(self._clients)
-        )
-        json_data = msg.to_json()
-
-        # Serialize weights
+        # Serialize weights once
         weights_data = serialize_weights(self.aggregator.global_weights)
 
-        # Send to all clients
+        # Send to all clients (using chunking if needed)
         for websocket in list(self._clients.values()):
             try:
-                await websocket.send(json_data)
-                await websocket.send(weights_data)
+                await self._send_weights_to_client(websocket, weights_data)
             except Exception as e:
                 print(f"[Server] Error broadcasting to client: {e}")
 
@@ -517,16 +573,51 @@ class AggregationServer(QObject):
         if self.aggregator.global_weights is None:
             return
 
-        msg = create_global_model_message(
-            aggregation_round=self.session.aggregation_round if self.session else 0,
-            contributor_count=len(self._clients)
-        )
-
         try:
-            await websocket.send(msg.to_json())
-            await websocket.send(serialize_weights(self.aggregator.global_weights))
+            weights_data = serialize_weights(self.aggregator.global_weights)
+            await self._send_weights_to_client(websocket, weights_data)
         except Exception as e:
             print(f"[Server] Error sending global model: {e}")
+
+    async def _send_weights_to_client(self, websocket: WebSocketServerProtocol,
+                                       weights_data: bytes):
+        """Send weights to a client, using chunking if the data is large."""
+        if needs_chunking(weights_data):
+            import uuid
+            transfer_id = str(uuid.uuid4())[:8]
+            chunks = chunk_data(weights_data)
+            total_chunks = len(chunks)
+
+            _log(f"Sending weights in {total_chunks} chunks ({len(weights_data)} bytes)")
+
+            # Send chunk_start
+            start_msg = create_chunk_start_message(
+                transfer_id=transfer_id,
+                total_chunks=total_chunks,
+                total_size=len(weights_data),
+                original_type="global_model"
+            )
+            start_msg.payload["aggregation_round"] = (
+                self.session.aggregation_round if self.session else 0
+            )
+            start_msg.payload["contributor_count"] = len(self._clients)
+            await websocket.send(start_msg.to_json())
+
+            # Send chunks
+            for chunk in chunks:
+                await websocket.send(chunk)
+
+            # Send chunk_end
+            end_msg = create_chunk_end_message(transfer_id)
+            await websocket.send(end_msg.to_json())
+        else:
+            # Small enough to send in one message
+            msg = create_global_model_message(
+                aggregation_round=self.session.aggregation_round if self.session else 0,
+                contributor_count=len(self._clients)
+            )
+            await websocket.send(msg.to_json())
+            await websocket.send(weights_data)
 
     def set_global_weights(self, weights: dict):
         """
