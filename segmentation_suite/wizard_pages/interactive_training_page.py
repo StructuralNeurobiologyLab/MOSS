@@ -164,7 +164,7 @@ class InteractiveTrainingPage(QWidget):
         self._aggregation_server = None  # AggregationServer (if hosting)
         self._multi_user_enabled = False
         self._is_host = False  # Whether this user is hosting the session
-        self._sync_interval_epochs = 5  # Push weights every N epochs
+        self._sync_interval_epochs = 2  # Push weights every N epochs
         self._blend_ratio = 0.5  # How much to blend global model (0=local, 1=global)
         self._last_sync_epoch = 0
         self._pending_global_weights = None  # Weights received while training
