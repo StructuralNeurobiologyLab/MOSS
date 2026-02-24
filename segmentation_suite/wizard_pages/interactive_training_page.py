@@ -2781,19 +2781,31 @@ class InteractiveTrainingPage(QWidget):
                 self._show_temp_status("Received model from session")
                 return
 
-            # Load local weights for blending
+            # In centralized mode (client not training), use host weights directly
+            if not self._is_host:
+                new_checkpoint = {
+                    'epoch': 0,
+                    'model_state_dict': global_weights,
+                    'loss': 0.0
+                }
+                torch.save(new_checkpoint, checkpoint_path)
+                if self.predict_worker:
+                    self.predict_worker.set_checkpoint(str(checkpoint_path))
+                self._show_temp_status("Received model from host")
+                print(f"[MultiUser] Applied host weights directly (centralized mode)")
+                return
+
+            # Federated mode: blend local and global weights
             local_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
             if isinstance(local_checkpoint, dict) and 'model_state_dict' in local_checkpoint:
                 local_weights = local_checkpoint['model_state_dict']
             elif isinstance(local_checkpoint, dict) and 'model_state' in local_checkpoint:
                 local_weights = local_checkpoint['model_state']
             else:
-                local_weights = local_checkpoint  # Assume it's just the state dict
+                local_weights = local_checkpoint
 
-            # Blend weights
             blended = blend_weights(local_weights, global_weights, self._blend_ratio)
 
-            # Save blended weights back to checkpoint
             if isinstance(local_checkpoint, dict):
                 if 'model_state_dict' in local_checkpoint:
                     local_checkpoint['model_state_dict'] = blended
@@ -2806,7 +2818,6 @@ class InteractiveTrainingPage(QWidget):
 
             torch.save(local_checkpoint, checkpoint_path)
 
-            # Notify prediction worker to reload
             if self.predict_worker:
                 self.predict_worker.set_checkpoint(str(checkpoint_path))
 
