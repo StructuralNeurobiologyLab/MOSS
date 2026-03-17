@@ -26,7 +26,7 @@ class ViewportPredictWorker(QThread):
     """
 
     # Signals
-    prediction_ready = pyqtSignal(np.ndarray, tuple)  # prediction, viewport_bounds
+    prediction_ready = pyqtSignal(np.ndarray, tuple, int)  # prediction, viewport_bounds, slice_index
 
     # Only reload model every N seconds (avoids conflicts with training)
     # Reduced to 5 seconds for more responsive live predictions during training
@@ -258,16 +258,17 @@ class ViewportPredictWorker(QThread):
                 pass
             return False
 
-    def request_prediction(self, image: np.ndarray, viewport_bounds: tuple):
+    def request_prediction(self, image: np.ndarray, viewport_bounds: tuple, slice_index: int = -1):
         """
         Queue a prediction request. Replaces any pending request.
 
         Args:
             image: Full image array (2D grayscale or 3D with 3 channels for 2.5D)
             viewport_bounds: (x_min, y_min, x_max, y_max) in image coordinates
+            slice_index: The slice index this prediction is for (used to discard stale results)
         """
         self.mutex.lock()
-        self.pending_request = (image, viewport_bounds)
+        self.pending_request = (image, viewport_bounds, slice_index)
         self.mutex.unlock()
 
     def is_25d(self) -> bool:
@@ -414,7 +415,7 @@ class ViewportPredictWorker(QThread):
                 if self.model is None:
                     continue
 
-            image, bounds = request
+            image, bounds, slice_idx = request
             x_min, y_min, x_max, y_max = bounds
 
             try:
@@ -447,8 +448,8 @@ class ViewportPredictWorker(QThread):
 
                 prediction = prediction[trim_top:trim_bottom, trim_left:trim_right]
 
-                # Emit result
-                self.prediction_ready.emit(prediction, bounds)
+                # Emit result with slice index for staleness check
+                self.prediction_ready.emit(prediction, bounds, slice_idx)
 
             except Exception as e:
                 # Silently skip failed predictions

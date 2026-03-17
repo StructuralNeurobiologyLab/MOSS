@@ -12,6 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 # Configure zarr for async concurrency (must be done before opening any zarr arrays)
 try:
     import zarr
+    import warnings
+    # Suppress v2/v3 coexistence warnings (we handle this in _open_zarr_robust)
+    warnings.filterwarnings('ignore', category=UserWarning, module='zarr')
     # Try zarr v3 config style first
     if hasattr(zarr, 'config'):
         zarr.config.set({'async.concurrency': 64})
@@ -37,7 +40,7 @@ class ZarrImageSource:
         import zarr
 
         self.zarr_path = Path(zarr_path)
-        self.zarr_group = zarr.open(str(zarr_path), mode='r')
+        self.zarr_group = self._open_zarr_robust(zarr_path)
 
         # Discover pyramid structure
         self.pyramid_paths = []  # List of dataset paths (e.g., ['0', 's1', 's2', 's3'])
@@ -60,11 +63,67 @@ class ZarrImageSource:
         self._stats_thread = threading.Thread(target=self._compute_global_stats_async, daemon=True)
         self._stats_thread.start()
 
+    @staticmethod
+    def _open_zarr_robust(zarr_path):
+        """Open a Zarr store, handling v2/v3 format conflicts.
+
+        Some stores have v2 root metadata (.zgroup/.zattrs) but v3 arrays,
+        or v3 root metadata (zarr.json) with empty attrs. This method tries
+        multiple strategies to get a working group with both attrs and arrays.
+        """
+        import zarr
+        zarr_path = str(zarr_path)
+        zarr_major = int(zarr.__version__.split('.')[0])
+
+        if zarr_major >= 3:
+            # Zarr 3.x: try v3 first, fall back to v2 if arrays not found
+            # Strategy 1: open normally (zarr 3 picks format automatically)
+            group = zarr.open_group(zarr_path, mode='r')
+            if list(group.keys()):
+                return group
+
+            # Strategy 2: try forcing v2 format
+            try:
+                group_v2 = zarr.open_group(zarr_path, mode='r', zarr_format=2)
+                if list(group_v2.keys()):
+                    return group_v2
+            except Exception:
+                pass
+
+            # Strategy 3: try forcing v3 format
+            try:
+                group_v3 = zarr.open_group(zarr_path, mode='r', zarr_format=3)
+                if list(group_v3.keys()):
+                    # v3 group may have empty attrs if multiscales are in .zattrs (v2)
+                    # Merge v2 attrs if available
+                    if not group_v3.attrs.get('multiscales'):
+                        import json
+                        zattrs_path = Path(zarr_path) / '.zattrs'
+                        if zattrs_path.exists():
+                            v2_attrs = json.loads(zattrs_path.read_text())
+                            # Store merged attrs for later use
+                            group_v3._v2_attrs = v2_attrs
+                    return group_v3
+            except Exception:
+                pass
+
+            # Last resort: return whatever we got
+            return group
+        else:
+            # Zarr 2.x: just open normally
+            return zarr.open(zarr_path, mode='r')
+
     def _discover_pyramid_levels(self):
         """Discover pyramid levels from Zarr metadata."""
         # Try OME-Zarr multiscales first
-        if hasattr(self.zarr_group, 'attrs') and 'multiscales' in self.zarr_group.attrs:
+        # Check both native attrs and merged v2 attrs (for v2/v3 hybrid stores)
+        attrs = {}
+        if hasattr(self.zarr_group, 'attrs'):
             attrs = dict(self.zarr_group.attrs)
+        if 'multiscales' not in attrs and hasattr(self.zarr_group, '_v2_attrs'):
+            attrs = self.zarr_group._v2_attrs
+
+        if 'multiscales' in attrs:
             multiscales = attrs['multiscales'][0]  # First multiscale
             datasets = multiscales.get('datasets', [])
 

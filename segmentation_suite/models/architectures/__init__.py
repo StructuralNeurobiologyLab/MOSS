@@ -23,6 +23,7 @@ _architecture_names: Dict[str, str] = {}
 _architecture_descriptions: Dict[str, str] = {}
 _architecture_losses: Dict[str, str] = {}  # Optional preferred loss function
 _architecture_checkpoints: Dict[str, str] = {}  # Pretrained checkpoint paths
+_architecture_training_v2: Dict[str, bool] = {}  # v2 training improvements flag
 _loaded = False
 
 
@@ -69,6 +70,10 @@ def _load_architectures():
             pretrained_ckpt = getattr(module, 'PRETRAINED_CHECKPOINT', None)
             if pretrained_ckpt:
                 _architecture_checkpoints[arch_id] = pretrained_ckpt
+
+            # Check for v2 training improvements flag
+            if getattr(module, 'TRAINING_V2', False):
+                _architecture_training_v2[arch_id] = True
 
             # Debug output (commented out for cleaner startup)
             # print(f"Loaded architecture: {arch_id} ({module.ARCHITECTURE_NAME})")
@@ -169,3 +174,9 @@ def get_pretrained_checkpoint(arch_id: str) -> Optional[str]:
     """
     _load_architectures()
     return _architecture_checkpoints.get(arch_id)
+
+
+def uses_training_v2(arch_id: str) -> bool:
+    """Check if architecture uses v2 training improvements (grad clipping, proper resume)."""
+    _load_architectures()
+    return _architecture_training_v2.get(arch_id, False)

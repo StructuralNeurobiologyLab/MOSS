@@ -811,10 +811,13 @@ class TrainWorker(QThread):
                 return
 
             # Loss function
-            from ..models.architectures import get_preferred_loss
+            from ..models.architectures import get_preferred_loss, uses_training_v2
             loss_type = get_preferred_loss(architecture)
             criterion = get_loss_function(loss_type)
+            training_v2 = uses_training_v2(architecture)
             print(f"  Loss function:   {loss_type} ({criterion.__class__.__name__})")
+            if training_v2:
+                print(f"  Training mode:   v2 (grad clipping, proper resume)")
 
             # Training params
             print(f"  Learning rate:   {learning_rate}")
@@ -859,7 +862,10 @@ class TrainWorker(QThread):
                     # Assume the checkpoint IS the state dict
                     model.load_state_dict(ckpt)
                 # Load optimizer if available
-                if "optimizer_state" in ckpt:
+                # v2: skip optimizer state to avoid stale momentum after adding new data
+                if training_v2:
+                    print(f"  Optimizer:       fresh Adam (v2 mode)")
+                elif "optimizer_state" in ckpt:
                     optimizer.load_state_dict(ckpt["optimizer_state"])
                 elif "optimizer_state_dict" in ckpt:
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -887,10 +893,13 @@ class TrainWorker(QThread):
                 # Freeze BatchNorm running stats for stable live predictions
                 # Only when resuming from a checkpoint (stats are already good).
                 # When training from scratch, let stats adapt normally.
+                # v2: only freeze for first 3 warmup epochs, then let BN adapt
                 if resume_checkpoint:
-                    for module in model.modules():
-                        if isinstance(module, nn.BatchNorm2d):
-                            module.eval()  # Freeze running_mean/running_var updates
+                    bn_warmup_epochs = 3 if training_v2 else num_epochs
+                    if (epoch - start_epoch) < bn_warmup_epochs:
+                        for module in model.modules():
+                            if isinstance(module, nn.BatchNorm2d):
+                                module.eval()  # Freeze running_mean/running_var updates
 
                 train_loss = 0.0
                 batch_count = 0
@@ -924,6 +933,9 @@ class TrainWorker(QThread):
                                 outputs = model(imgs)
                             loss = criterion(outputs, masks)
                         scaler.scale(loss).backward()
+                        if training_v2:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         scaler.step(optimizer)
                         scaler.update()
                     else:
@@ -933,6 +945,8 @@ class TrainWorker(QThread):
                             outputs = model(imgs)
                         loss = criterion(outputs, masks)
                         loss.backward()
+                        if training_v2:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
 
                     batch_loss = loss.item()
@@ -1003,10 +1017,7 @@ class TrainWorker(QThread):
                         num_workers=0, pin_memory=False
                     )
 
-            # Final save
-            final_path = checkpoint_path.replace('.pth', '_final.pth')
-            torch.save(model.state_dict(), final_path)
-            self.log.emit(f"Training complete. Model saved to {final_path}")
+            self.log.emit(f"Training complete. Model saved to {checkpoint_path}")
             self.finished.emit(True, checkpoint_path)
 
         except Exception as e:

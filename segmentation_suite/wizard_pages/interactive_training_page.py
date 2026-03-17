@@ -689,20 +689,24 @@ class InteractiveTrainingPage(QWidget):
             if adjacent is not None and len(adjacent) == 3:
                 # Stack as (H, W, 3)
                 image_stack = np.stack(adjacent, axis=-1)
-                self.predict_worker.request_prediction(image_stack, bounds)
+                self.predict_worker.request_prediction(image_stack, bounds, idx)
             else:
                 # Fall back to single slice if adjacent loading fails
-                self.predict_worker.request_prediction(image, bounds)
+                self.predict_worker.request_prediction(image, bounds, idx)
         else:
             # Regular 2D prediction
-            self.predict_worker.request_prediction(image, bounds)
+            self.predict_worker.request_prediction(image, bounds, idx)
 
-    def _on_prediction_ready(self, prediction: np.ndarray, bounds: tuple):
+    def _on_prediction_ready(self, prediction: np.ndarray, bounds: tuple, request_slice_idx: int = -1):
         """Handle prediction result from worker."""
         if not self.show_predictions:
             return
 
         idx = self.current_slice_index
+
+        # Discard stale predictions from a different slice
+        if request_slice_idx >= 0 and request_slice_idx != idx:
+            return
 
         # Get image dimensions - handle both Zarr and TIFF modes
         if self.use_zarr and self.zarr_source is not None:
@@ -1326,12 +1330,18 @@ class InteractiveTrainingPage(QWidget):
                             and old_project_dir != new_project_dir
                             and str(old_project_dir) != '')
 
+        # If same project and already initialized, just update config and return
+        # This prevents re-initialization from resetting slice index during training
+        if not is_project_change and old_project_dir == new_project_dir and self.image_files:
+            self.config = config
+            return
+
         if is_project_change:
             print(f"[Training] Project changed from {old_project_dir} to {new_project_dir}")
             # Reset state for new project
             self.image_files = []
             self.image_source = None
-            self.current_index = 0
+            self.current_slice_index = 0
             # Canvas will be updated when new images are loaded via scan_and_load_initial
 
         self.config = config

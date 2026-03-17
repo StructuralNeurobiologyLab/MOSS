@@ -254,7 +254,7 @@ class WelcomePage(QWidget):
         main_layout.addStretch()
 
         # Footer
-        self.footer_label = QLabel("v1.0.0")
+        self.footer_label = QLabel("v1.1.0")
         self.footer_label.setFont(scaled_font(9))
         self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.footer_label.setStyleSheet("color: #555555; background: transparent; border: none;")

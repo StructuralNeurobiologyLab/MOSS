@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "segmentation-suite"
-version = "1.0.0"
+version = "1.1.0"
 description = "MOSS - Microscopy Oriented Segmentation with Supervision. Interactive segmentation tool with U-Net training and prediction."
 readme = "README.md"
 license = "MIT"
@@ -39,7 +39,7 @@ dependencies = [
     "psutil>=5.9.0",
     "PyOpenGL>=3.1.0",
     "tensorstore>=0.1.45",
-    "zarr>=2.16.0",
+    "zarr>=3.0.0",
 ]
 
 [project.scripts]

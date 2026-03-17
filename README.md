@@ -32,7 +32,7 @@ pip install -e .
 ```bash
 python -m venv moss-env
 source moss-env/bin/activate
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -e .
 ```
 
