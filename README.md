@@ -16,7 +16,22 @@ MOSS-lite is the first version of MOSS and my personal copy. All future work and
 
 ## Installation
 
-### Option 1: pip install (recommended)
+
+
+### Option 1: conda environment (Recommended)
+
+```bash
+# Create environment from file
+conda env create -f environment.yml
+
+# Activate environment
+conda activate moss
+
+# Install the package
+pip install -e .
+```
+
+### Option 2: pip install
 
 #### Mac (Apple Silicon or Intel)
 
@@ -42,19 +57,6 @@ pip install -e .
 python -m venv moss-env
 source moss-env/bin/activate  # On Windows: moss-env\Scripts\activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install -e .
-```
-
-### Option 2: conda environment
-
-```bash
-# Create environment from file
-conda env create -f environment.yml
-
-# Activate environment
-conda activate moss
-
-# Install the package
 pip install -e .
 ```
 
