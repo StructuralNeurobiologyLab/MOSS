@@ -282,13 +282,16 @@ class SyncClient(QObject):
         while self._running:
             try:
                 await self._connect_and_listen()
+                # Clean exit from listen loop (e.g., _running set to False)
+                break
             except Exception as e:
                 _log(f"Connection error: {e}")
-                import traceback
-                traceback.print_exc()
                 self._connected = False
                 self.disconnected.emit()
-                self.error.emit(f"Connection failed: {e}")
+
+                # Only show error if this wasn't a deliberate disconnect
+                if self._running:
+                    self.error.emit(f"Connection failed: {e}")
 
                 if not self._running or not self.auto_reconnect:
                     _log(f"Not reconnecting (running={self._running}, auto_reconnect={self.auto_reconnect})")
@@ -371,10 +374,17 @@ class SyncClient(QObject):
                         await self._handle_binary_message(message)
 
                 _log("Message loop ended")
+        except websockets.exceptions.ConnectionClosedOK:
+            _log("Connection closed normally")
+        except websockets.exceptions.ConnectionClosedError as e:
+            # Normal disconnect: we sent 1000 but server didn't reply with close frame
+            if (e.sent and e.sent.code == 1000) or (e.rcvd and e.rcvd.code == 1000):
+                _log("Connection closed (clean disconnect)")
+            else:
+                _log(f"Connection closed with error: {e}")
+                raise
         except Exception as e:
             _log(f"Connection error in _connect_and_listen: {e}")
-            import traceback
-            traceback.print_exc()
             raise
 
     def _get_websocket_url(self) -> str:

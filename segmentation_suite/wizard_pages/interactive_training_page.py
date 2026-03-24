@@ -21,7 +21,11 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 from PyQt6.QtWidgets import QApplication
 
-from ..project_config import save_project_config, load_project_config, make_relative_path
+from ..project_config import (
+    save_project_config, load_project_config, make_relative_path,
+    has_subprojects, get_active_subproject, get_subproject_paths,
+    save_subproject_config, load_subproject_config, get_subproject_dir,
+)
 from ..dpi_scaling import scaled, scaled_font
 
 
@@ -117,11 +121,14 @@ class InteractiveTrainingPage(QWidget):
         self.project_dir = None
         self.train_images_dir = None
         self.train_masks_dir = None
-        self.train_images_25d_dir = None  # For 2.5D training data
+        self.train_images_25d_dir = None  # For 2.5D training data (3-channel)
         self.train_masks_25d_dir = None   # For 2.5D training masks
+        self.train_images_dwarf25d_dir = None  # For deep 2.5D training data (11-channel)
+        self.train_masks_dwarf25d_dir = None   # For deep 2.5D training masks
         self.masks_dir = None
         self.user_training_masks_dir = None  # User-provided training masks (optional)
         self._pending_images_dir = None  # For lazy loading when page becomes visible
+        self._active_subproject = None  # Active subproject name (None = legacy flat layout)
 
         # Training state
         self.train_worker = None
@@ -130,6 +137,7 @@ class InteractiveTrainingPage(QWidget):
         self._arch_name_to_id = {}  # Maps display name -> architecture id
         self._arch_id_to_name = {}  # Maps architecture id -> display name
         self._architecture_locked = False  # True when in multi-user session
+        self._training_locked = False  # True when joinee in multi-user session
 
         # Prediction state
         self.predict_worker = None
@@ -220,9 +228,8 @@ class InteractiveTrainingPage(QWidget):
 
         if OptimizedCanvas is None:
             error_label = QLabel(
-                "Error: annotation_tool package not found.\n\n"
-                "Please install it with:\n"
-                "pip install -e /path/to/annotation_tool_package"
+                "Error: Required canvas widget not found.\n\n"
+                "The OptimizedCanvas module could not be loaded."
             )
             error_label.setFont(scaled_font(14))
             error_label.setStyleSheet("color: red;")
@@ -329,9 +336,9 @@ class InteractiveTrainingPage(QWidget):
         if self.train_worker and self.train_worker.isRunning():
             was_training = True
             self.train_worker.stop()
-            if not self.train_worker.wait(3000):
-                self.train_worker.terminate()
-                self.train_worker.wait(1000)
+            # Never terminate() a CUDA thread — wait for batch to finish naturally
+            if not self.train_worker.wait(30000):
+                print("[Training] Worker still running after 30s, continuing anyway")
             self.train_btn.setText("Start Training")
             self.train_progress.setVisible(False)
             self.arch_combo.setEnabled(True)
@@ -460,20 +467,11 @@ class InteractiveTrainingPage(QWidget):
         # Check if we have pending weights that can now be applied
         self._try_apply_pending_weights()
 
-        # Update prediction worker with new architecture
-        if self.predict_worker:
-            self.predict_worker.set_architecture(arch_id)
-            # Update checkpoint path for new architecture
-            checkpoint_path = self._get_checkpoint_path()
-            if checkpoint_path and checkpoint_path.exists():
-                self.predict_worker.set_checkpoint(str(checkpoint_path))
+        # NOTE: Do NOT update predict worker here — prediction architecture
+        # is controlled independently by the prediction model combo.
 
         # Update status to show training state for this architecture
         self._update_architecture_status()
-
-        # Request new prediction with new architecture
-        if self.show_predictions:
-            self._request_viewport_prediction()
 
     def _get_checkpoint_path(self):
         """Get the checkpoint path for the current architecture."""
@@ -483,7 +481,7 @@ class InteractiveTrainingPage(QWidget):
             return None
 
         filename = get_checkpoint_filename(self.current_architecture)
-        return self.project_dir / filename
+        return self._get_working_dir() / filename
 
     def _update_architecture_status(self):
         """Update status to show training state for current architecture."""
@@ -511,21 +509,19 @@ class InteractiveTrainingPage(QWidget):
         print(f"[Training] Locking architecture to: {architecture}")
         self._architecture_locked = True
 
-        # If we need to switch architecture
-        if architecture and architecture != self.current_architecture:
-            if architecture in self._arch_id_to_name:
-                # Switch to the required architecture
-                self.current_architecture = architecture
-                self.arch_combo.blockSignals(True)
-                idx = self.arch_combo.findText(self._arch_id_to_name[architecture])
-                if idx >= 0:
-                    self.arch_combo.setCurrentIndex(idx)
-                self.arch_combo.blockSignals(False)
-                self._show_temp_status(f"Architecture set to {self._arch_id_to_name[architecture]} (locked)")
-                # Check if we have pending weights that can now be applied
-                self._try_apply_pending_weights()
-            else:
-                print(f"[Training] Warning: Unknown architecture {architecture}")
+        # Always set internal state and update combo (combo may be out of sync
+        # if _resolve_working_dirs set current_architecture without updating widget)
+        if architecture and architecture in self._arch_id_to_name:
+            self.current_architecture = architecture
+            self.arch_combo.blockSignals(True)
+            idx = self.arch_combo.findText(self._arch_id_to_name[architecture])
+            if idx >= 0:
+                self.arch_combo.setCurrentIndex(idx)
+            self.arch_combo.blockSignals(False)
+            self._show_temp_status(f"Architecture set to {self._arch_id_to_name[architecture]} (locked)")
+            self._try_apply_pending_weights()
+        elif architecture:
+            print(f"[Training] Warning: Unknown architecture {architecture}")
 
         # Style the dropdown to show it's locked (red text, disabled look)
         self.arch_combo.setEnabled(False)
@@ -550,6 +546,20 @@ class InteractiveTrainingPage(QWidget):
         self.arch_combo.setEnabled(True)
         self.arch_combo.setStyleSheet("")
         self.arch_combo.setToolTip("Select model architecture")
+
+    def lock_training(self):
+        """Lock training controls (joinee in multi-user session — only host trains)."""
+        print("[Training] Locking training controls (joinee mode)")
+        self._training_locked = True
+        self.train_btn.setEnabled(False)
+        self.train_btn.setToolTip("Only the host can train in a multi-user session")
+
+    def unlock_training(self):
+        """Unlock training controls (when leaving multi-user session)."""
+        print("[Training] Unlocking training controls")
+        self._training_locked = False
+        self.train_btn.setEnabled(True)
+        self.train_btn.setToolTip("Start Training")
 
     def _populate_prediction_model_combo(self):
         """Populate the prediction model dropdown with available trained models."""
@@ -591,6 +601,9 @@ class InteractiveTrainingPage(QWidget):
         self.prediction_architecture = arch_id
 
         # Update prediction worker
+        # set_architecture() clears the checkpoint path to avoid race conditions
+        # where the worker tries to load the old checkpoint with the new architecture.
+        # Always call set_checkpoint() after to provide the correct path.
         if self.predict_worker:
             self.predict_worker.set_architecture(arch_id)
             checkpoint_path = self._get_prediction_checkpoint_path()
@@ -598,11 +611,27 @@ class InteractiveTrainingPage(QWidget):
                 self.predict_worker.set_checkpoint(str(checkpoint_path))
                 self._show_temp_status(f"Predictions: {short_name}")
             else:
-                self._show_temp_status(f"No trained model for {short_name}")
+                # Set the expected checkpoint path even if it doesn't exist yet.
+                # This way the periodic reload will pick it up when training saves it.
+                from ..models.unet import get_checkpoint_filename
+                expected_path = self._get_working_dir() / get_checkpoint_filename(arch_id)
+                self.predict_worker.set_checkpoint(str(expected_path))
+                self._show_temp_status(f"No trained model for {short_name} yet — will load when available")
 
         # Request new prediction if showing
         if self.show_predictions:
             self._request_viewport_prediction()
+
+    def _sync_pred_combo(self):
+        """Sync the prediction dropdown to match self.prediction_architecture."""
+        if not hasattr(self, 'pred_model_combo') or not hasattr(self, '_pred_id_to_name'):
+            return
+        if self.prediction_architecture in self._pred_id_to_name:
+            self.pred_model_combo.blockSignals(True)
+            idx = self.pred_model_combo.findText(self._pred_id_to_name[self.prediction_architecture])
+            if idx >= 0:
+                self.pred_model_combo.setCurrentIndex(idx)
+            self.pred_model_combo.blockSignals(False)
 
     def _get_prediction_checkpoint_path(self):
         """Get the checkpoint path for the prediction architecture.
@@ -620,10 +649,11 @@ class InteractiveTrainingPage(QWidget):
             if pretrained_path and Path(pretrained_path).exists():
                 return Path(pretrained_path)
 
-        # For trainable architectures, check project checkpoint first
+        # For trainable architectures, check working dir (subproject or project root)
         if self.project_dir:
             filename = get_checkpoint_filename(self.prediction_architecture)
-            project_checkpoint = self.project_dir / filename
+            working_dir = self._get_working_dir()
+            project_checkpoint = working_dir / filename
             if project_checkpoint.exists():
                 return project_checkpoint
 
@@ -683,11 +713,12 @@ class InteractiveTrainingPage(QWidget):
         if bounds is None:
             return
 
-        # For 2.5D architectures, pass a 3-channel stack (z-3, z, z+3)
+        # For 2.5D architectures, pass multi-channel stack
         if self.predict_worker.is_25d():
+            n_expected = self.predict_worker._n_channels
             adjacent = self._load_adjacent_slices(idx)
-            if adjacent is not None and len(adjacent) == 3:
-                # Stack as (H, W, 3)
+            if adjacent is not None and len(adjacent) == n_expected:
+                # Stack as (H, W, C)
                 image_stack = np.stack(adjacent, axis=-1)
                 self.predict_worker.request_prediction(image_stack, bounds, idx)
             else:
@@ -1022,8 +1053,9 @@ class InteractiveTrainingPage(QWidget):
             self.status_label.setText("3D GT mode ON: Paint, then Tab to lock crop box (blue)")
             # Ensure 3D training directories exist
             if self.project_dir:
-                self.train_images_3d_dir = self.project_dir / "train_images_3d"
-                self.train_masks_3d_dir = self.project_dir / "train_masks_3d"
+                working_dir = self._get_working_dir()
+                self.train_images_3d_dir = working_dir / "train_images_3d"
+                self.train_masks_3d_dir = working_dir / "train_masks_3d"
                 self.train_images_3d_dir.mkdir(parents=True, exist_ok=True)
                 self.train_masks_3d_dir.mkdir(parents=True, exist_ok=True)
         else:
@@ -1230,6 +1262,12 @@ class InteractiveTrainingPage(QWidget):
             self.status_label.setText(f"Shape mismatch: mask {mask_shape} vs prediction {suggestion.shape}")
             return
 
+        # Save full mask for undo (accept-all replaces everything)
+        h, w = self.masks[idx].shape
+        self.undo_stack.append((idx, (0, h, 0, w), self.masks[idx].copy()))
+        if len(self.undo_stack) > self.max_undo:
+            self.undo_stack.pop(0)
+
         # Replace the mask with the prediction
         self.masks[idx] = suggestion.copy()
 
@@ -1240,6 +1278,7 @@ class InteractiveTrainingPage(QWidget):
         self.canvas.set_suggestion(None)
 
         # Mark as edited
+        self._mask_dirty = True
         self.edit_count += 1
         self.edits_label.setText(f"Edits: {self.edit_count}")
 
@@ -1342,23 +1381,15 @@ class InteractiveTrainingPage(QWidget):
             self.image_files = []
             self.image_source = None
             self.current_slice_index = 0
+            self._active_subproject = None
             # Canvas will be updated when new images are loaded via scan_and_load_initial
 
         self.config = config
         self.project_dir = new_project_dir
 
         if self.project_dir:
-            self.train_images_dir = self.project_dir / 'train_images'
-            self.train_masks_dir = self.project_dir / 'train_masks'
-            self.train_images_25d_dir = self.project_dir / 'train_images_25d'
-            self.train_masks_25d_dir = self.project_dir / 'train_masks_25d'
-            self.masks_dir = self.project_dir / 'masks'
-
-            self.train_images_dir.mkdir(parents=True, exist_ok=True)
-            self.train_masks_dir.mkdir(parents=True, exist_ok=True)
-            self.train_images_25d_dir.mkdir(parents=True, exist_ok=True)
-            self.train_masks_25d_dir.mkdir(parents=True, exist_ok=True)
-            self.masks_dir.mkdir(parents=True, exist_ok=True)
+            # Resolve per-label directories via subproject if active
+            self._resolve_working_dirs()
 
             # Check for zarr volume in project directory (try raw_data.zarr first, then train_images.zarr for backwards compatibility)
             zarr_path = self.project_dir / 'raw_data.zarr'
@@ -1428,6 +1459,148 @@ class InteractiveTrainingPage(QWidget):
                     self._pending_images_dir = None
             else:
                 self._pending_images_dir = None
+
+    def _resolve_working_dirs(self):
+        """Resolve masks/train dirs — use subproject path if project has subprojects."""
+        if not self.project_dir:
+            return
+
+        if has_subprojects(str(self.project_dir)):
+            sp_name = get_active_subproject(str(self.project_dir))
+            self._active_subproject = sp_name
+            paths = get_subproject_paths(str(self.project_dir), sp_name)
+            self.train_images_dir = paths["train_images_dir"]
+            self.train_masks_dir = paths["train_masks_dir"]
+            self.train_images_25d_dir = paths["train_images_25d_dir"]
+            self.train_masks_25d_dir = paths["train_masks_25d_dir"]
+            self.masks_dir = paths["masks_dir"]
+            base = paths["subproject_dir"]
+            print(f"[Training] Using subproject '{sp_name}' dirs")
+
+            # Restore per-subproject architecture state (unless locked by multi-user session)
+            if not self._architecture_locked:
+                sp_config = load_subproject_config(str(self.project_dir), sp_name)
+                if sp_config:
+                    saved_arch = sp_config.get("architecture", "")
+                    if saved_arch:
+                        self.current_architecture = saved_arch
+                    saved_pred = sp_config.get("prediction_architecture", "")
+                    if saved_pred:
+                        self.prediction_architecture = saved_pred
+                        self._sync_pred_combo()
+        else:
+            # Legacy flat layout
+            self._active_subproject = None
+            self.train_images_dir = self.project_dir / 'train_images'
+            self.train_masks_dir = self.project_dir / 'train_masks'
+            self.train_images_25d_dir = self.project_dir / 'train_images_25d'
+            self.train_masks_25d_dir = self.project_dir / 'train_masks_25d'
+            self.masks_dir = self.project_dir / 'masks'
+            base = self.project_dir
+
+        self.train_images_dwarf25d_dir = base / 'train_images_dwarf25d'
+        self.train_masks_dwarf25d_dir = base / 'train_masks_dwarf25d'
+
+        self.train_images_dir.mkdir(parents=True, exist_ok=True)
+        self.train_masks_dir.mkdir(parents=True, exist_ok=True)
+        self.train_images_25d_dir.mkdir(parents=True, exist_ok=True)
+        self.train_masks_25d_dir.mkdir(parents=True, exist_ok=True)
+        self.train_images_dwarf25d_dir.mkdir(parents=True, exist_ok=True)
+        self.train_masks_dwarf25d_dir.mkdir(parents=True, exist_ok=True)
+        self.masks_dir.mkdir(parents=True, exist_ok=True)
+
+        # Eagerly set checkpoint on predict worker so predictions work without training first
+        if hasattr(self, 'predict_worker') and self.predict_worker:
+            self.predict_worker.set_architecture(self.prediction_architecture)
+            checkpoint_path = self._get_prediction_checkpoint_path()
+            if checkpoint_path and checkpoint_path.exists():
+                self.predict_worker.set_checkpoint(str(checkpoint_path))
+                print(f"[Training] Predict worker: loaded {checkpoint_path.name}")
+
+    def _get_working_dir(self) -> Path:
+        """Return the directory where checkpoints live (subproject dir or project dir)."""
+        if self._active_subproject and self.project_dir:
+            return get_subproject_dir(str(self.project_dir), self._active_subproject)
+        return self.project_dir
+
+    def switch_subproject(self, subproject_name: str):
+        """Switch to a different subproject — save current state, reload dirs and masks."""
+        if not self.project_dir:
+            return
+        if subproject_name == self._active_subproject:
+            return
+
+        # Stop training if running
+        if self.train_worker and self.train_worker.isRunning():
+            self.train_worker.stop()
+            self.train_worker.wait(5000)
+            self.train_btn.setText("Start Training")
+            self.train_progress.setVisible(False)
+            self.arch_combo.setEnabled(True)
+            self.training_stopped.emit()
+
+        # Save current mask to disk before switching
+        self.save_current_slice()
+
+        # Save current subproject state
+        self._save_subproject_state()
+
+        # Clear in-memory mask cache (belongs to the old subproject)
+        self.masks.clear()
+
+        # Switch
+        self._active_subproject = subproject_name
+        self._resolve_working_dirs()
+
+        # Load subproject-specific state (slice index, architecture, etc.)
+        sp_config = load_subproject_config(str(self.project_dir), subproject_name)
+        if sp_config:
+            saved_arch = sp_config.get("architecture", "")
+            if saved_arch and hasattr(self, 'arch_combo'):
+                # Find and select the saved architecture in combo
+                for i in range(self.arch_combo.count()):
+                    if self.arch_combo.itemData(i) == saved_arch:
+                        self.arch_combo.setCurrentIndex(i)
+                        break
+
+        # Clear stale predictions and reload checkpoint for new subproject
+        self.canvas.set_suggestion(None)
+        if self.predict_worker:
+            self.predict_worker.set_architecture(self.prediction_architecture)
+            checkpoint_path = self._get_prediction_checkpoint_path()
+            print(f"[Training] Subproject switch: arch={self.prediction_architecture}, "
+                  f"checkpoint={checkpoint_path}, exists={checkpoint_path.exists() if checkpoint_path else False}")
+            if checkpoint_path and checkpoint_path.exists():
+                self.predict_worker.set_checkpoint(str(checkpoint_path))
+            else:
+                self.predict_worker.set_checkpoint("")
+
+        # Reload masks for the new subproject
+        # Keep current Z position — don't jump to where this subproject was last edited
+        current_idx = self.current_slice_index
+        if self.use_zarr and self.zarr_source is not None:
+            self.current_slice_index = max(0, min(current_idx, len(self.image_files) - 1))
+            self.load_current_slice()
+        elif self.image_files:
+            self.current_slice_index = max(0, min(current_idx, len(self.image_files) - 1))
+            self.load_current_slice()
+
+        # Update status
+        self._show_temp_status(f"Switched to subproject: {subproject_name}")
+        self._update_architecture_status()
+
+        print(f"[Training] Switched to subproject '{subproject_name}'")
+
+    def _save_subproject_state(self):
+        """Save current state to the active subproject's config."""
+        if not self._active_subproject or not self.project_dir:
+            return
+        sp_config = load_subproject_config(str(self.project_dir), self._active_subproject) or {}
+        sp_config["current_slice_index"] = self.current_slice_index
+        sp_config["edit_count"] = self.edit_count
+        sp_config["architecture"] = self.current_architecture
+        sp_config["prediction_architecture"] = self.prediction_architecture
+        save_subproject_config(str(self.project_dir), self._active_subproject, sp_config)
 
     def showEvent(self, event):
         """Handle page becoming visible - load images if pending."""
@@ -1606,16 +1779,13 @@ class InteractiveTrainingPage(QWidget):
                 saved_pred_arch = config.get("prediction_architecture", saved_arch)
                 if saved_pred_arch != self.prediction_architecture:
                     self.prediction_architecture = saved_pred_arch
-                    # Update prediction combo box (if populated)
-                    if hasattr(self, '_pred_id_to_name') and saved_pred_arch in self._pred_id_to_name:
-                        self.pred_model_combo.blockSignals(True)
-                        idx = self.pred_model_combo.findText(self._pred_id_to_name[saved_pred_arch])
-                        if idx >= 0:
-                            self.pred_model_combo.setCurrentIndex(idx)
-                        self.pred_model_combo.blockSignals(False)
+                    self._sync_pred_combo()
                     # Update prediction worker
                     if self.predict_worker:
                         self.predict_worker.set_architecture(saved_pred_arch)
+                        checkpoint_path = self._get_prediction_checkpoint_path()
+                        if checkpoint_path and checkpoint_path.exists():
+                            self.predict_worker.set_checkpoint(str(checkpoint_path))
 
                 # Restore user training masks directory if saved (for re-copying if needed)
                 saved_user_masks = config.get("user_training_masks_dir")
@@ -2176,6 +2346,9 @@ class InteractiveTrainingPage(QWidget):
         if self.show_predictions:
             self._request_viewport_prediction()
 
+        # Ensure canvas has keyboard focus so spacebar accept works immediately
+        self.canvas.setFocus()
+
     def update_slice_label(self):
         """Update the slice indicator label and slider."""
         total = len(self.image_files)
@@ -2188,21 +2361,25 @@ class InteractiveTrainingPage(QWidget):
         self.nav_slider.setValue(self.current_slice_index)
         self.nav_slider.blockSignals(False)
 
-    def on_edit_made(self, bounds_or_mask, after_mask):
+    def on_edit_made(self, bounds_or_mask, undo_region):
         """Handle edit signal from canvas - memory only, no disk I/O.
 
         Args:
             bounds_or_mask: Tuple (y1, y2, x1, x2) indicating edited region bounds.
-                           Full mask copies are no longer used (too expensive).
-            after_mask: None (no longer used - mask is modified in place)
+            undo_region: Small numpy array snapshot of the region before editing,
+                        or None if undo data not available.
         """
         idx = self.current_slice_index
 
         # Mark mask as dirty (needs save on slice change)
         self._mask_dirty = True
 
-        # NOTE: Undo disabled for large masks - 316MB copies are too expensive
-        # Could implement region-based undo in the future using bounds_or_mask
+        # Region-based undo: store only the small edited region, not the full mask
+        if undo_region is not None:
+            self.undo_stack.append((idx, bounds_or_mask, undo_region))
+            # Limit undo stack size
+            if len(self.undo_stack) > self.max_undo:
+                self.undo_stack.pop(0)
 
         # Update mask reference - canvas modifies mask in place, but ensure
         # our reference is current
@@ -2294,43 +2471,34 @@ class InteractiveTrainingPage(QWidget):
             saved_25d = False
             if self.train_images_25d_dir and self.train_masks_25d_dir:
                 adjacent = self._load_adjacent_slices(idx)
-                if adjacent is not None and len(adjacent) == 3:
-                    try:
-                        import tifffile
+                if adjacent is not None:
+                    self._save_25d_crop(adjacent, mask_after_crop, crop_y, crop_x,
+                                        crop_h, crop_id,
+                                        self.train_images_25d_dir, self.train_masks_25d_dir,
+                                        crop_w=crop_w)
+                    saved_25d = True
 
-                        # Crop each adjacent slice at the same position
-                        crops_25d = []
-                        for slice_img in adjacent:
-                            h, w = slice_img.shape
-                            if crop_y + crop_h <= h and crop_x + crop_w <= w:
-                                crop = slice_img[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w].copy()
-                                crop_min, crop_max = crop.min(), crop.max()
-                                if crop_max > crop_min:
-                                    crop = ((crop - crop_min) / (crop_max - crop_min) * 255).astype(np.uint8)
-                                else:
-                                    crop = crop.astype(np.uint8)
-                                crops_25d.append(crop)
-                            else:
-                                crops_25d = None
-                                break
-
-                        if crops_25d and len(crops_25d) == 3:
-                            # Stack as (C, H, W) for tifffile - it interprets first dim as pages/channels
-                            stack = np.stack(crops_25d, axis=0)
-                            tifffile.imwrite(str(self.train_images_25d_dir / f"{crop_id}.tif"), stack, compression='lzw')
-                            Image.fromarray(mask_after_crop).save(self.train_masks_25d_dir / f"{crop_id}.tif", compression='tiff_lzw')
-                            saved_25d = True
-
-                    except Exception as e:
-                        print(f"Failed to save 2.5D crop: {e}")
+            # Also save dwarf 2.5D version (11 channels)
+            saved_dwarf = False
+            if self.train_images_dwarf25d_dir and self.train_masks_dwarf25d_dir:
+                deep_adjacent = self._load_adjacent_slices(idx, n_flanking=5, spacing=2)
+                if deep_adjacent is not None:
+                    self._save_25d_crop(deep_adjacent, mask_after_crop, crop_y, crop_x,
+                                        crop_h, crop_id,
+                                        self.train_images_dwarf25d_dir, self.train_masks_dwarf25d_dir,
+                                        crop_w=crop_w)
+                    saved_dwarf = True
 
             # Count existing training files
             train_count = len(list(self.train_images_dir.glob("*.tif")))
             count_25d = len(list(self.train_images_25d_dir.glob("*.tif"))) if self.train_images_25d_dir else 0
+            count_dwarf = len(list(self.train_images_dwarf25d_dir.glob("*.tif"))) if self.train_images_dwarf25d_dir else 0
 
             status_msg = f"Captured crop! ({crop_w}x{crop_h}) - {train_count} 2D"
             if saved_25d:
                 status_msg += f", {count_25d} 2.5D"
+            if saved_dwarf:
+                status_msg += f", {count_dwarf} dwarf"
             status_msg += " training samples"
 
             # Multi-user mode: send crop to host
@@ -2352,13 +2520,30 @@ class InteractiveTrainingPage(QWidget):
             self.canvas.clear_paint_bounds()
 
     def undo(self):
-        """Undo the last edit.
+        """Undo the last edit using region-based snapshots."""
+        if not self.undo_stack:
+            self._show_temp_status("Nothing to undo")
+            return
 
-        NOTE: Full undo is disabled for large masks (too expensive to copy 316MB per edit).
-        This now only shows a message that undo is not available.
-        """
-        # Undo is disabled for performance - full mask copies are too expensive
-        self.status_label.setText("Undo disabled for large images (performance)")
+        idx, bounds, region = self.undo_stack.pop()
+        y1, y2, x1, x2 = bounds
+
+        # If the undo is for the current slice, restore directly
+        if idx == self.current_slice_index and self.canvas.mask is not None:
+            self.canvas.mask[y1:y2, x1:x2] = region
+            # Also update our masks dict reference
+            self.masks[idx] = self.canvas.mask
+            self.canvas._cache_valid = False
+            # Clear suggestion labels cache so hover detection uses updated mask
+            self.canvas._labeled_suggestion = None
+            self.canvas._hovered_component = None
+            self.canvas.update()
+            self._mask_dirty = True
+        elif idx in self.masks:
+            # Undo on a different slice (already navigated away)
+            self.masks[idx][y1:y2, x1:x2] = region
+
+        self._show_temp_status("Undo")
 
     def load_project(self):
         """Load an existing project directory."""
@@ -2451,6 +2636,9 @@ class InteractiveTrainingPage(QWidget):
             "interactive_mode": True,
             "training_started": self.train_worker is not None,
             "training_complete": False,
+
+            # Subproject
+            "active_subproject": self._active_subproject or "",
         }
         return config
 
@@ -2467,117 +2655,50 @@ class InteractiveTrainingPage(QWidget):
         config = self._build_project_config()
         save_project_config(str(self.project_dir), config)
 
+        # Also save per-subproject state if active
+        self._save_subproject_state()
+
     def _auto_save_config(self):
         """Auto-save callback for timer."""
         if self.project_dir and self.image_files:
             self._save_project_config()
 
-    def _save_edit_to_disk(self, idx, after_mask, image, before_mask):
-        """Save mask and crops to disk (called asynchronously)."""
-        print(f"DEBUG _save_edit_to_disk called: idx={idx}")
+    def _load_adjacent_slices(self, slice_idx: int,
+                              n_flanking: int = None, spacing: int = None) -> list:
+        """Load adjacent slices for 2.5D training.
 
-        # Save mask to disk
-        if self.masks_dir:
-            mask_path = self.masks_dir / f"mask_{idx:05d}.tif"
-            try:
-                Image.fromarray(after_mask).save(mask_path, compression='tiff_lzw')
-            except Exception as e:
-                print(f"Failed to save mask: {e}")
+        Args:
+            slice_idx: Center slice index
+            n_flanking: Number of flanking slices on each side (default: from architecture)
+            spacing: Z-distance between sampled slices (default: from architecture)
 
-        # Save training crops
-        self._save_edit_crops(image, before_mask, after_mask, idx)
-
-    def _save_edit_crops(self, image, before_mask, after_mask, slice_idx):
-        """Extract and save crops around the edited region."""
-        print(f"DEBUG _save_edit_crops called: slice_idx={slice_idx}")
-
-        if not self.train_images_dir or not self.train_masks_dir:
-            print(f"DEBUG _save_edit_crops: train dirs not set, returning")
-            return
-
-        diff = (before_mask != after_mask)
-        if not diff.any():
-            print(f"DEBUG _save_edit_crops: no diff detected, returning")
-            return
-
-        print(f"DEBUG _save_edit_crops: diff found, proceeding to save crops")
-
-        rows = np.any(diff, axis=1)
-        cols = np.any(diff, axis=0)
-        y_indices = np.where(rows)[0]
-        x_indices = np.where(cols)[0]
-
-        if len(y_indices) == 0 or len(x_indices) == 0:
-            return
-
-        y_min, y_max = y_indices[0], y_indices[-1]
-        x_min, x_max = x_indices[0], x_indices[-1]
-        center_y, center_x = (y_min + y_max) // 2, (x_min + x_max) // 2
-
-        crop_size = 256
-        h, w = image.shape
-
-        # Load adjacent slices for 2.5D (if available)
-        adjacent_slices = self._load_adjacent_slices(slice_idx)
-        print(f"DEBUG: adjacent_slices={'None' if adjacent_slices is None else len(adjacent_slices)}, "
-              f"train_images_25d_dir={self.train_images_25d_dir}")
-
-        offsets = [(0, 0), (-64, 0), (64, 0), (0, -64), (0, 64)]
-        for i, (dy, dx) in enumerate(offsets):
-            py = center_y + dy - crop_size // 2
-            px = center_x + dx - crop_size // 2
-
-            py = max(0, min(py, h - crop_size))
-            px = max(0, min(px, w - crop_size))
-
-            if py + crop_size > h or px + crop_size > w:
-                continue
-
-            img_crop = image[py:py+crop_size, px:px+crop_size].copy()
-            mask_crop = after_mask[py:py+crop_size, px:px+crop_size].copy()
-
-            img_min, img_max = img_crop.min(), img_crop.max()
-            if img_max > img_min:
-                img_crop = ((img_crop - img_min) / (img_max - img_min) * 255).astype(np.uint8)
-            else:
-                img_crop = img_crop.astype(np.uint8)
-
-            crop_id = f"slice{slice_idx:04d}_edit{self.edit_count:04d}_crop{i}"
-            try:
-                # Save 2D crop
-                Image.fromarray(img_crop).save(self.train_images_dir / f"{crop_id}.tif", compression='tiff_lzw')
-                Image.fromarray(mask_crop).save(self.train_masks_dir / f"{crop_id}.tif", compression='tiff_lzw')
-
-                # Save 2.5D stack (11 channels: 5 flanking on each side + center)
-                if adjacent_slices is not None and self.train_images_25d_dir:
-                    print(f"DEBUG: Saving 2.5D crop {crop_id} with {len(adjacent_slices)} slices")
-                    self._save_25d_crop(adjacent_slices, mask_crop, py, px, crop_size, crop_id)
-                else:
-                    print(f"DEBUG: NOT saving 2.5D crop - adjacent_slices={adjacent_slices is not None}, "
-                          f"25d_dir={self.train_images_25d_dir is not None}")
-
-            except Exception as e:
-                print(f"Failed to save crop: {e}")
-
-    def _load_adjacent_slices(self, slice_idx: int) -> list:
-        """Load adjacent slices for 2.5D training (z-3, z, z+3 = 3 channels)."""
+        Returns:
+            List of numpy arrays [slice_far_before, ..., center, ..., slice_far_after]
+            or None on failure.
+        """
         if not self.image_files or len(self.image_files) < 3:
             return None
 
         from concurrent.futures import ThreadPoolExecutor
 
-        total_slices = len(self.image_files)
-        slice_spacing = 3  # Distance between slices (z-3, z, z+3)
+        # Get parameters from architecture if not specified
+        if n_flanking is None or spacing is None:
+            from ..models.architectures import get_n_context_slices, get_slice_spacing
+            arch = self.current_architecture
+            if n_flanking is None:
+                n_ctx = get_n_context_slices(arch)
+                n_flanking = (n_ctx - 1) // 2  # e.g. 11 -> 5, 3 -> 1
+            if spacing is None:
+                spacing = get_slice_spacing(arch)
 
-        # Build list of indices we need (z-3, z, z+3)
+        total_slices = len(self.image_files)
+
+        # Build list of indices: [-n*spacing, ..., -spacing, 0, +spacing, ..., +n*spacing]
         indices = []
-        for offset in [-slice_spacing, 0, slice_spacing]:
-            idx = slice_idx + offset
+        for i in range(-n_flanking, n_flanking + 1):
+            idx = slice_idx + i * spacing
             # Mirror at boundaries
-            if idx < 0:
-                idx = 0
-            elif idx >= total_slices:
-                idx = total_slices - 1
+            idx = max(0, min(idx, total_slices - 1))
             indices.append(idx)
 
         # Identify which slices need loading from disk
@@ -2635,10 +2756,31 @@ class InteractiveTrainingPage(QWidget):
         return slices
 
     def _save_25d_crop(self, slices: list, mask_crop: np.ndarray,
-                       py: int, px: int, crop_size: int, crop_id: str):
-        """Save a 2.5D crop (11-channel stack) for training."""
-        if not self.train_images_25d_dir or not self.train_masks_25d_dir:
-            print(f"DEBUG _save_25d_crop: dirs not set")
+                       py: int, px: int, crop_h: int, crop_id: str,
+                       images_dir: Path = None, masks_dir: Path = None,
+                       crop_w: int = None):
+        """Save a 2.5D crop (multi-channel stack) for training.
+
+        Args:
+            slices: List of 2D arrays (adjacent z-slices)
+            mask_crop: Mask crop to save
+            py, px: Top-left corner of crop
+            crop_h: Height of crop (also used as width if crop_w is None)
+            crop_id: Unique identifier for the crop
+            images_dir: Target directory for image stacks
+            masks_dir: Target directory for mask crops
+            crop_w: Width of crop (defaults to crop_h for square crops)
+        """
+        if crop_w is None:
+            crop_w = crop_h
+
+        # Fall back to standard 2.5D dirs if not specified
+        if images_dir is None:
+            images_dir = self.train_images_25d_dir
+        if masks_dir is None:
+            masks_dir = self.train_masks_25d_dir
+
+        if not images_dir or not masks_dir:
             return
 
         try:
@@ -2648,12 +2790,10 @@ class InteractiveTrainingPage(QWidget):
             crops = []
             for i, slice_img in enumerate(slices):
                 h, w = slice_img.shape
-                # Handle edge cases where slice might be smaller
-                if py + crop_size > h or px + crop_size > w:
-                    print(f"DEBUG _save_25d_crop: slice {i} too small ({h}x{w}) for crop at ({py},{px}) size {crop_size}")
+                if py + crop_h > h or px + crop_w > w:
                     return
 
-                crop = slice_img[py:py+crop_size, px:px+crop_size].copy()
+                crop = slice_img[py:py+crop_h, px:px+crop_w].copy()
 
                 # Normalize each channel independently
                 crop_min, crop_max = crop.min(), crop.max()
@@ -2663,17 +2803,16 @@ class InteractiveTrainingPage(QWidget):
                     crop = crop.astype(np.uint8)
                 crops.append(crop)
 
-            # Stack as (C, H, W) for tifffile - it interprets first dim as pages/channels
+            # Stack as (C, H, W) for tifffile
             stack = np.stack(crops, axis=0)
 
-            print(f"DEBUG _save_25d_crop: saving stack shape {stack.shape} to {self.train_images_25d_dir / f'{crop_id}.tif'}")
-
-            # Save as multi-channel TIFF using tifffile (handles >3 channels)
-            tifffile.imwrite(str(self.train_images_25d_dir / f"{crop_id}.tif"), stack, compression='lzw')
-            Image.fromarray(mask_crop).save(self.train_masks_25d_dir / f"{crop_id}.tif", compression='tiff_lzw')
+            tifffile.imwrite(str(images_dir / f"{crop_id}.tif"), stack, compression='lzw')
+            Image.fromarray(mask_crop).save(masks_dir / f"{crop_id}.tif", compression='tiff_lzw')
 
         except Exception as e:
-            print(f"Failed to save 2.5D crop: {e}")
+            import traceback
+            print(f"Failed to save 2.5D crop to {images_dir}: {e}")
+            traceback.print_exc()
 
     def reset_model(self):
         """Reset the model - archive old checkpoint and start fresh."""
@@ -2709,11 +2848,9 @@ class InteractiveTrainingPage(QWidget):
         # Stop training if running
         if self.train_worker and self.train_worker.isRunning():
             self.train_worker.stop()
-            # Use longer timeout to avoid crashes during CUDA cleanup (10s)
-            if not self.train_worker.wait(10000):
-                print("[Training] Worker didn't stop in 10s, forcing termination")
-                self.train_worker.terminate()
-                self.train_worker.wait(2000)
+            # Never terminate() a CUDA thread — wait for batch to finish naturally
+            if not self.train_worker.wait(30000):
+                print("[Training] Worker still running after 30s, continuing anyway")
             self.train_btn.setText("Start Training")
             self.train_progress.setVisible(False)
             self.arch_combo.setEnabled(True)
@@ -2749,9 +2886,10 @@ class InteractiveTrainingPage(QWidget):
                 checkpoint_path.unlink()
 
             # Also archive final checkpoint if it exists
-            final_path = self.project_dir / 'checkpoint_final.pth'
+            working_dir = self._get_working_dir()
+            final_path = working_dir / 'checkpoint_final.pth'
             if final_path.exists():
-                final_archive = self.project_dir / f"checkpoint_final_old_{timestamp}.pth"
+                final_archive = working_dir / f"checkpoint_final_old_{timestamp}.pth"
                 final_path.rename(final_archive)
 
             # Final verification
@@ -2799,11 +2937,9 @@ class InteractiveTrainingPage(QWidget):
 
         if self.train_worker and self.train_worker.isRunning():
             self.train_worker.stop()
-            # Use longer timeout to avoid crashes during CUDA cleanup (10s)
-            if not self.train_worker.wait(10000):
-                print("[Training] Worker didn't stop in 10s, forcing termination")
-                self.train_worker.terminate()
-                self.train_worker.wait(2000)  # Brief wait after terminate
+            # Never terminate() a CUDA thread — wait for batch to finish naturally
+            if not self.train_worker.wait(30000):
+                print("[Training] Worker still running after 30s, continuing anyway")
             self.train_btn.setText("Start Training")
             self.train_progress.setVisible(False)
             self.arch_combo.setEnabled(True)  # Re-enable architecture selection
@@ -3298,8 +3434,8 @@ class InteractiveTrainingPage(QWidget):
 
                 # Notify prediction worker to reload
                 if self.predict_worker:
-                    self.predict_worker.set_checkpoint(str(checkpoint_path))
                     self.predict_worker.set_architecture(self.current_architecture)
+                    self.predict_worker.set_checkpoint(str(checkpoint_path))
 
                 self._show_temp_status("Received model from session")
                 return
@@ -3713,9 +3849,9 @@ class InteractiveTrainingPage(QWidget):
         # Stop workers with timeouts to avoid hangs
         if self.train_worker:
             self.train_worker.stop()
-            if not self.train_worker.wait(3000):
-                self.train_worker.terminate()
-                self.train_worker.wait(1000)
+            # Never terminate() a CUDA thread — wait for batch to finish naturally
+            if not self.train_worker.wait(30000):
+                print("[Training] Worker still running after 30s during cleanup")
             self.train_worker = None
             # Notify predict worker that training stopped
             if self.predict_worker:
@@ -3723,9 +3859,8 @@ class InteractiveTrainingPage(QWidget):
 
         if self.predict_worker:
             self.predict_worker.stop()
-            if not self.predict_worker.wait(2000):
-                self.predict_worker.terminate()
-                self.predict_worker.wait(500)
+            if not self.predict_worker.wait(10000):
+                print("[Predict] Worker still running after 10s during cleanup")
             self.predict_worker = None
 
     def closeEvent(self, event):

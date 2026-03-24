@@ -706,22 +706,27 @@ class TrainWorker(QThread):
             architecture = self.config.get('architecture', 'unet')
 
             # Detect architecture variants
-            # 2.5D uses 3 channels (z-3, z, z+3)
+            from ..models.architectures import get_n_context_slices
             is_25d = '25d' in architecture.lower()
             is_sam2 = 'sam2' in architecture.lower()
-            n_channels = 3 if is_25d else 1
+            n_channels = get_n_context_slices(architecture)
 
             if is_25d:
-                # Switch to 2.5D training folders if they exist
-                train_images_25d = train_images.replace('train_images', 'train_images_25d')
-                train_masks_25d = train_masks.replace('train_masks', 'train_masks_25d')
+                # Deep 2.5D uses a separate folder (11-channel stacks)
+                if 'dwarf25d' in architecture.lower():
+                    suffix = 'dwarf25d'
+                else:
+                    suffix = '25d'
+
+                train_images_25d = train_images.replace('train_images', f'train_images_{suffix}')
+                train_masks_25d = train_masks.replace('train_masks', f'train_masks_{suffix}')
 
                 if os.path.isdir(train_images_25d) and os.path.isdir(train_masks_25d):
                     train_images = train_images_25d
                     train_masks = train_masks_25d
-                    self.log.emit(f"Using 2.5D training data from: {train_images}")
+                    self.log.emit(f"Using {suffix} training data ({n_channels} channels) from: {train_images}")
                 else:
-                    self.log.emit(f"WARNING: 2.5D folders not found, using regular folders")
+                    self.log.emit(f"WARNING: {suffix} folders not found, using regular folders")
                     self.log.emit(f"  Expected: {train_images_25d}")
                     # Fall back to 1 channel if 2.5D data not available
                     n_channels = 1

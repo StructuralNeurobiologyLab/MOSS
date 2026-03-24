@@ -43,6 +43,8 @@ class PaintCanvas(QWidget):
         self.brush_size = 10
         self.mask_before_edit = None  # Store mask state before editing (region only)
         self._edit_bounds = None  # (y_min, y_max, x_min, x_max) of edited region
+        self._undo_region = None  # Snapshot of region before editing
+        self._undo_bounds = None  # Bounds of the undo snapshot
         self.current_tool = 'brush'  # 'brush', 'eraser', or 'hand'
 
         # Display settings
@@ -399,11 +401,34 @@ class PaintCanvas(QWidget):
         # Track edit bounds for efficient undo (accumulate across stroke)
         if self._edit_bounds is None:
             self._edit_bounds = [y_min, y_max, x_min, x_max]
+            # Snapshot the region before first modification of this stroke
+            self._undo_region = self.mask[y_min:y_max, x_min:x_max].copy()
+            self._undo_bounds = [y_min, y_max, x_min, x_max]
         else:
-            self._edit_bounds[0] = min(self._edit_bounds[0], y_min)
-            self._edit_bounds[1] = max(self._edit_bounds[1], y_max)
-            self._edit_bounds[2] = min(self._edit_bounds[2], x_min)
-            self._edit_bounds[3] = max(self._edit_bounds[3], x_max)
+            # Check if bounds expanded — if so, expand the snapshot
+            new_y1 = min(self._edit_bounds[0], y_min)
+            new_y2 = max(self._edit_bounds[1], y_max)
+            new_x1 = min(self._edit_bounds[2], x_min)
+            new_x2 = max(self._edit_bounds[3], x_max)
+            if (new_y1 < self._undo_bounds[0] or new_y2 > self._undo_bounds[1] or
+                    new_x1 < self._undo_bounds[2] or new_x2 > self._undo_bounds[3]):
+                # Expand: snapshot the new larger region from current mask
+                # (already-drawn pixels from this stroke will be included, but
+                # we merge with the old snapshot to preserve original values)
+                oy1, oy2, ox1, ox2 = self._undo_bounds
+                expanded = self.mask[new_y1:new_y2, new_x1:new_x2].copy()
+                # Paste old snapshot back into the expanded region at its original offset
+                ey1 = oy1 - new_y1
+                ey2 = ey1 + (oy2 - oy1)
+                ex1 = ox1 - new_x1
+                ex2 = ex1 + (ox2 - ox1)
+                expanded[ey1:ey2, ex1:ex2] = self._undo_region
+                self._undo_region = expanded
+                self._undo_bounds = [new_y1, new_y2, new_x1, new_x2]
+            self._edit_bounds[0] = new_y1
+            self._edit_bounds[1] = new_y2
+            self._edit_bounds[2] = new_x1
+            self._edit_bounds[3] = new_x2
 
         for y in range(y_min, y_max):
             for x in range(x_min, x_max):
@@ -415,12 +440,15 @@ class PaintCanvas(QWidget):
     def emit_edit(self):
         """Emit signal that an edit was made.
 
-        Emits edit_made signal with (bounds, None) where bounds is (y1, y2, x1, x2).
-        The receiver should use bounds to extract the edited region if needed.
-        We no longer pass full mask copies - too expensive for large masks.
+        Emits edit_made signal with (bounds, undo_region) where:
+        - bounds is (y1, y2, x1, x2) of the edited region
+        - undo_region is a small numpy array snapshot of the region before editing
         """
         if self._edit_bounds is not None:
-            bounds = tuple(self._edit_bounds)
-            self.edit_made.emit(bounds, None)
+            bounds = tuple(self._undo_bounds if hasattr(self, '_undo_bounds') and self._undo_bounds else self._edit_bounds)
+            undo_region = getattr(self, '_undo_region', None)
+            self.edit_made.emit(bounds, undo_region)
             self._edit_bounds = None
+            self._undo_region = None
+            self._undo_bounds = None
             self.mask_before_edit = None

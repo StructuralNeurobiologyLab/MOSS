@@ -84,17 +84,28 @@ class ViewportPredictWorker(QThread):
         self.mutex.unlock()
 
     def set_architecture(self, architecture: str):
-        """Set the model architecture. Forces a model reload."""
+        """Set the model architecture. Forces a model reload.
+
+        Note: After calling this, call set_checkpoint() with the correct path
+        before the worker tries to reload. To avoid race conditions where the
+        worker reloads with a stale checkpoint, this method does NOT set
+        _force_reload — that is deferred until set_checkpoint() is called.
+        """
         self.mutex.lock()
         if architecture != self.architecture:
             self.architecture = architecture
             self._is_25d = '25d' in architecture.lower()
             self._is_sam2 = 'sam2' in architecture.lower()
             self._is_lsd = 'lsd' in architecture.lower()  # LSD needs watershed
-            # 2.5D uses 3 channels (z-3, z, z+3)
-            self._n_channels = 3 if self._is_25d else 1
-            self._force_reload = True
+            # Get n_channels from architecture metadata
+            from ..models.architectures import get_n_context_slices
+            self._n_channels = get_n_context_slices(architecture)
             self.model = None  # Clear cached model
+            # Clear checkpoint path — caller must set_checkpoint() after this
+            self.checkpoint_path = None
+            self._last_checkpoint_mtime = 0
+            self._last_checkpoint_size = 0
+            self._consecutive_failures = 0  # Reset backoff for new architecture
             # Reset SAM2 predictor if needed (will reinitialize on next prediction)
             if self._is_sam2 and not self._sam2_initialized:
                 self._sam2_predictor = None
@@ -132,8 +143,8 @@ class ViewportPredictWorker(QThread):
         # Force reload (e.g., architecture changed) - but still respect minimum interval
         if self._force_reload:
             now = time.time()
-            # Even for force reload, wait at least 1 second between attempts
-            if now - self._last_reload_time < 1.0:
+            # Brief cooldown to let architecture+checkpoint both settle
+            if now - self._last_reload_time < 0.2:
                 return False
             return True
 
@@ -183,6 +194,12 @@ class ViewportPredictWorker(QThread):
     def _safe_load_model(self):
         """Safely load model by copying checkpoint first to avoid read/write conflicts."""
         if self.checkpoint_path is None:
+            return False
+
+        # If checkpoint file doesn't exist yet, don't count as failure
+        # (it may appear later when training saves it)
+        if not os.path.exists(self.checkpoint_path):
+            self._force_reload = False  # Don't keep force-retrying
             return False
 
         # We'll restore thread count after loading (model loading often resets it)
@@ -249,7 +266,8 @@ class ViewportPredictWorker(QThread):
                           f"Train with new architecture first.")
                 else:
                     print(f"Failed to load model: {e}")
-            self._force_reload = False
+            # Keep _force_reload = True so we retry once architecture/checkpoint settle
+            # self._force_reload = False
             # Clean up temp file on failure
             try:
                 if os.path.exists(temp_path):

@@ -271,6 +271,24 @@ class OptimizedCanvas(PaintCanvas):
         self._num_labels = 0
         self._hovered_component = None
 
+        # Re-check hover state at current cursor position so spacebar works
+        # immediately without requiring a mouse move after new predictions arrive
+        if suggestion is not None and self.show_suggestion:
+            cursor_pos = self.mapFromGlobal(self.cursor().pos())
+            if self.rect().contains(cursor_pos):
+                h, w = self._get_image_dimensions()
+                if h is not None:
+                    scaled_w = int(w * self.zoom_level)
+                    scaled_h = int(h * self.zoom_level)
+                    img_x = (self.width() - scaled_w) // 2 + self.offset.x()
+                    img_y = (self.height() - scaled_h) // 2 + self.offset.y()
+                    rel_x = cursor_pos.x() - img_x
+                    rel_y = cursor_pos.y() - img_y
+                    if 0 <= rel_x < scaled_w and 0 <= rel_y < scaled_h:
+                        px = int(rel_x / self.zoom_level)
+                        py = int(rel_y / self.zoom_level)
+                        self._update_hovered_component(px, py)
+
     def set_image_alpha(self, alpha: float):
         """Set the base image alpha."""
         super().set_image_alpha(alpha)
@@ -442,12 +460,24 @@ class OptimizedCanvas(PaintCanvas):
         if self._hovered_component is None:
             return False
 
+        # Allocate mask if it doesn't exist yet (fresh slice with no prior edits)
         if self.mask is None:
-            return False
+            self._ensure_mask_exists()
+            if self.mask is None:
+                return False
 
-        # Track bounds for edit region (full mask since component can be anywhere)
-        h, w = self.mask.shape
-        self._edit_bounds = [0, h, 0, w]
+        # Compute tight bounds of the component for efficient undo
+        rows = np.any(self._hovered_component, axis=1)
+        cols = np.any(self._hovered_component, axis=0)
+        y1, y2 = np.where(rows)[0][[0, -1]]
+        x1, x2 = np.where(cols)[0][[0, -1]]
+        y2 += 1
+        x2 += 1
+
+        self._edit_bounds = [y1, y2, x1, x2]
+        # Snapshot region before modification
+        self._undo_region = self.mask[y1:y2, x1:x2].copy()
+        self._undo_bounds = [y1, y2, x1, x2]
 
         # Add hovered component to mask
         self.mask[self._hovered_component] = 255
@@ -557,17 +587,36 @@ class OptimizedCanvas(PaintCanvas):
         yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
         # Create circular mask
         circle_mask = (xx - px) ** 2 + (yy - py) ** 2 <= radius ** 2
-        # Apply to mask
-        self.mask[y_min:y_max, x_min:x_max][circle_mask] = value
-
-        # Track edit bounds for emit_edit (accumulate across stroke)
+        # Track edit bounds and undo snapshot BEFORE modifying the mask
         if self._edit_bounds is None:
             self._edit_bounds = [y_min, y_max, x_min, x_max]
+            # Snapshot the region before first modification of this stroke
+            self._undo_region = self.mask[y_min:y_max, x_min:x_max].copy()
+            self._undo_bounds = [y_min, y_max, x_min, x_max]
         else:
-            self._edit_bounds[0] = min(self._edit_bounds[0], y_min)
-            self._edit_bounds[1] = max(self._edit_bounds[1], y_max)
-            self._edit_bounds[2] = min(self._edit_bounds[2], x_min)
-            self._edit_bounds[3] = max(self._edit_bounds[3], x_max)
+            new_y1 = min(self._edit_bounds[0], y_min)
+            new_y2 = max(self._edit_bounds[1], y_max)
+            new_x1 = min(self._edit_bounds[2], x_min)
+            new_x2 = max(self._edit_bounds[3], x_max)
+            if (new_y1 < self._undo_bounds[0] or new_y2 > self._undo_bounds[1] or
+                    new_x1 < self._undo_bounds[2] or new_x2 > self._undo_bounds[3]):
+                # Expand: snapshot larger region, merge with old snapshot to preserve originals
+                oy1, oy2, ox1, ox2 = self._undo_bounds
+                expanded = self.mask[new_y1:new_y2, new_x1:new_x2].copy()
+                ey1 = oy1 - new_y1
+                ey2 = ey1 + (oy2 - oy1)
+                ex1 = ox1 - new_x1
+                ex2 = ex1 + (ox2 - ox1)
+                expanded[ey1:ey2, ex1:ex2] = self._undo_region
+                self._undo_region = expanded
+                self._undo_bounds = [new_y1, new_y2, new_x1, new_x2]
+            self._edit_bounds[0] = new_y1
+            self._edit_bounds[1] = new_y2
+            self._edit_bounds[2] = new_x1
+            self._edit_bounds[3] = new_x2
+
+        # Apply to mask (after snapshot)
+        self.mask[y_min:y_max, x_min:x_max][circle_mask] = value
 
         # Track painting bounds for crop preview
         if self._paint_bounds_min is None:
@@ -630,9 +679,11 @@ class OptimizedCanvas(PaintCanvas):
         if event.button() == Qt.MouseButton.LeftButton and (self.current_tool == 'fill' or self._f_key_held):
             self._ensure_mask_exists()
             if self.mask is not None:
-                # Fill affects whole mask potentially
+                # Fill affects whole mask potentially — snapshot full mask for undo
                 h, w = self.mask.shape
                 self._edit_bounds = [0, h, 0, w]
+                self._undo_region = self.mask.copy()
+                self._undo_bounds = [0, h, 0, w]
                 self.fill_at(event.pos())
                 self.emit_edit()
             return

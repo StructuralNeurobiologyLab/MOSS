@@ -24,6 +24,8 @@ _architecture_descriptions: Dict[str, str] = {}
 _architecture_losses: Dict[str, str] = {}  # Optional preferred loss function
 _architecture_checkpoints: Dict[str, str] = {}  # Pretrained checkpoint paths
 _architecture_training_v2: Dict[str, bool] = {}  # v2 training improvements flag
+_architecture_n_context: Dict[str, int] = {}  # N_CONTEXT_SLICES for 2.5D variants
+_architecture_slice_spacing: Dict[str, int] = {}  # SLICE_SPACING for 2.5D variants
 _loaded = False
 
 
@@ -74,6 +76,14 @@ def _load_architectures():
             # Check for v2 training improvements flag
             if getattr(module, 'TRAINING_V2', False):
                 _architecture_training_v2[arch_id] = True
+
+            # Store 2.5D context parameters if present
+            n_ctx = getattr(module, 'N_CONTEXT_SLICES', None)
+            if n_ctx is not None:
+                _architecture_n_context[arch_id] = n_ctx
+            spacing = getattr(module, 'SLICE_SPACING', None)
+            if spacing is not None:
+                _architecture_slice_spacing[arch_id] = spacing
 
             # Debug output (commented out for cleaner startup)
             # print(f"Loaded architecture: {arch_id} ({module.ARCHITECTURE_NAME})")
@@ -180,3 +190,27 @@ def uses_training_v2(arch_id: str) -> bool:
     """Check if architecture uses v2 training improvements (grad clipping, proper resume)."""
     _load_architectures()
     return _architecture_training_v2.get(arch_id, False)
+
+
+def get_n_context_slices(arch_id: str) -> int:
+    """Get the number of input channels/slices for a 2.5D architecture.
+
+    Returns 3 as default for any 2.5D architecture without explicit metadata.
+    Returns 1 for non-2.5D architectures.
+    """
+    _load_architectures()
+    if arch_id in _architecture_n_context:
+        return _architecture_n_context[arch_id]
+    # Fallback: 3 for any 2.5D, 1 otherwise
+    return 3 if '25d' in arch_id.lower() else 1
+
+
+def get_slice_spacing(arch_id: str) -> int:
+    """Get the z-spacing between context slices for a 2.5D architecture.
+
+    Returns 3 as default (z-3, z, z+3) for standard 2.5D.
+    """
+    _load_architectures()
+    if arch_id in _architecture_slice_spacing:
+        return _architecture_slice_spacing[arch_id]
+    return 3  # Default spacing

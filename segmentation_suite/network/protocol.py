@@ -362,8 +362,8 @@ def serialize_training_data(image_array, mask_array) -> tuple:
     """
     import io
     from PIL import Image
-# Disable PIL decompression bomb warning for large EM images
-Image.MAX_IMAGE_PIXELS = None
+    # Disable PIL decompression bomb warning for large EM images
+    Image.MAX_IMAGE_PIXELS = None
 
     # Convert to PIL and save as PNG (lossless compression)
     img_buffer = io.BytesIO()
@@ -391,8 +391,8 @@ def deserialize_training_data(image_bytes: bytes, mask_bytes: bytes) -> tuple:
     import io
     import numpy as np
     from PIL import Image
-# Disable PIL decompression bomb warning for large EM images
-Image.MAX_IMAGE_PIXELS = None
+    # Disable PIL decompression bomb warning for large EM images
+    Image.MAX_IMAGE_PIXELS = None
 
     img = Image.open(io.BytesIO(image_bytes))
     mask = Image.open(io.BytesIO(mask_bytes))

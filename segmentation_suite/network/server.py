@@ -244,6 +244,8 @@ class AggregationServer(QObject):
                 await self._handle_goodbye(websocket, msg)
             elif msg.type == MessageType.REQUEST_MODEL:
                 await self._handle_request_model(websocket, msg)
+            elif msg.type == MessageType.TRAINING_DATA:
+                await self._handle_training_data(websocket, msg)
             else:
                 print(f"[Server] Unknown message type: {msg.type}")
 
@@ -316,7 +318,7 @@ class AggregationServer(QObject):
             "num_samples": num_samples
         }
 
-    async def _handle_binary_message(self, user_id: str, data: bytes):
+    async def _handle_weight_binary(self, user_id: str, data: bytes):
         """Handle binary weight data from a client."""
         try:
             # Deserialize weights
@@ -372,6 +374,65 @@ class AggregationServer(QObject):
             await self._send_global_model_to_client(websocket)
         else:
             _log(f"No global model available to send to {user_id}")
+
+    async def _handle_training_data(self, websocket: WebSocketServerProtocol, msg: Message):
+        """
+        Handle TRAINING_DATA from a client — relay header + 2 binary frames to the host.
+
+        The host client is the first registered client (connected to 127.0.0.1).
+        """
+        sender_id = self._websocket_to_user.get(websocket, "unknown")
+        sender_name = msg.payload.get("display_name", "Unknown")
+        _log(f"TRAINING_DATA from {sender_name} ({sender_id})")
+
+        # Mark this client as expecting 2 binary frames for training data
+        if not hasattr(self, '_pending_training_data'):
+            self._pending_training_data = {}
+        self._pending_training_data[sender_id] = {
+            "header_json": msg.to_json(),
+            "binary_frames": [],
+            "expected": 2
+        }
+
+    async def _handle_binary_message(self, user_id: str, data: bytes):
+        """Handle binary data from a client (weights or training data frames)."""
+        # Check if this is part of a training data transfer
+        pending_td = getattr(self, '_pending_training_data', {}).get(user_id)
+        if pending_td is not None:
+            pending_td["binary_frames"].append(data)
+            if len(pending_td["binary_frames"]) == pending_td["expected"]:
+                # Got all frames — relay to the host client
+                await self._relay_training_data_to_host(user_id, pending_td)
+                del self._pending_training_data[user_id]
+            return
+
+        # Otherwise it's weight data — existing handler
+        await self._handle_weight_binary(user_id, data)
+
+    async def _relay_training_data_to_host(self, sender_id: str, td: dict):
+        """Relay completed training data (header + binary frames) to the host client."""
+        # Host is the first client (or find by 127.0.0.1 connection)
+        host_ws = None
+        for uid, ws in self._clients.items():
+            if uid != sender_id:
+                # In LAN mode, host connects from 127.0.0.1
+                # In relay mode, first registered client is the host
+                host_ws = ws
+                break
+
+        if not host_ws:
+            _log(f"No host found to relay training data from {sender_id}")
+            return
+
+        try:
+            # Send JSON header
+            await host_ws.send(td["header_json"])
+            # Send binary frames (image, mask)
+            for frame in td["binary_frames"]:
+                await host_ws.send(frame)
+            _log(f"Relayed training data from {sender_id} to host")
+        except Exception as e:
+            _log(f"Error relaying training data: {e}")
 
     async def _broadcast_user_list(self):
         """Broadcast updated user list to all clients."""

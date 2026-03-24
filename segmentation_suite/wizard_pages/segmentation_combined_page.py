@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Combined Segmentation page - offers both MOSS 2D multi-view and LSD 3D options.
+Combined Segmentation page - offers both MOSS (recommended) and LSD 2D options.
 """
 
 import os
@@ -17,6 +17,10 @@ from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QFont
 
 from ..dpi_scaling import scaled
+from ..project_config import (
+    has_subprojects, list_subprojects, get_active_subproject,
+    get_subproject_dir,
+)
 
 
 class ConversionWorker(QThread):
@@ -621,7 +625,7 @@ class SegmentationTrainWorker(QThread):
 
 
 class SegmentationCombinedPage(QWidget):
-    """Combined segmentation page with MOSS 2D and LSD 3D options."""
+    """Combined segmentation page with MOSS (recommended) and LSD 2D options."""
 
     segmentation_complete = pyqtSignal(str)
     busy_changed = pyqtSignal(bool)
@@ -659,32 +663,32 @@ class SegmentationCombinedPage(QWidget):
 
         self.method_group = QButtonGroup(self)
 
-        # Option 1: LSD 3D (recommended)
-        self.lsd_radio = QRadioButton("3D LSD Pipeline (Recommended)")
-        self.lsd_radio.setStyleSheet("color: #ffffff; font-weight: bold;")
-        self.lsd_radio.setChecked(True)
-        self.method_group.addButton(self.lsd_radio, 0)
-        method_layout.addWidget(self.lsd_radio)
-
-        lsd_desc = QLabel(
-            "   Uses Local Shape Descriptors for accurate 3D neuron segmentation.\n"
-            "   Best for: Final production segmentation, large volumes."
-        )
-        lsd_desc.setStyleSheet("color: #888888; margin-left: 20px;")
-        method_layout.addWidget(lsd_desc)
-
-        # Option 2: MOSS 2D
-        self.moss_radio = QRadioButton("MOSS 2D Multi-View (Quick Preview)")
+        # Option 1: MOSS (recommended)
+        self.moss_radio = QRadioButton("MOSS (Recommended)")
         self.moss_radio.setStyleSheet("color: #ffffff; font-weight: bold;")
-        self.method_group.addButton(self.moss_radio, 1)
+        self.moss_radio.setChecked(True)
+        self.method_group.addButton(self.moss_radio, 0)
         method_layout.addWidget(self.moss_radio)
 
         moss_desc = QLabel(
             "   Uses your trained MOSS model with multi-view consensus.\n"
-            "   Best for: Quick preview, validation of training labels."
+            "   Best for: General-purpose segmentation, trained on your annotations."
         )
         moss_desc.setStyleSheet("color: #888888; margin-left: 20px;")
         method_layout.addWidget(moss_desc)
+
+        # Option 2: LSD 2D
+        self.lsd_radio = QRadioButton("LSD 2D")
+        self.lsd_radio.setStyleSheet("color: #ffffff; font-weight: bold;")
+        self.method_group.addButton(self.lsd_radio, 1)
+        method_layout.addWidget(self.lsd_radio)
+
+        lsd_desc = QLabel(
+            "   Uses Local Shape Descriptors for 3D neuron segmentation.\n"
+            "   Best for: Neuron instance segmentation in large EM volumes."
+        )
+        lsd_desc.setStyleSheet("color: #888888; margin-left: 20px;")
+        method_layout.addWidget(lsd_desc)
 
         self.method_group.buttonClicked.connect(self._on_method_changed)
         layout.addWidget(method_group)
@@ -692,21 +696,21 @@ class SegmentationCombinedPage(QWidget):
         # Stacked options for each method - wrapped in scroll area
         self.options_stack = QStackedWidget()
 
-        # LSD Options
-        lsd_widget = self._create_lsd_options()
-        lsd_scroll = QScrollArea()
-        lsd_scroll.setWidget(lsd_widget)
-        lsd_scroll.setWidgetResizable(True)
-        lsd_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.options_stack.addWidget(lsd_scroll)
-
-        # MOSS Options
+        # MOSS Options (index 0 — matches moss_radio)
         moss_widget = self._create_moss_options()
         moss_scroll = QScrollArea()
         moss_scroll.setWidget(moss_widget)
         moss_scroll.setWidgetResizable(True)
         moss_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.options_stack.addWidget(moss_scroll)
+
+        # LSD Options (index 1 — matches lsd_radio)
+        lsd_widget = self._create_lsd_options()
+        lsd_scroll = QScrollArea()
+        lsd_scroll.setWidget(lsd_widget)
+        lsd_scroll.setWidgetResizable(True)
+        lsd_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.options_stack.addWidget(lsd_scroll)
 
         layout.addWidget(self.options_stack)
 
@@ -1013,6 +1017,18 @@ class SegmentationCombinedPage(QWidget):
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, scaled(10), 0, 0)
 
+        # Subproject selector (hidden until project with subprojects is loaded)
+        self._moss_sp_group = QGroupBox("Subproject")
+        self._moss_sp_group.setStyleSheet(self._group_style())
+        sp_layout = QHBoxLayout(self._moss_sp_group)
+        sp_layout.addWidget(QLabel("Segment using:"))
+        self._moss_sp_combo = QComboBox()
+        self._moss_sp_combo.setMinimumWidth(scaled(150))
+        self._moss_sp_combo.currentTextChanged.connect(self._on_moss_subproject_changed)
+        sp_layout.addWidget(self._moss_sp_combo, 1)
+        self._moss_sp_group.setVisible(False)
+        layout.addWidget(self._moss_sp_group)
+
         # Model selection
         model_group = QGroupBox("Model")
         model_group.setStyleSheet(self._group_style())
@@ -1127,7 +1143,7 @@ class SegmentationCombinedPage(QWidget):
 
     def _on_method_changed(self, button):
         """Handle method selection change."""
-        if button == self.lsd_radio:
+        if button == self.moss_radio:
             self.options_stack.setCurrentIndex(0)
         else:
             self.options_stack.setCurrentIndex(1)
@@ -1135,6 +1151,9 @@ class SegmentationCombinedPage(QWidget):
     def set_config(self, config: dict):
         """Set configuration from project."""
         self.project_dir = Path(config.get('project_dir', '')) if config.get('project_dir') else None
+
+        # Populate subproject combo if project uses subprojects
+        self._refresh_subproject_combo()
 
         # Use Zarr path from home tab if available
         zarr_path = config.get('zarr_path') or config.get('train_images_zarr')
@@ -1147,10 +1166,12 @@ class SegmentationCombinedPage(QWidget):
             # Fall back to scanning project directory
             self._scan_for_data()
 
-        # Check for trained MOSS model
-        if config.get('checkpoint_path'):
-            self.moss_model_label.setText(config['checkpoint_path'])
-            self.moss_model_label.setStyleSheet("color: #4CAF50;")
+        # Check for trained MOSS model — prefer subproject checkpoint
+        self._update_moss_model_from_subproject()
+        if self.moss_model_label.text() in ("Not found", ""):
+            if config.get('checkpoint_path'):
+                self.moss_model_label.setText(config['checkpoint_path'])
+                self.moss_model_label.setStyleSheet("color: #4CAF50;")
 
     def _scan_for_data(self):
         """Scan project directory for data files."""
@@ -1249,6 +1270,63 @@ class SegmentationCombinedPage(QWidget):
                 self.trained_model_label.setText(f"Affinity Ready ({latest_affinity.name})")
                 self.trained_model_label.setStyleSheet("color: #4CAF50;")
                 self._log(f"Found trained model: {latest_affinity.name}")
+
+    def _refresh_subproject_combo(self):
+        """Populate subproject combo if project has subprojects."""
+        if not self.project_dir or not has_subprojects(str(self.project_dir)):
+            self._moss_sp_group.setVisible(False)
+            return
+
+        self._moss_sp_combo.blockSignals(True)
+        self._moss_sp_combo.clear()
+        subprojects = list_subprojects(str(self.project_dir))
+        active = get_active_subproject(str(self.project_dir))
+
+        for sp_name in subprojects:
+            self._moss_sp_combo.addItem(sp_name)
+
+        # Select active subproject
+        idx = self._moss_sp_combo.findText(active)
+        if idx >= 0:
+            self._moss_sp_combo.setCurrentIndex(idx)
+
+        self._moss_sp_combo.blockSignals(False)
+        self._moss_sp_group.setVisible(len(subprojects) > 0)
+
+    def _on_moss_subproject_changed(self, sp_name: str):
+        """Handle subproject combo change — update model path."""
+        if not sp_name or not self.project_dir:
+            return
+        self._update_moss_model_from_subproject()
+
+    def _update_moss_model_from_subproject(self):
+        """Find the best checkpoint in the selected subproject."""
+        if not self.project_dir:
+            return
+
+        # Determine which directory to scan for checkpoints
+        if has_subprojects(str(self.project_dir)) and self._moss_sp_combo.currentText():
+            sp_name = self._moss_sp_combo.currentText()
+            search_dir = get_subproject_dir(str(self.project_dir), sp_name)
+        else:
+            search_dir = self.project_dir
+
+        # Find checkpoint_*.pth files (not final, not archived)
+        checkpoints = sorted(
+            search_dir.glob("checkpoint_*.pth"),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True
+        )
+        # Filter out archived ones
+        checkpoints = [c for c in checkpoints if '_old_' not in c.name]
+
+        if checkpoints:
+            best = checkpoints[0]
+            self.moss_model_label.setText(str(best))
+            self.moss_model_label.setStyleSheet("color: #4CAF50;")
+        else:
+            self.moss_model_label.setText("Not found")
+            self.moss_model_label.setStyleSheet("color: #888888;")
 
     def _browse_tiff(self):
         """Browse for TIFF directory."""

@@ -14,8 +14,8 @@ from PyQt6.QtCore import Qt, pyqtSignal, QSettings
 from PyQt6.QtGui import QFont, QColor, QBrush
 
 from .dpi_scaling import scaled, scaled_font, scaled_window_size, center_on_screen
+from .widgets.subproject_panel import SubprojectPanel
 from .wizard_pages.interactive_training_page import InteractiveTrainingPage
-from .wizard_pages.proofreading_page import ProofreadingPage
 from .wizard_pages.finish_page import FinishPage
 from .wizard_pages.home_page import HomePage
 from .wizard_pages.segmentation_combined_page import SegmentationCombinedPage
@@ -30,15 +30,14 @@ class TrainingWizard(QMainWindow):
     # Step indices - Simplified workflow (Setup merged into Home)
     STEP_HOME = 0
     STEP_TRAINING = 1  # Ground truth / interactive training
-    STEP_SEGMENTATION = 2  # Combined: MOSS 2D or LSD 3D
-    STEP_PROOFREADING = 3
-    STEP_EXPORT = 4
+    STEP_SEGMENTATION = 2  # Combined: MOSS or LSD 2D
+    # STEP_PROOFREADING — Work in progress, hidden for now
+    STEP_EXPORT = 3
 
     STEP_NAMES = [
         "Home",
         "Ground Truth",
         "Segmentation",
-        "Proofreading",
         "Export"
     ]
 
@@ -78,17 +77,15 @@ class TrainingWizard(QMainWindow):
         self.stack = QStackedWidget()
         content_layout.addWidget(self.stack)
 
-        # Create pages (simplified workflow - no separate Setup)
+        # Create pages
         self.home_page = HomePage()
         self.training_page = InteractiveTrainingPage()
         self.segmentation_page = SegmentationCombinedPage()
-        self.proofreading_page = ProofreadingPage()
         self.export_page = FinishPage()
 
         self.stack.addWidget(self.home_page)
         self.stack.addWidget(self.training_page)
         self.stack.addWidget(self.segmentation_page)
-        self.stack.addWidget(self.proofreading_page)
         self.stack.addWidget(self.export_page)
 
         # Navigation buttons
@@ -186,6 +183,11 @@ class TrainingWizard(QMainWindow):
         self.step_list.currentRowChanged.connect(self._on_step_clicked)
         layout.addWidget(self.step_list)
 
+        # Subproject panel (hidden until project loaded)
+        self.subproject_panel = SubprojectPanel()
+        self.subproject_panel.subproject_changed.connect(self._on_subproject_changed)
+        layout.addWidget(self.subproject_panel)
+
         layout.addStretch()
 
         # Multi-user session section
@@ -219,19 +221,12 @@ class TrainingWizard(QMainWindow):
             }}
         """
 
-        self.session_create_btn = QPushButton("Create Session")
-        self.session_create_btn.setStyleSheet(btn_style)
-        self.session_create_btn.setToolTip("Create a session for collaborative training")
-        self.session_create_btn.clicked.connect(self._create_session)
-        self.session_create_btn.setEnabled(False)  # Disabled until project loaded
-        layout.addWidget(self.session_create_btn)
-
-        self.session_join_btn = QPushButton("Join Session")
-        self.session_join_btn.setStyleSheet(btn_style)
-        self.session_join_btn.setToolTip("Join an existing session by code")
-        self.session_join_btn.clicked.connect(self._join_session)
-        self.session_join_btn.setEnabled(False)  # Disabled until project loaded
-        layout.addWidget(self.session_join_btn)
+        self.session_btn = QPushButton("Multi-User Session")
+        self.session_btn.setStyleSheet(btn_style)
+        self.session_btn.setToolTip("Create or join a collaborative training session")
+        self.session_btn.clicked.connect(self._open_session_dialog)
+        self.session_btn.setEnabled(False)  # Disabled until project loaded
+        layout.addWidget(self.session_btn)
 
         self.session_status_label = QLabel("")
         self.session_status_label.setStyleSheet(f"""
@@ -253,6 +248,7 @@ class TrainingWizard(QMainWindow):
 
         # Session state
         self._session_client = None
+        self._aggregation_server = None
         self._is_session_host = False
 
         layout.addSpacing(scaled(10))
@@ -304,23 +300,15 @@ class TrainingWizard(QMainWindow):
         self.home_page.project_loaded.connect(self._on_project_loaded)
         self.home_page.start_training.connect(lambda: self._go_to_page(self.STEP_TRAINING))
         self.home_page.start_3d_segmentation.connect(lambda: self._go_to_page(self.STEP_SEGMENTATION))
-        self.home_page.start_proofreading.connect(lambda: self._go_to_page(self.STEP_PROOFREADING))
 
         # Training page signals
         self.training_page.training_complete.connect(self._on_training_complete)
         self.training_page.training_started.connect(self._on_training_started)
         self.training_page.training_stopped.connect(self._on_training_stopped)
 
-        # Segmentation page signals (combined MOSS 2D + LSD 3D)
+        # Segmentation page signals
         self.segmentation_page.segmentation_complete.connect(self._on_segmentation_complete)
         self.segmentation_page.busy_changed.connect(self._on_segmentation_busy_changed)
-
-        # Proofreading page signals
-        self.proofreading_page.proofread_complete.connect(self._on_proofread_complete)
-        self.proofreading_page.busy_changed.connect(self._on_proofread_busy_changed)
-
-        # Export page signals
-        self.export_page.open_annotation_tool.connect(self._on_open_annotation_tool)
 
     def _on_segmentation_busy_changed(self, busy: bool):
         """Handle segmentation busy state change."""
@@ -333,8 +321,8 @@ class TrainingWizard(QMainWindow):
         self.config['segmentation_output'] = output_path
         self._propagate_config()
         self.home_page.refresh()
-        # Auto-advance to proofreading
-        self.stack.setCurrentIndex(self.STEP_PROOFREADING)
+        # Auto-advance to export (proofreading is WIP, skipped for now)
+        self.stack.setCurrentIndex(self.STEP_EXPORT)
         self._update_ui()
 
     def _on_training_started(self):
@@ -458,14 +446,19 @@ class TrainingWizard(QMainWindow):
             self.next_btn.setVisible(True)
             self.skip_btn.setVisible(current > self.STEP_HOME)
 
+        # Show subproject panel only on Ground Truth page
+        if hasattr(self, 'subproject_panel'):
+            self.subproject_panel.setVisible(
+                current == self.STEP_TRAINING
+                and self.subproject_panel._project_dir is not None
+            )
+
         # Update next button text based on simplified workflow
         if current == self.STEP_HOME:
             self.next_btn.setText("Start Workflow")
         elif current == self.STEP_TRAINING:
             self.next_btn.setText("Proceed to Segmentation")
         elif current == self.STEP_SEGMENTATION:
-            self.next_btn.setText("Review Results")
-        elif current == self.STEP_PROOFREADING:
             self.next_btn.setText("Export")
         else:
             self.next_btn.setText("Next")
@@ -480,19 +473,22 @@ class TrainingWizard(QMainWindow):
         """Pass config to all pages."""
         self.training_page.set_config(self.config)
         self.segmentation_page.set_config(self.config)
-        self.proofreading_page.set_config(self.config)
         self.export_page.set_config(self.config)
 
     def _on_project_loaded(self):
         """Handle project loaded from home page."""
         # Enable session buttons now that project is loaded
-        self.session_create_btn.setEnabled(True)
-        self.session_join_btn.setEnabled(True)
+        self.session_btn.setEnabled(True)
 
         # Get config from home page
         self.config = self.home_page.get_config()
         self._ensure_project_dir()
         self._propagate_config()
+
+        # Refresh subproject panel
+        project_dir = self.config.get('project_dir', '')
+        if project_dir:
+            self.subproject_panel.set_project(project_dir)
 
         # Check if there's a saved page index for this project
         project_dir = os.path.normpath(self.config['project_dir'])
@@ -520,23 +516,16 @@ class TrainingWizard(QMainWindow):
         self.stack.setCurrentIndex(self.STEP_HOME)
         self._update_ui()
 
+    def _on_subproject_changed(self, subproject_name: str):
+        """Handle subproject switch from the panel."""
+        print(f"[Wizard] Switching to subproject: {subproject_name}")
+        self.training_page.switch_subproject(subproject_name)
+
     def _on_training_complete(self, checkpoint_path: str):
         """Handle training completion."""
         self.config['checkpoint_path'] = checkpoint_path
         self._propagate_config()
         self.home_page.refresh()
-
-    def _on_proofread_busy_changed(self, busy: bool):
-        """Handle proofreading busy state change."""
-        # Disable Next/Skip/Back buttons while generating tasks
-        self.next_btn.setEnabled(not busy)
-        self.skip_btn.setEnabled(not busy)
-        self.back_btn.setEnabled(not busy)
-
-    def _on_proofread_complete(self, result: dict):
-        """Handle proofreading completion."""
-        self.config['proofread_result'] = result
-        self._propagate_config()
 
     def _go_to_page(self, page_index: int):
         """Navigate to a specific page."""
@@ -547,28 +536,22 @@ class TrainingWizard(QMainWindow):
         else:
             print(f"[_go_to_page] Invalid page index: {page_index}")
 
-    def _on_open_annotation_tool(self, images_dir: str, masks_dir: str):
-        """Handle request to open annotation tool."""
-        import subprocess
-        try:
-            subprocess.Popen(['annotation-tool'])
-        except FileNotFoundError:
-            QMessageBox.warning(
-                self,
-                "Annotation Tool Not Found",
-                "The annotation-tool command was not found.\n"
-                "Please ensure it is installed and in your PATH."
-            )
-
     # =========================================================================
     # Multi-User Session Management
     # =========================================================================
 
-    def _create_session(self):
-        """Create a multi-user session."""
-        from PyQt6.QtWidgets import QInputDialog
+    def _open_session_dialog(self):
+        """Open unified multi-user session dialog."""
+        from PyQt6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QRadioButton,
+            QButtonGroup, QLabel, QLineEdit, QDialogButtonBox,
+            QGroupBox, QComboBox
+        )
+        from PyQt6.QtCore import Qt
+        from .project_config import has_subprojects, list_subprojects, get_active_subproject
+
         try:
-            from .network import SyncClient, DEFAULT_RELAY_URL
+            from .network import SyncClient, AggregationServer, get_local_ip, DEFAULT_RELAY_URL
         except ImportError as e:
             QMessageBox.warning(
                 self, "Missing Dependency",
@@ -577,7 +560,222 @@ class TrainingWizard(QMainWindow):
             )
             return
 
-        if not DEFAULT_RELAY_URL:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Multi-User Session")
+        dialog.setMinimumWidth(420)
+        dlayout = QVBoxLayout(dialog)
+
+        # --- Role: Host or Join ---
+        role_group = QGroupBox("Role")
+        role_layout = QVBoxLayout(role_group)
+        role_btn_group = QButtonGroup(dialog)
+        host_radio = QRadioButton("Host a session (others connect to you)")
+        join_radio = QRadioButton("Join an existing session")
+        host_radio.setChecked(True)
+        role_btn_group.addButton(host_radio)
+        role_btn_group.addButton(join_radio)
+        role_layout.addWidget(host_radio)
+        role_layout.addWidget(join_radio)
+        dlayout.addWidget(role_group)
+
+        # --- Mode: LAN or Relay ---
+        mode_group = QGroupBox("Connection Mode")
+        mode_layout = QVBoxLayout(mode_group)
+        mode_btn_group = QButtonGroup(dialog)
+        lan_radio = QRadioButton("Local Network (LAN) — no internet needed")
+        relay_radio = QRadioButton("Relay Server (Internet) — uses room codes")
+        lan_radio.setChecked(True)  # LAN is default
+        mode_btn_group.addButton(lan_radio)
+        mode_btn_group.addButton(relay_radio)
+        mode_layout.addWidget(lan_radio)
+        mode_layout.addWidget(relay_radio)
+
+        # Relay status hint
+        relay_hint = QLabel("")
+        relay_hint.setStyleSheet("color: #888; font-size: 11px; padding-left: 20px;")
+        if DEFAULT_RELAY_URL:
+            relay_hint.setText(f"Relay configured: {DEFAULT_RELAY_URL.split('//')[1].split('/')[0]}")
+        else:
+            relay_hint.setText("No relay configured (see network/relay_config.txt)")
+        mode_layout.addWidget(relay_hint)
+        dlayout.addWidget(mode_group)
+
+        # --- Host settings: architecture + subproject (only visible when hosting) ---
+        host_settings_group = QGroupBox("Session Settings (Host)")
+        host_settings_layout = QVBoxLayout(host_settings_group)
+
+        # Architecture selection
+        arch_label = QLabel("Architecture (all participants will use this):")
+        host_settings_layout.addWidget(arch_label)
+        arch_combo = QComboBox()
+        arch_id_map = self.training_page._arch_id_to_name  # {id: display_name}
+        arch_ids = []
+        for arch_id, display_name in arch_id_map.items():
+            arch_combo.addItem(display_name)
+            arch_ids.append(arch_id)
+        # Select current architecture
+        current_arch = self.training_page.current_architecture
+        if current_arch in arch_id_map:
+            idx = arch_combo.findText(arch_id_map[current_arch])
+            if idx >= 0:
+                arch_combo.setCurrentIndex(idx)
+        host_settings_layout.addWidget(arch_combo)
+
+        # Subproject selection
+        sp_label = QLabel("Subproject (all participants will annotate for this):")
+        host_settings_layout.addWidget(sp_label)
+        sp_combo = QComboBox()
+        project_dir = self.config.get('project_dir', '')
+        subproject_names = []
+        if project_dir and has_subprojects(project_dir):
+            subproject_names = list_subprojects(project_dir)
+            for sp_name in subproject_names:
+                sp_combo.addItem(sp_name)
+            active_sp = get_active_subproject(project_dir)
+            if active_sp:
+                idx = sp_combo.findText(active_sp)
+                if idx >= 0:
+                    sp_combo.setCurrentIndex(idx)
+        else:
+            sp_combo.addItem("(no subprojects)")
+            sp_combo.setEnabled(False)
+        host_settings_layout.addWidget(sp_combo)
+
+        host_settings_layout.addWidget(QLabel(
+            "Note: Only the host trains. Joinees annotate and send crops to the host."
+        ))
+        dlayout.addWidget(host_settings_group)
+
+        # --- Join address/code input (only visible when joining) ---
+        join_group = QGroupBox("Connection Details")
+        join_layout = QVBoxLayout(join_group)
+        address_label = QLabel("Host address (IP or IP:port):")
+        address_input = QLineEdit()
+        address_input.setPlaceholderText("e.g. 192.168.1.5 or 192.168.1.5:8765")
+        join_layout.addWidget(address_label)
+        join_layout.addWidget(address_input)
+        join_group.setVisible(False)
+        dlayout.addWidget(join_group)
+
+        # --- Display name ---
+        name_group = QGroupBox("Display Name")
+        name_layout = QVBoxLayout(name_group)
+        default_name = os.environ.get('USER', os.environ.get('USERNAME', 'user'))
+        name_input = QLineEdit(default_name)
+        name_layout.addWidget(name_input)
+        dlayout.addWidget(name_group)
+
+        # --- Buttons ---
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dlayout.addWidget(buttons)
+
+        # --- Dynamic UI updates ---
+        def update_ui():
+            is_hosting = host_radio.isChecked()
+            is_joining = join_radio.isChecked()
+            host_settings_group.setVisible(is_hosting)
+            join_group.setVisible(is_joining)
+            if is_joining and lan_radio.isChecked():
+                address_label.setText("Host address (IP or IP:port):")
+                address_input.setPlaceholderText("e.g. 192.168.1.5 or 192.168.1.5:8765")
+            elif is_joining and relay_radio.isChecked():
+                address_label.setText("6-character session code:")
+                address_input.setPlaceholderText("e.g. ABC123")
+            address_input.clear()
+
+        host_radio.toggled.connect(update_ui)
+        join_radio.toggled.connect(update_ui)
+        lan_radio.toggled.connect(update_ui)
+        relay_radio.toggled.connect(update_ui)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        name = name_input.text().strip()
+        if not name:
+            return
+
+        is_host = host_radio.isChecked()
+        is_lan = lan_radio.isChecked()
+
+        # Get host settings
+        selected_arch = arch_ids[arch_combo.currentIndex()] if arch_ids else current_arch
+        selected_sp = sp_combo.currentText() if subproject_names else None
+
+        if is_host:
+            # Switch to selected subproject before starting session
+            if selected_sp and selected_sp != self.training_page._active_subproject:
+                self.training_page.switch_subproject(selected_sp)
+
+            if is_lan:
+                self._host_lan_session(name, selected_arch, selected_sp)
+            else:
+                self._host_relay_session(name, DEFAULT_RELAY_URL, selected_arch, selected_sp)
+        else:
+            if is_lan:
+                address = address_input.text().strip()
+                if not address:
+                    QMessageBox.warning(self, "Missing Address", "Please enter the host address.")
+                    return
+                self._join_lan_session(address, name)
+            else:
+                code = address_input.text().strip().upper()
+                if not code or len(code) != 6:
+                    QMessageBox.warning(self, "Invalid Code", "Session code must be 6 characters.")
+                    return
+                self._join_relay_session(code, name, DEFAULT_RELAY_URL)
+
+    def _host_lan_session(self, name: str, architecture: str = None, subproject: str = None):
+        """Host a LAN session — starts local aggregation server + host client."""
+        from .network import AggregationServer, SyncClient, get_local_ip
+
+        arch = architecture or self.training_page.current_architecture
+        try:
+            self._aggregation_server = AggregationServer(parent=self)
+            self._aggregation_server.server_started.connect(self._on_lan_server_started)
+            self._aggregation_server.error.connect(self._on_session_error)
+
+            self._aggregation_server.start(port=8765, architecture=arch)
+            print(f"[Wizard] Started LAN server with architecture: {arch}")
+
+            # Create a host client that connects to our own server
+            local_ip = get_local_ip()
+            self._session_client = SyncClient(parent=self)
+            self._session_client.display_name = name
+            self._session_client.connected.connect(lambda: self._on_lan_host_connected(local_ip, arch, subproject))
+            self._session_client.disconnected.connect(self._on_session_disconnected)
+            self._session_client.error.connect(self._on_session_error)
+            self._session_client.user_list_updated.connect(self._on_user_list_updated)
+            self._session_client.sync_status.connect(self._on_sync_status)
+
+            self._session_client.connect_direct("127.0.0.1", 8765, name)
+            self._is_session_host = True
+            self.session_btn.setEnabled(False)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start LAN session:\n{e}")
+
+    def _on_lan_server_started(self, connection_string: str):
+        """Handle LAN server started."""
+        print(f"[Wizard] LAN server started: {connection_string}")
+
+    def _on_lan_host_connected(self, local_ip: str, architecture: str = None, subproject: str = None):
+        """Handle host client connected to own LAN server."""
+        print(f"[Wizard] LAN host connected")
+        self.session_status_label.setText(f"LAN: {local_ip}:8765")
+        self._update_session_ui(connected=True)
+        self.training_page.set_multi_user_state(None, self._session_client, is_relay_host=True)
+        arch = architecture or self.training_page.current_architecture
+        self.training_page.lock_architecture(arch)
+        self._lock_subproject(subproject)
+
+    def _host_relay_session(self, name: str, relay_url: str, architecture: str = None, subproject: str = None):
+        """Host a relay session — creates a room on the relay server."""
+        from .network import SyncClient
+
+        if not relay_url:
             QMessageBox.warning(
                 self, "Relay Not Configured",
                 "No relay server configured.\n\n"
@@ -586,44 +784,63 @@ class TrainingWizard(QMainWindow):
             )
             return
 
-        # Get display name
-        default_name = os.environ.get('USER', os.environ.get('USERNAME', 'user'))
-        name, ok = QInputDialog.getText(
-            self, "Create Session",
-            "Enter your display name:",
-            text=default_name + "_host"
-        )
-        if not ok or not name.strip():
-            return
-
-        # Create client and connect
         self._session_client = SyncClient(parent=self)
-        self._session_client.display_name = name.strip()
-        self._session_client.room_created.connect(self._on_room_created)
+        self._session_client.display_name = name
+        self._session_client.room_created.connect(lambda code: self._on_room_created(code, architecture, subproject))
         self._session_client.disconnected.connect(self._on_session_disconnected)
         self._session_client.error.connect(self._on_session_error)
         self._session_client.user_list_updated.connect(self._on_user_list_updated)
         self._session_client.sync_status.connect(self._on_sync_status)
 
-        self._session_client.create_relay_room(name.strip(), DEFAULT_RELAY_URL)
-        self.session_create_btn.setEnabled(False)
-        self.session_join_btn.setEnabled(False)
+        self._session_client.create_relay_room(name, relay_url)
+        self.session_btn.setEnabled(False)
         self._is_session_host = True
 
-    def _join_session(self):
-        """Join an existing session."""
-        from PyQt6.QtWidgets import QInputDialog
+    def _join_lan_session(self, host_address: str, name: str):
+        """Join a LAN session by direct IP connection."""
+        from .network import SyncClient
+
         try:
-            from .network import SyncClient, DEFAULT_RELAY_URL
-        except ImportError as e:
-            QMessageBox.warning(
-                self, "Missing Dependency",
-                f"Multi-user networking requires the 'websockets' library.\n"
-                f"Install with: pip install websockets\n\nError: {e}"
-            )
+            if ':' in host_address:
+                host_ip, port_str = host_address.split(':')
+                port = int(port_str)
+            else:
+                host_ip = host_address
+                port = 8765
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Address",
+                "Please enter a valid address (e.g., 192.168.1.5 or 192.168.1.5:8765)")
             return
 
-        if not DEFAULT_RELAY_URL:
+        self._session_client = SyncClient(parent=self)
+        self._session_client.display_name = name
+        self._session_client.connected.connect(self._on_lan_client_connected)
+        self._session_client.disconnected.connect(self._on_session_disconnected)
+        self._session_client.error.connect(self._on_session_error)
+        self._session_client.user_list_updated.connect(self._on_user_list_updated)
+        self._session_client.sync_status.connect(self._on_sync_status)
+        self._session_client.architecture_received.connect(self._on_architecture_received)
+
+        self._session_client.connect_direct(host_ip, port, name)
+        self.session_btn.setEnabled(False)
+        self._is_session_host = False
+
+    def _on_lan_client_connected(self):
+        """Handle successful LAN client connection."""
+        print("[Wizard] LAN client connected")
+        self.session_status_label.setText("LAN: Connected")
+        self._update_session_ui(connected=True)
+        self.training_page.set_multi_user_state(None, self._session_client, is_relay_host=False)
+        # Lock subproject panel — joinee uses whatever subproject the host chose
+        self._lock_subproject(self.training_page._active_subproject)
+        # Lock training for joinees — only the host trains
+        self.training_page.lock_training()
+
+    def _join_relay_session(self, code: str, name: str, relay_url: str):
+        """Join a relay session by room code."""
+        from .network import SyncClient
+
+        if not relay_url:
             QMessageBox.warning(
                 self, "Relay Not Configured",
                 "No relay server configured.\n\n"
@@ -632,32 +849,8 @@ class TrainingWizard(QMainWindow):
             )
             return
 
-        # Get room code
-        code, ok = QInputDialog.getText(
-            self, "Join Session",
-            "Enter 6-character session code:"
-        )
-        if not ok or not code.strip():
-            return
-
-        code = code.strip().upper()
-        if len(code) != 6:
-            QMessageBox.warning(self, "Invalid Code", "Session code must be 6 characters.")
-            return
-
-        # Get display name
-        default_name = os.environ.get('USER', os.environ.get('USERNAME', 'user'))
-        name, ok = QInputDialog.getText(
-            self, "Join Session",
-            "Enter your display name:",
-            text=default_name
-        )
-        if not ok or not name.strip():
-            return
-
-        # Create client and connect
         self._session_client = SyncClient(parent=self)
-        self._session_client.display_name = name.strip()
+        self._session_client.display_name = name
         self._session_client.room_joined.connect(self._on_room_joined)
         self._session_client.disconnected.connect(self._on_session_disconnected)
         self._session_client.error.connect(self._on_session_error)
@@ -665,9 +858,8 @@ class TrainingWizard(QMainWindow):
         self._session_client.sync_status.connect(self._on_sync_status)
         self._session_client.architecture_received.connect(self._on_architecture_received)
 
-        self._session_client.connect_relay(code, name.strip(), DEFAULT_RELAY_URL)
-        self.session_create_btn.setEnabled(False)
-        self.session_join_btn.setEnabled(False)
+        self._session_client.connect_relay(code, name, relay_url)
+        self.session_btn.setEnabled(False)
         self._is_session_host = False
 
     def _disconnect_session(self):
@@ -675,24 +867,40 @@ class TrainingWizard(QMainWindow):
         if self._session_client:
             self._session_client.disconnect()
             self._session_client = None
+        # Stop LAN server if we were hosting
+        if hasattr(self, '_aggregation_server') and self._aggregation_server:
+            self._aggregation_server.stop()
+            self._aggregation_server = None
         self._is_session_host = False
         self._update_session_ui(connected=False)
         # Disable multi-user on training page
         self.training_page.disable_multi_user()
-        # Unlock architecture
+        # Unlock architecture, subproject, and training
         self.training_page.unlock_architecture()
+        self.training_page.unlock_training()
+        self._unlock_subproject()
 
-    def _on_room_created(self, room_code: str):
+    def _lock_subproject(self, subproject_name: str = None):
+        """Lock the subproject panel during a multi-user session."""
+        if subproject_name:
+            print(f"[Wizard] Locking subproject to: {subproject_name}")
+        self.subproject_panel.setEnabled(False)
+
+    def _unlock_subproject(self):
+        """Unlock the subproject panel after disconnecting."""
+        self.subproject_panel.setEnabled(True)
+
+    def _on_room_created(self, room_code: str, architecture: str = None, subproject: str = None):
         """Handle room created."""
         print(f"[Wizard] Room created: {room_code}")
         self.session_status_label.setText(f"Session: {room_code}")
         self._update_session_ui(connected=True)
         # Enable multi-user on training page as host
         self.training_page.set_multi_user_state(None, self._session_client, is_relay_host=True)
-        # Lock architecture - host's current architecture becomes the session architecture
-        current_arch = self.training_page.current_architecture
-        self.training_page.lock_architecture(current_arch)
-        print(f"[Wizard] Locked architecture to: {current_arch}")
+        arch = architecture or self.training_page.current_architecture
+        self.training_page.lock_architecture(arch)
+        self._lock_subproject(subproject)
+        print(f"[Wizard] Locked architecture to: {arch}")
 
     def _on_room_joined(self, room_code: str):
         """Handle room joined."""
@@ -701,6 +909,9 @@ class TrainingWizard(QMainWindow):
         self._update_session_ui(connected=True)
         # Enable multi-user on training page as joinee
         self.training_page.set_multi_user_state(None, self._session_client, is_relay_host=False)
+        # Lock subproject + training for joinee
+        self._lock_subproject(self.training_page._active_subproject)
+        self.training_page.lock_training()
         # Architecture will be locked when architecture_received signal fires
 
     def _on_architecture_received(self, architecture: str):
@@ -735,13 +946,11 @@ class TrainingWizard(QMainWindow):
 
     def _update_session_ui(self, connected: bool):
         """Update session UI based on connection state."""
-        self.session_create_btn.setVisible(not connected)
-        self.session_join_btn.setVisible(not connected)
+        self.session_btn.setVisible(not connected)
         self.session_status_label.setVisible(connected)
         self.session_disconnect_btn.setVisible(connected)
         if not connected:
-            self.session_create_btn.setEnabled(True)
-            self.session_join_btn.setEnabled(True)
+            self.session_btn.setEnabled(True)
 
     def _close_wizard(self):
         """Close the wizard and return to welcome page."""
@@ -749,6 +958,9 @@ class TrainingWizard(QMainWindow):
         if self._session_client:
             self._session_client.disconnect()
             self._session_client = None
+        if self._aggregation_server:
+            self._aggregation_server.stop()
+            self._aggregation_server = None
         # Emit signal to return to welcome page (when embedded in launcher)
         self.wizard_closed.emit()
 
@@ -757,6 +969,8 @@ class TrainingWizard(QMainWindow):
         # Disconnect from session if connected
         if self._session_client:
             self._session_client.disconnect()
+        if self._aggregation_server:
+            self._aggregation_server.stop()
         self.wizard_closed.emit()
         event.accept()
 

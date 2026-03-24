@@ -427,7 +427,6 @@ class HomePage(QWidget):
     # Signals
     start_training = pyqtSignal()  # Start 2D MOSS training
     start_3d_segmentation = pyqtSignal()  # Start 3D segmentation pipeline
-    start_proofreading = pyqtSignal()  # Start proofreading
     open_data_manager = pyqtSignal()  # Open data management
     project_loaded = pyqtSignal()  # Emitted when a project is loaded/created
 
@@ -821,17 +820,14 @@ class HomePage(QWidget):
         self.zarr_card.secondary_action_clicked.connect(self._on_load_existing_zarr)
 
         self.segmentation_card = DataStatusCard("Segmentation", "Run")
-        self.proofread_card = DataStatusCard("Proofread Data", "Review")
 
         self.segmentation_card.action_clicked.connect(lambda: self.start_3d_segmentation.emit())
-        self.proofread_card.action_clicked.connect(lambda: self.start_proofreading.emit())
 
         data_layout.addWidget(self.raw_data_card, 0, 0)
         data_layout.addWidget(self.training_data_card, 0, 1)
         data_layout.addWidget(self.model_card, 0, 2)
         data_layout.addWidget(self.zarr_card, 1, 0)
         data_layout.addWidget(self.segmentation_card, 1, 1)
-        data_layout.addWidget(self.proofread_card, 1, 2)
 
         content_layout.addWidget(data_group)
 
@@ -855,14 +851,12 @@ class HomePage(QWidget):
         pipeline_layout = QVBoxLayout(pipeline_group)
         pipeline_layout.setSpacing(scaled(6))
 
-        # Pipeline steps
+        # Pipeline steps (matches actual wizard workflow)
         steps = [
             ("1. Data Import", "Import raw EM images (TIFF/Zarr)"),
-            ("2. Training Data", "Create/load training labels"),
-            ("3. Model Training", "Train 2D segmentation model (MOSS)"),
-            ("4. 3D Segmentation", "Run LSD/Ensemble pipeline"),
-            ("5. Proofreading", "Review and correct in Neuroglancer"),
-            ("6. Export", "Export final segmentation"),
+            ("2. Ground Truth", "Create training labels & train segmentation model"),
+            ("3. Segmentation", "Run MOSS or LSD 2D segmentation"),
+            ("4. Export", "Export final segmentation"),
         ]
 
         self.pipeline_steps = []
@@ -1305,19 +1299,23 @@ class HomePage(QWidget):
         )
         if has_labels:
             self.training_data_card.set_status(True, "Training labels available", show_action=False)
-            self.pipeline_steps[1].set_status('completed')
         else:
             self.training_data_card.set_status(False, "Create labels in Ground Truth step", show_action=True)
-            self.pipeline_steps[1].set_status('pending' if not tiff_files else 'available')
 
         # Check for trained model
         model_files = list(self.project_dir.glob("**/*.pt")) + list(self.project_dir.glob("**/*.pth"))
         if model_files:
             self.model_card.set_status(True, f"{len(model_files)} model(s) found", show_action=False)
-            self.pipeline_steps[2].set_status('completed')
         else:
             self.model_card.set_status(False, "Train a model first", show_action=has_labels)
-            self.pipeline_steps[2].set_status('pending' if not has_labels else 'available')
+
+        # Pipeline step 1 (Ground Truth) = labels + model combined
+        if model_files:
+            self.pipeline_steps[1].set_status('completed')
+        elif has_labels:
+            self.pipeline_steps[1].set_status('available')
+        else:
+            self.pipeline_steps[1].set_status('pending' if not tiff_files else 'available')
 
         # Check for Zarr data
         zarr_dirs = list(self.project_dir.glob("**/*.zarr"))
@@ -1369,21 +1367,14 @@ class HomePage(QWidget):
         has_segmentation = bool(seg_files)
         if has_segmentation:
             self.segmentation_card.set_status(True, f"{len(seg_files)} segmentation(s)", show_action=False)
-            self.pipeline_steps[3].set_status('completed')
+            self.pipeline_steps[2].set_status('completed')
+            self.pipeline_steps[3].set_status('available')  # Export available
         else:
             # Can run segmentation if we have zarr OR model
             can_segment = has_zarr or bool(model_files)
             self.segmentation_card.set_status(False, "Run segmentation", show_action=can_segment)
-            self.pipeline_steps[3].set_status('available' if can_segment else 'pending')
-
-        # Check for proofread data
-        proofread_dir = self.project_dir / "proofread"
-        if proofread_dir.exists() and any(proofread_dir.iterdir()):
-            self.proofread_card.set_status(True, "Proofread corrections saved", show_action=False)
-            self.pipeline_steps[4].set_status('completed')
-        else:
-            self.proofread_card.set_status(False, "Review in Neuroglancer", show_action=has_segmentation)
-            self.pipeline_steps[4].set_status('available' if has_segmentation else 'pending')
+            self.pipeline_steps[2].set_status('available' if can_segment else 'pending')
+            self.pipeline_steps[3].set_status('pending')  # Export not ready
 
     def _reset_status(self):
         """Reset all status indicators."""
@@ -1392,7 +1383,6 @@ class HomePage(QWidget):
         self.model_card.set_status(False)
         self.zarr_card.set_status(False)
         self.segmentation_card.set_status(False)
-        self.proofread_card.set_status(False)
 
         for step in self.pipeline_steps:
             step.set_status('pending')
@@ -1402,13 +1392,12 @@ class HomePage(QWidget):
         step_num = int(step_name.split('.')[0])
         if step_num == 1:  # Data Import
             self._on_import_data()
-        elif step_num in (2, 3):  # Training Data or Model Training
+        elif step_num == 2:  # Ground Truth (training labels + model training)
             self._on_start_training()  # Check for Zarr conversion first
-        elif step_num == 4:  # Segmentation
+        elif step_num == 3:  # Segmentation
             self.start_3d_segmentation.emit()
-        elif step_num == 5:  # Proofreading
-            self.start_proofreading.emit()
-        # Step 6 (Export) - no action yet
+        elif step_num == 4:  # Export
+            pass  # TODO: navigate to export page
 
     def _on_start_training(self):
         """Handle start training - check if Zarr conversion is needed first."""

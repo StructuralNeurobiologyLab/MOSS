@@ -12,3 +12,12 @@ build/
 *.swo
 *~
 .DS_Store
+
+# Relay server credentials (contains user-specific URL)
+segmentation_suite/network/relay_config.txt
+
+# SAM2 model weights (downloaded on first use, ~300MB)
+sam2_models/
+
+# Claude Code local settings
+.claude/settings.local.json
