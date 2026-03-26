@@ -766,7 +766,7 @@ class TrainingWizard(QMainWindow):
         print(f"[Wizard] LAN host connected")
         self.session_status_label.setText(f"LAN: {local_ip}:8765")
         self._update_session_ui(connected=True)
-        self.training_page.set_multi_user_state(None, self._session_client, is_relay_host=True)
+        self.training_page.set_multi_user_state(self._aggregation_server, self._session_client, is_relay_host=True)
         arch = architecture or self.training_page.current_architecture
         self.training_page.lock_architecture(arch)
         self._lock_subproject(subproject)

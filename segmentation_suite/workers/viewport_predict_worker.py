@@ -434,39 +434,16 @@ class ViewportPredictWorker(QThread):
                     continue
 
             image, bounds, slice_idx = request
-            x_min, y_min, x_max, y_max = bounds
 
             try:
-                # Add padding for context
-                padding = 64
-                # Handle both 2D (H, W) and 3D (H, W, C) images
-                h, w = image.shape[:2]
-                x_min_pad = max(0, x_min - padding)
-                y_min_pad = max(0, y_min - padding)
-                x_max_pad = min(w, x_max + padding)
-                y_max_pad = min(h, y_max + padding)
-
-                # Crop to viewport + padding (works for both 2D and 3D)
-                if image.ndim == 3:
-                    cropped = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad, :].copy()
-                else:
-                    cropped = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad].copy()
-
-                # Predict
-                prediction = self._predict(cropped)
+                # Image is pre-cropped to viewport+padding by the caller.
+                # Bounds reflect the padded region coordinates in full-image space.
+                prediction = self._predict(image)
 
                 if prediction is None:
                     continue
 
-                # Trim padding from prediction to match original viewport
-                trim_left = x_min - x_min_pad
-                trim_top = y_min - y_min_pad
-                trim_right = prediction.shape[1] - (x_max_pad - x_max)
-                trim_bottom = prediction.shape[0] - (y_max_pad - y_max)
-
-                prediction = prediction[trim_top:trim_bottom, trim_left:trim_right]
-
-                # Emit result with slice index for staleness check
+                # Emit result with bounds for placement
                 self.prediction_ready.emit(prediction, bounds, slice_idx)
 
             except Exception as e:

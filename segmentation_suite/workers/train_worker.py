@@ -1022,6 +1022,12 @@ class TrainWorker(QThread):
                         num_workers=0, pin_memory=False
                     )
 
+            # Explicitly shut down DataLoader workers before thread exits
+            # (persistent_workers keep processes alive until the loader is deleted)
+            del train_loader
+            if val_loader:
+                del val_loader
+
             self.log.emit(f"Training complete. Model saved to {checkpoint_path}")
             self.finished.emit(True, checkpoint_path)
 

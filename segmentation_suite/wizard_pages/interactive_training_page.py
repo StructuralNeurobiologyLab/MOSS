@@ -684,17 +684,6 @@ class InteractiveTrainingPage(QWidget):
 
         idx = self.current_slice_index
 
-        # Get image for prediction - handle both Zarr and TIFF modes
-        if self.use_zarr and self.zarr_source is not None:
-            # Zarr mode: load full slice at full resolution
-            image = self.zarr_source.get_slice(idx, pyramid_level=0)
-        elif idx in self.images:
-            # TIFF mode: use cached image
-            image = self.images[idx]
-        else:
-            # No image available
-            return
-
         # Check for checkpoint (prediction architecture-specific)
         checkpoint_path = self._get_prediction_checkpoint_path()
         if not checkpoint_path or not checkpoint_path.exists():
@@ -713,20 +702,49 @@ class InteractiveTrainingPage(QWidget):
         if bounds is None:
             return
 
-        # For 2.5D architectures, pass multi-channel stack
+        x_min, y_min, x_max, y_max = bounds
+
+        # Add padding for context (prediction needs surrounding pixels)
+        padding = 64
+        if self.use_zarr and self.zarr_source is not None:
+            h, w = self.zarr_source.height, self.zarr_source.width
+        elif idx in self.images:
+            h, w = self.images[idx].shape[:2]
+        else:
+            return
+
+        x_min_pad = max(0, x_min - padding)
+        y_min_pad = max(0, y_min - padding)
+        x_max_pad = min(w, x_max + padding)
+        y_max_pad = min(h, y_max + padding)
+
+        # Load only the viewport region (not the full slice)
+        if self.use_zarr and self.zarr_source is not None:
+            # Zarr mode: load only the viewport crop at full resolution
+            tile, _ = self.zarr_source.get_tile_native(
+                idx, y_min_pad, y_max_pad, x_min_pad, x_max_pad, pyramid_level=0
+            )
+            image = tile
+        elif idx in self.images:
+            # TIFF mode: crop from cached image
+            image = self.images[idx][y_min_pad:y_max_pad, x_min_pad:x_max_pad].copy()
+        else:
+            return
+
+        # For 2.5D architectures, load adjacent slice crops and stack
         if self.predict_worker.is_25d():
             n_expected = self.predict_worker._n_channels
-            adjacent = self._load_adjacent_slices(idx)
+            adjacent = self._load_adjacent_slice_crops(
+                idx, y_min_pad, y_max_pad, x_min_pad, x_max_pad, n_expected
+            )
             if adjacent is not None and len(adjacent) == n_expected:
-                # Stack as (H, W, C)
-                image_stack = np.stack(adjacent, axis=-1)
-                self.predict_worker.request_prediction(image_stack, bounds, idx)
-            else:
-                # Fall back to single slice if adjacent loading fails
-                self.predict_worker.request_prediction(image, bounds, idx)
-        else:
-            # Regular 2D prediction
-            self.predict_worker.request_prediction(image, bounds, idx)
+                image = np.stack(adjacent, axis=-1)
+
+        # Submit pre-cropped image — bounds reflect the padded region
+        # so the worker knows where to trim
+        self.predict_worker.request_prediction(
+            image, (x_min_pad, y_min_pad, x_max_pad, y_max_pad), idx
+        )
 
     def _on_prediction_ready(self, prediction: np.ndarray, bounds: tuple, request_slice_idx: int = -1):
         """Handle prediction result from worker."""
@@ -2684,7 +2702,7 @@ class InteractiveTrainingPage(QWidget):
         # Get parameters from architecture if not specified
         if n_flanking is None or spacing is None:
             from ..models.architectures import get_n_context_slices, get_slice_spacing
-            arch = self.current_architecture
+            arch = self.prediction_architecture
             if n_flanking is None:
                 n_ctx = get_n_context_slices(arch)
                 n_flanking = (n_ctx - 1) // 2  # e.g. 11 -> 5, 3 -> 1
@@ -2754,6 +2772,50 @@ class InteractiveTrainingPage(QWidget):
                 return None  # Failed to load a required slice
 
         return slices
+
+    def _load_adjacent_slice_crops(self, slice_idx: int,
+                                    y1: int, y2: int, x1: int, x2: int,
+                                    n_channels: int) -> list:
+        """Load adjacent slice crops for 2.5D prediction (viewport region only).
+
+        Like _load_adjacent_slices but only loads the viewport crop from each slice,
+        avoiding full-resolution zarr reads on the main thread.
+
+        Returns:
+            List of cropped numpy arrays, or None on failure.
+        """
+        from ..models.architectures import get_n_context_slices, get_slice_spacing
+        arch = self.prediction_architecture
+        n_ctx = get_n_context_slices(arch)
+        n_flanking = (n_ctx - 1) // 2
+        spacing = get_slice_spacing(arch)
+        total_slices = len(self.image_files) if self.image_files else 0
+        if total_slices < 3:
+            return None
+
+        indices = []
+        for i in range(-n_flanking, n_flanking + 1):
+            idx = slice_idx + i * spacing
+            idx = max(0, min(idx, total_slices - 1))
+            indices.append(idx)
+
+        crops = []
+        for idx in indices:
+            try:
+                if self.use_zarr and self.zarr_source is not None:
+                    tile, _ = self.zarr_source.get_tile_native(
+                        idx, y1, y2, x1, x2, pyramid_level=0
+                    )
+                    crops.append(tile)
+                elif idx in self.images:
+                    crops.append(self.images[idx][y1:y2, x1:x2].copy())
+                else:
+                    return None
+            except Exception as e:
+                print(f"[Predict] Failed to load crop for slice {idx}: {e}")
+                return None
+
+        return crops
 
     def _save_25d_crop(self, slices: list, mask_crop: np.ndarray,
                        py: int, px: int, crop_h: int, crop_id: str,

@@ -57,6 +57,12 @@ class TrainingDataReviewer(QDialog):
         self.discarded_images_25d_dir = self.discarded_dir / "train_images_25d"
         self.discarded_masks_25d_dir = self.discarded_dir / "train_masks_25d"
 
+        # Dwarf 2.5D training directories
+        self.train_images_dwarf25d_dir = self.project_dir / "train_images_dwarf25d"
+        self.train_masks_dwarf25d_dir = self.project_dir / "train_masks_dwarf25d"
+        self.discarded_images_dwarf25d_dir = self.discarded_dir / "train_images_dwarf25d"
+        self.discarded_masks_dwarf25d_dir = self.discarded_dir / "train_masks_dwarf25d"
+
         # Load image list
         self.image_files: List[Path] = []
         self.current_index = 0
@@ -308,6 +314,27 @@ class TrainingDataReviewer(QDialog):
                     print(f"[Reviewer] Discarded 2.5D mask: {image_path.name}")
                 except Exception as e:
                     print(f"[Reviewer] Error moving 2.5D mask: {e}")
+
+        # Also check for dwarf 2.5D training data
+        if self.train_images_dwarf25d_dir.exists():
+            image_dwarf25d_path = self.train_images_dwarf25d_dir / image_path.name
+            if image_dwarf25d_path.exists():
+                self.discarded_images_dwarf25d_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.move(str(image_dwarf25d_path), str(self.discarded_images_dwarf25d_dir / image_path.name))
+                    print(f"[Reviewer] Discarded dwarf 2.5D image: {image_path.name}")
+                except Exception as e:
+                    print(f"[Reviewer] Error moving dwarf 2.5D image: {e}")
+
+        if self.train_masks_dwarf25d_dir.exists():
+            mask_dwarf25d_path = self.train_masks_dwarf25d_dir / image_path.name
+            if mask_dwarf25d_path.exists():
+                self.discarded_masks_dwarf25d_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.move(str(mask_dwarf25d_path), str(self.discarded_masks_dwarf25d_dir / image_path.name))
+                    print(f"[Reviewer] Discarded dwarf 2.5D mask: {image_path.name}")
+                except Exception as e:
+                    print(f"[Reviewer] Error moving dwarf 2.5D mask: {e}")
 
         # Update state
         self.discard_count += 1

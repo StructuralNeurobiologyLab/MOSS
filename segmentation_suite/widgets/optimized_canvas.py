@@ -47,9 +47,10 @@ class OptimizedCanvas(PaintCanvas):
         # Enable mouse tracking to get cursor position even without button press
         self.setMouseTracking(True)
 
-        # Cached display pixmap (unscaled)
+        # Cached composited pixmap for the current viewport
         self._cached_pixmap = None
         self._cache_valid = False
+        self._cached_render_key = None  # (slice_idx, x1, y1, x2, y2, level, mask_id, sugg_id)
 
         # === Zarr source state ===
         self._zarr_source = None
@@ -551,6 +552,7 @@ class OptimizedCanvas(PaintCanvas):
         # Fill all pixels with this label
         fill_mask = (labeled == clicked_label)
         self.mask[fill_mask] = fill_value
+        self._cache_valid = False
 
         self.update()
 
@@ -617,6 +619,8 @@ class OptimizedCanvas(PaintCanvas):
 
         # Apply to mask (after snapshot)
         self.mask[y_min:y_max, x_min:x_max][circle_mask] = value
+
+        self._cache_valid = False
 
         # Track painting bounds for crop preview
         if self._paint_bounds_min is None:
@@ -970,10 +974,13 @@ class OptimizedCanvas(PaintCanvas):
                 dest_w = max(1, dest_w)
                 dest_h = max(1, dest_h)
 
-            # Let Qt scale the small pixmap to dest size (GPU-accelerated)
-            from PyQt6.QtCore import QRect
-            dest_rect = QRect(draw_x, draw_y, dest_w, dest_h)
-            painter.drawPixmap(dest_rect, viewport_pixmap)
+            # Pre-scale pixmap with fast nearest-neighbor, then draw at 1:1
+            scaled_pixmap = viewport_pixmap.scaled(
+                dest_w, dest_h,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation
+            )
+            painter.drawPixmap(draw_x, draw_y, scaled_pixmap)
 
         # Draw overlays
         self._draw_brush_cursor(painter)
@@ -1010,6 +1017,22 @@ class OptimizedCanvas(PaintCanvas):
             if self.zoom_level < 0.1:
                 print(f"[Canvas] _render_region: empty region at zoom={self.zoom_level:.4f}")
             return None, 1
+
+        # Check composited pixmap cache — avoid recomputing numpy overlays
+        # when nothing has changed (e.g. cursor moves, timer repaints, etc.)
+        level = 0
+        if self._zarr_source is not None:
+            level = self._select_pyramid_level()
+        render_key = (
+            getattr(self, '_zarr_slice_idx', 0), x1, y1, x2, y2, level,
+            id(self.mask) if self.mask is not None else 0,
+            id(self.suggestion) if self.suggestion is not None else 0,
+            id(self._hovered_component) if self._hovered_component is not None else 0,
+        )
+        if self._cache_valid and self._cached_render_key == render_key and self._cached_pixmap is not None:
+            # Nothing changed — return cached pixmap
+            downsample = self._zarr_source.downsample_factors[level] if self._zarr_source and level < len(self._zarr_source.downsample_factors) else 1
+            return self._cached_pixmap, downsample
 
         downsample = 1  # Default for raw image mode
 
@@ -1165,7 +1188,14 @@ class OptimizedCanvas(PaintCanvas):
         # Convert to QPixmap
         img_rgb = np.ascontiguousarray(img_rgb)
         qimg = QImage(img_rgb.data, tile_w, tile_h, 3 * tile_w, QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(qimg.copy()), downsample
+        pixmap = QPixmap.fromImage(qimg.copy())
+
+        # Cache the composited pixmap
+        self._cached_pixmap = pixmap
+        self._cached_render_key = render_key
+        self._cache_valid = True
+
+        return pixmap, downsample
 
     def _draw_brush_cursor(self, painter):
         """Draw brush cursor preview."""

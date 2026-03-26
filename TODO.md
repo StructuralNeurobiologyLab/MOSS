@@ -25,6 +25,10 @@
 - [x] Home page pipeline steps updated to match actual workflow: Data Import → Ground Truth → Segmentation → Export
 - [x] Removed stale "Proofreading" card and pipeline step from home page
 
+## Bugs
+- [ ] LSD "Run Segmentation" button fails with missing module error. "Test LSD" works fine. Need to investigate how much of the LSD 3D watershed pipeline is implemented and what dependencies are missing.
+- [x] Review Crops button didn't delete dwarf 2.5D crops (`train_images_dwarf25d`/`train_masks_dwarf25d`). **FIXED**: Added dwarf25d directory awareness and move logic to `TrainingDataReviewer._discard_current()`.
+
 ## Work in Progress
 - [ ] Proofreading page (removed from wizard, code deleted — needs full reimplementation)
 - [ ] Export page needs rewrite (currently a placeholder with stale references)

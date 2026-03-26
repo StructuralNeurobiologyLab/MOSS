@@ -246,6 +246,10 @@ class AggregationServer(QObject):
                 await self._handle_request_model(websocket, msg)
             elif msg.type == MessageType.TRAINING_DATA:
                 await self._handle_training_data(websocket, msg)
+            elif msg.type == MessageType.CHUNK_START:
+                await self._handle_chunk_start(websocket, msg)
+            elif msg.type == MessageType.CHUNK_END:
+                await self._handle_chunk_end(websocket, msg)
             else:
                 print(f"[Server] Unknown message type: {msg.type}")
 
@@ -394,8 +398,70 @@ class AggregationServer(QObject):
             "expected": 2
         }
 
+    async def _handle_chunk_start(self, websocket: WebSocketServerProtocol, msg: Message):
+        """Handle CHUNK_START — begin accumulating chunks for a chunked weight transfer."""
+        user_id = self._websocket_to_user.get(websocket, "unknown")
+        transfer_id = msg.payload.get("transfer_id", "")
+        total_chunks = msg.payload.get("total_chunks", 0)
+        total_size = msg.payload.get("total_size", 0)
+        _log(f"CHUNK_START from {user_id}: transfer={transfer_id}, "
+             f"{total_chunks} chunks, {total_size} bytes")
+
+        if not hasattr(self, '_pending_chunks'):
+            self._pending_chunks = {}
+
+        self._pending_chunks[user_id] = {
+            "transfer_id": transfer_id,
+            "total_chunks": total_chunks,
+            "chunks": [],
+            # Preserve weights_push metadata embedded in chunk_start
+            "epoch": msg.payload.get("epoch", 0),
+            "loss": msg.payload.get("loss", 0.0),
+            "num_samples": msg.payload.get("num_samples", 1),
+        }
+
+    async def _handle_chunk_end(self, websocket: WebSocketServerProtocol, msg: Message):
+        """Handle CHUNK_END — reassemble chunks and process as complete weights."""
+        user_id = self._websocket_to_user.get(websocket, "unknown")
+        transfer_id = msg.payload.get("transfer_id", "")
+        pending = getattr(self, '_pending_chunks', {}).get(user_id)
+
+        if not pending or pending["transfer_id"] != transfer_id:
+            _log(f"CHUNK_END for unknown transfer {transfer_id} from {user_id}")
+            return
+
+        chunks = pending["chunks"]
+        _log(f"CHUNK_END from {user_id}: reassembling {len(chunks)} chunks")
+
+        # Reassemble and process
+        complete_data = b''.join(chunks)
+        _log(f"Reassembled {len(complete_data)} bytes from {user_id}")
+
+        # Store metadata so _handle_weight_binary can use it
+        if not hasattr(self, '_pending_weights'):
+            self._pending_weights = {}
+        self._pending_weights[user_id] = {
+            "epoch": pending["epoch"],
+            "loss": pending["loss"],
+            "num_samples": pending["num_samples"],
+        }
+
+        # Clean up chunk state before processing
+        del self._pending_chunks[user_id]
+
+        # Process as complete weight data
+        await self._handle_weight_binary(user_id, complete_data)
+
     async def _handle_binary_message(self, user_id: str, data: bytes):
-        """Handle binary data from a client (weights or training data frames)."""
+        """Handle binary data from a client (weights, training data, or chunk frames)."""
+        # Check if this is part of a chunked weight transfer
+        pending_chunk = getattr(self, '_pending_chunks', {}).get(user_id)
+        if pending_chunk is not None:
+            pending_chunk["chunks"].append(data)
+            _log(f"Received chunk {len(pending_chunk['chunks'])}/{pending_chunk['total_chunks']} "
+                 f"from {user_id} ({len(data)} bytes)")
+            return
+
         # Check if this is part of a training data transfer
         pending_td = getattr(self, '_pending_training_data', {}).get(user_id)
         if pending_td is not None:
