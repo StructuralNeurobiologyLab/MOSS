@@ -127,7 +127,8 @@ class PredictWorker(QThread):
             # Detect architecture variants
             is_25d = '25d' in architecture.lower()
             is_sam2 = 'sam2' in architecture.lower()
-            n_channels = 3 if is_25d else 1
+            from ..models.architectures import get_n_context_slices
+            n_channels = get_n_context_slices(architecture)
 
             device = get_device()
             self.log.emit(f"Using device: {device}")
@@ -160,7 +161,8 @@ class PredictWorker(QThread):
 
                 self.log.emit(f"Processing {name}...")
                 self._predict_folder(model, input_dir, output_dir, patch_size, overlap, name, device,
-                                    is_25d=is_25d, is_sam2=is_sam2, sam2_predictor=sam2_predictor)
+                                    is_25d=is_25d, is_sam2=is_sam2, sam2_predictor=sam2_predictor,
+                                    architecture=architecture)
 
             # Check if we were stopped vs completed
             if self.should_stop:
@@ -174,7 +176,7 @@ class PredictWorker(QThread):
             self.finished.emit(False, {"error": str(e)})
 
     def _predict_folder(self, model, input_dir, output_dir, patch_size, overlap, name, device,
-                        is_25d=False, is_sam2=False, sam2_predictor=None):
+                        is_25d=False, is_sam2=False, sam2_predictor=None, architecture='unet'):
         """Predict on all images in a folder."""
         # Find all images
         image_files = sorted([
@@ -187,14 +189,29 @@ class PredictWorker(QThread):
 
         stride = patch_size - overlap
 
-        # For 2.5D, we need a helper to load adjacent slices
-        def load_image(path):
-            """Load and convert image to grayscale float32."""
+        # Image loading with LRU cache for 2.5D (adjacent slices overlap heavily)
+        _slice_cache = {}
+
+        def load_image(path, idx=None):
+            """Load image as native dtype (uint8/uint16), with caching."""
+            if idx is not None and idx in _slice_cache:
+                return _slice_cache[idx]
             img = Image.open(path)
-            arr = np.array(img).astype(np.float32)
+            arr = np.array(img)
             if arr.ndim == 3:
                 arr = arr[..., 0]
+            if idx is not None:
+                _slice_cache[idx] = arr
             return arr
+
+        # Pre-compute 2.5D parameters
+        if is_25d:
+            from ..models.architectures import get_n_context_slices, get_slice_spacing
+            n_ctx = get_n_context_slices(architecture)
+            slice_spacing = get_slice_spacing(architecture)
+            n_flanking = (n_ctx - 1) // 2
+            # Max cache size: keep only slices that could be needed
+            max_cache_idx_range = n_flanking * slice_spacing + 1
 
         skipped = 0
         for i, image_path in enumerate(image_files):
@@ -202,36 +219,34 @@ class PredictWorker(QThread):
                 break
 
             # Load center image
-            image = load_image(image_path)
+            image = load_image(image_path, idx=i)
             h, w = image.shape
 
-            # For 2.5D, load slices with spacing of 3 (z-3, z, z+3)
+            # For 2.5D, load adjacent slices (cached — most are reused)
             if is_25d:
-                slice_spacing = 3
                 slices = []
-                for offset in [-slice_spacing, 0, slice_spacing]:
-                    idx = i + offset
-                    # Clamp at boundaries
+                for k in range(-n_flanking, n_flanking + 1):
+                    idx = i + k * slice_spacing
                     idx = max(0, min(total - 1, idx))
+                    adj = load_image(image_files[idx], idx=idx)
+                    if adj.shape != (h, w):
+                        adj = np.resize(adj, (h, w))
+                    slices.append(adj)
 
-                    if offset == 0:
-                        slices.append(image)
-                    else:
-                        adj_image = load_image(image_files[idx])
-                        # Ensure same shape
-                        if adj_image.shape != (h, w):
-                            adj_image = np.resize(adj_image, (h, w))
-                        slices.append(adj_image)
-
-                # Stack as 11-channel image (H, W, C)
+                # Stack as multi-channel image (H, W, C)
                 image_stack = np.stack(slices, axis=-1)
+
+                # Evict old cache entries no longer needed
+                min_needed = max(0, i - n_flanking * slice_spacing)
+                for cached_idx in list(_slice_cache.keys()):
+                    if cached_idx < min_needed:
+                        del _slice_cache[cached_idx]
             else:
                 image_stack = None
 
             # Skip fully black images (save empty mask instead)
-            img_min, img_max = image.min(), image.max()
+            img_min, img_max = int(image.min()), int(image.max())
             if img_max == img_min:
-                # Image is uniform (likely all black) - save empty mask
                 output_path = output_dir / f"{image_path.stem}_pred.tif"
                 Image.fromarray(np.zeros((h, w), dtype=np.uint8)).save(
                     output_path, compression='tiff_lzw'
@@ -240,79 +255,78 @@ class PredictWorker(QThread):
                 self.progress.emit(name, i + 1, total)
                 continue
 
-            # Normalize (center slice for 2D, per-channel for 2.5D)
-            if is_25d:
-                # Normalize each channel independently
-                for c in range(image_stack.shape[-1]):
-                    ch = image_stack[..., c]
-                    ch_min, ch_max = ch.min(), ch.max()
-                    if ch_max > ch_min:
-                        image_stack[..., c] = (ch - ch_min) / (ch_max - ch_min)
-                    else:
-                        image_stack[..., c] = 0.0
-            else:
-                image = (image - img_min) / (img_max - img_min)
+            # Normalization is deferred to patch level to avoid full-image float32 conversion
 
-            # Patch-based prediction
+            # Patch-based prediction with batching
             pred_full = np.zeros((h, w), dtype=np.float32)
             count = np.zeros((h, w), dtype=np.float32)
+            batch_limit = 28  # All patches in one GPU batch
 
             with torch.no_grad():
+                # Collect all valid patches first
+                patch_batch = []  # (tensor, y, x, ph, pw)
+
                 for y in range(0, h, stride):
                     for x in range(0, w, stride):
                         if is_25d:
                             patch = image_stack[y:y+patch_size, x:x+patch_size, :]
                             ph, pw = patch.shape[:2]
 
-                            # Pad if needed
+                            if patch.max() == 0:
+                                continue
+
                             pad_bottom = patch_size - ph if ph < patch_size else 0
                             pad_right = patch_size - pw if pw < patch_size else 0
                             if pad_bottom or pad_right:
                                 patch = np.pad(patch, ((0, pad_bottom), (0, pad_right), (0, 0)))
 
-                            # Convert to (N, C, H, W) tensor
-                            patch_tensor = torch.tensor(
-                                np.transpose(patch.copy(), (2, 0, 1))[None, ...],
+                            patch = patch.astype(np.float32)
+                            for c in range(patch.shape[-1]):
+                                ch = patch[..., c]
+                                ch_min, ch_max = ch.min(), ch.max()
+                                if ch_max > ch_min:
+                                    patch[..., c] = (ch - ch_min) / (ch_max - ch_min)
+                                else:
+                                    patch[..., c] = 0.0
+
+                            tensor = torch.tensor(
+                                np.transpose(patch, (2, 0, 1))[None, ...],
                                 dtype=torch.float32
-                            ).to(device)
+                            )
                         else:
                             patch = image[y:y+patch_size, x:x+patch_size]
                             ph, pw = patch.shape
 
-                            # Pad if needed
+                            if patch.max() == 0:
+                                continue
+
                             pad_bottom = patch_size - ph if ph < patch_size else 0
                             pad_right = patch_size - pw if pw < patch_size else 0
                             if pad_bottom or pad_right:
                                 patch = np.pad(patch, ((0, pad_bottom), (0, pad_right)))
 
-                            # Predict
-                            patch_tensor = torch.tensor(
-                                patch.copy()[None, None, ...],
-                                dtype=torch.float32
-                            ).to(device)
+                            patch = patch.astype(np.float32)
+                            p_min, p_max = patch.min(), patch.max()
+                            if p_max > p_min:
+                                patch = (patch - p_min) / (p_max - p_min)
 
-                        # Extract SAM2 features on-the-fly if needed
-                        sam2_feats = None
-                        if is_sam2 and sam2_predictor is not None and not is_25d:
-                            # For SAM2, extract features from the normalized patch
-                            # Need to use the padded patch at full patch_size
-                            if pad_bottom or pad_right:
-                                sam2_patch = patch  # Already padded
-                            else:
-                                sam2_patch = patch.copy()
-                            sam2_feats = self._extract_sam2_patch_features(
-                                sam2_predictor, sam2_patch, device
+                            tensor = torch.tensor(
+                                patch[None, None, ...],
+                                dtype=torch.float32
                             )
 
-                        # Model forward pass
-                        if sam2_feats is not None:
-                            pred = torch.sigmoid(model(patch_tensor, sam2_features=sam2_feats))[0, 0].cpu().numpy()
-                        else:
-                            pred = torch.sigmoid(model(patch_tensor))[0, 0].cpu().numpy()
-                        pred = pred[:ph, :pw]
+                        patch_batch.append((tensor, y, x, ph, pw))
 
-                        pred_full[y:y+ph, x:x+pw] += pred
-                        count[y:y+ph, x:x+pw] += 1
+                        # Run batch when full
+                        if len(patch_batch) >= batch_limit:
+                            self._run_patch_batch(model, patch_batch, pred_full, count, device,
+                                                  is_sam2, sam2_predictor, is_25d)
+                            patch_batch = []
+
+                # Run remaining patches
+                if patch_batch:
+                    self._run_patch_batch(model, patch_batch, pred_full, count, device,
+                                          is_sam2, sam2_predictor, is_25d)
 
             # Normalize and binarize
             pred_full /= np.maximum(count, 1e-8)
@@ -332,3 +346,37 @@ class PredictWorker(QThread):
 
         if skipped > 0:
             self.log.emit(f"Skipped {skipped} blank images in {name}")
+
+    def _run_patch_batch(self, model, patch_batch, pred_full, count, device,
+                         is_sam2=False, sam2_predictor=None, is_25d=False):
+        """Run a batch of patches through the model in one forward pass."""
+        if not patch_batch:
+            return
+
+        # SAM2 doesn't support batching — fall back to one-at-a-time
+        if is_sam2 and sam2_predictor is not None and not is_25d:
+            for tensor, y, x, ph, pw in patch_batch:
+                tensor = tensor.to(device)
+                sam2_feats = self._extract_sam2_patch_features(
+                    sam2_predictor, tensor[0, 0].cpu().numpy(), device
+                )
+                if sam2_feats is not None:
+                    pred = torch.sigmoid(model(tensor, sam2_features=sam2_feats))[0, 0].cpu().numpy()
+                else:
+                    pred = torch.sigmoid(model(tensor))[0, 0].cpu().numpy()
+                pred = pred[:ph, :pw]
+                pred_full[y:y+ph, x:x+pw] += pred
+                count[y:y+ph, x:x+pw] += 1
+            return
+
+        # Stack all patches into one batch tensor
+        batch_tensor = torch.cat([t for t, _, _, _, _ in patch_batch], dim=0).to(device)
+
+        # Single forward pass for entire batch
+        preds = torch.sigmoid(model(batch_tensor)).cpu().numpy()
+
+        # Place results
+        for idx, (_, y, x, ph, pw) in enumerate(patch_batch):
+            pred = preds[idx, 0, :ph, :pw]
+            pred_full[y:y+ph, x:x+pw] += pred
+            count[y:y+ph, x:x+pw] += 1

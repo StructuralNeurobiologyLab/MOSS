@@ -1776,11 +1776,78 @@ class SegmentationCombinedPage(QWidget):
             # Reslicing needed (works with both Zarr and directories now)
             self._run_moss_reslice_step()
 
+    def _check_reslice_complete(self, config):
+        """Check if reslice outputs already exist and are complete.
+
+        Returns True if all required reslices are already done.
+        """
+        from PIL import Image as PILImage
+        import numpy as np
+
+        input_dir = Path(config['input_dir'])
+        reslice_dir = Path(config['reslice_dir'])
+
+        # Count input images to get z_size
+        input_images = sorted(input_dir.glob("*.tif"))
+        if not input_images:
+            input_images = sorted(input_dir.glob("*.png"))
+        if not input_images:
+            return False
+
+        z_size = len(input_images)
+
+        # Get x/y dimensions from first image
+        try:
+            first_img = np.array(PILImage.open(input_images[0]))
+            y_size, x_size = first_img.shape[:2]
+        except Exception:
+            return False
+
+        # Check XZ reslice
+        if 'xz' in config['views']:
+            xz_dir = reslice_dir / "xz_reslice"
+            if not xz_dir.exists():
+                return False
+            xz_count = len(list(xz_dir.glob("xz_slice_*.tif")))
+            if xz_count < y_size:
+                self._log(f"XZ reslice incomplete: {xz_count}/{y_size}")
+                return False
+
+        # Check YZ reslice
+        if 'yz' in config['views']:
+            yz_dir = reslice_dir / "yz_reslice"
+            if not yz_dir.exists():
+                return False
+            yz_count = len(list(yz_dir.glob("yz_slice_*.tif")))
+            if yz_count < x_size:
+                self._log(f"YZ reslice incomplete: {yz_count}/{x_size}")
+                return False
+
+        # Check diagonal reslices
+        for diag in config.get('diagonals', []):
+            diag_name = diag['name']
+            diag_dir = reslice_dir / diag_name
+            if not diag_dir.exists():
+                return False
+            diag_count = len(list(diag_dir.glob(f"{diag_name}_slice_*.tif")))
+            if diag_count < z_size:
+                self._log(f"{diag_name} reslice incomplete: {diag_count}/{z_size}")
+                return False
+
+        return True
+
     def _run_moss_reslice_step(self):
         """Step 1: Reslice volume into different views."""
+        config = self._moss_workflow_config
+
+        # Check if reslicing is already complete
+        if self._check_reslice_complete(config):
+            self._log("Reslices already exist and are complete — skipping to prediction")
+            self._run_moss_predict_step()
+            return
+
         from ..workers.reslice_worker import ResliceWorker
 
-        config = self._moss_workflow_config
         has_diagonals = len(config['diagonals']) > 0
         step_label = "Step 1/4: Reslicing..." if has_diagonals else "Step 1/3: Reslicing..."
         self.status_label.setText(step_label)
@@ -1796,11 +1863,9 @@ class SegmentationCombinedPage(QWidget):
         }
 
         self._log(f"Reslicing volume...")
-        has_diagonals = len(config['diagonals']) > 0
-        progress_divisor = 4 if has_diagonals else 3
 
         self.reslice_worker = ResliceWorker(reslice_config)
-        self.reslice_worker.progress.connect(lambda p: self._on_moss_progress("Reslicing", p // progress_divisor))
+        self.reslice_worker.progress.connect(lambda name, cur, tot: self._on_moss_progress(f"Reslicing {name}", int(100 * cur / tot) if tot > 0 else 0))
         self.reslice_worker.log.connect(self._log)
         self.reslice_worker.finished.connect(self._on_moss_reslice_finished)
         self.reslice_worker.start()
@@ -1880,8 +1945,14 @@ class SegmentationCombinedPage(QWidget):
         architecture = 'unet'
 
         # Check for specific architectures (order matters - most specific first)
-        if 'unet_deep_dice_25d' in checkpoint_lower:
+        if 'unet_deep_dice_dwarf25d_v2' in checkpoint_lower:
+            architecture = 'unet_deep_dice_dwarf25d_v2'
+        elif 'unet_deep_dice_25d_v2' in checkpoint_lower:
+            architecture = 'unet_deep_dice_25d_v2'
+        elif 'unet_deep_dice_25d' in checkpoint_lower:
             architecture = 'unet_deep_dice_25d'
+        elif 'dwarf25d' in checkpoint_lower:
+            architecture = 'unet_deep_dice_dwarf25d_v2'
         elif 'unet_deep_dice_sam2' in checkpoint_lower:
             architecture = 'unet_deep_dice_sam2'
         elif 'unet_deep_dice' in checkpoint_lower:
