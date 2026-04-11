@@ -56,6 +56,7 @@ class ViewportPredictWorker(QThread):
         self._is_sam2 = False
         self._is_lsd = False  # LSD boundary model needs watershed post-processing
         self._n_channels = 1
+        self._uses_z_coord = False
 
         # SAM2 predictor (cached, initialized on first use)
         self._sam2_predictor = None
@@ -98,8 +99,11 @@ class ViewportPredictWorker(QThread):
             self._is_sam2 = 'sam2' in architecture.lower()
             self._is_lsd = 'lsd' in architecture.lower()  # LSD needs watershed
             # Get n_channels from architecture metadata
-            from ..models.architectures import get_n_context_slices
+            from ..models.architectures import get_n_context_slices, uses_z_coord
             self._n_channels = get_n_context_slices(architecture)
+            self._uses_z_coord = uses_z_coord(architecture)
+            if self._uses_z_coord:
+                self._n_channels += 1  # Extra channel for z-coordinate
             self.model = None  # Clear cached model
             # Clear checkpoint path — caller must set_checkpoint() after this
             self.checkpoint_path = None
@@ -276,7 +280,8 @@ class ViewportPredictWorker(QThread):
                 pass
             return False
 
-    def request_prediction(self, image: np.ndarray, viewport_bounds: tuple, slice_index: int = -1):
+    def request_prediction(self, image: np.ndarray, viewport_bounds: tuple, slice_index: int = -1,
+                           total_slices: int = 0):
         """
         Queue a prediction request. Replaces any pending request.
 
@@ -284,9 +289,10 @@ class ViewportPredictWorker(QThread):
             image: Full image array (2D grayscale or 3D with 3 channels for 2.5D)
             viewport_bounds: (x_min, y_min, x_max, y_max) in image coordinates
             slice_index: The slice index this prediction is for (used to discard stale results)
+            total_slices: Total number of slices in the stack (for z-coord normalization)
         """
         self.mutex.lock()
-        self.pending_request = (image, viewport_bounds, slice_index)
+        self.pending_request = (image, viewport_bounds, slice_index, total_slices)
         self.mutex.unlock()
 
     def is_25d(self) -> bool:
@@ -433,12 +439,13 @@ class ViewportPredictWorker(QThread):
                 if self.model is None:
                     continue
 
-            image, bounds, slice_idx = request
+            image, bounds, slice_idx, total_sl = request
 
             try:
                 # Image is pre-cropped to viewport+padding by the caller.
                 # Bounds reflect the padded region coordinates in full-image space.
-                prediction = self._predict(image)
+                z_normalized = slice_idx / max(total_sl - 1, 1) if self._uses_z_coord and total_sl > 0 else None
+                prediction = self._predict(image, z_normalized=z_normalized)
 
                 if prediction is None:
                     continue
@@ -450,12 +457,13 @@ class ViewportPredictWorker(QThread):
                 # Silently skip failed predictions
                 pass
 
-    def _predict(self, image: np.ndarray) -> np.ndarray:
+    def _predict(self, image: np.ndarray, z_normalized: float = None) -> np.ndarray:
         """
         Run prediction on a single image crop.
 
         Args:
             image: 2D grayscale image (H, W) or 3-channel image (H, W, 3) for 2.5D
+            z_normalized: Normalized z-position (0-1) for z-coord architectures, or None
 
         Returns:
             Prediction mask (uint8, 0-255) or None on failure
@@ -500,6 +508,12 @@ class ViewportPredictWorker(QThread):
             else:
                 # (H, W) -> (N, 1, H, W)
                 tensor = torch.tensor(img[None, None, ...], dtype=torch.float32).to(self.device)
+
+            # Append z-coordinate channel if needed
+            if z_normalized is not None:
+                z_ch = torch.full((1, 1, tensor.shape[2], tensor.shape[3]), z_normalized,
+                                  dtype=torch.float32).to(self.device)
+                tensor = torch.cat([tensor, z_ch], dim=1)
 
             # Extract SAM2 features on-the-fly if needed (only for 2D mode)
             sam2_feats = None

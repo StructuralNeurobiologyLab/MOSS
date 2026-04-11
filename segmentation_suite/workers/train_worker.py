@@ -6,6 +6,7 @@ Adapted from train_unet.py
 """
 
 import os
+import re
 import random
 import numpy as np
 from tqdm import tqdm
@@ -81,12 +82,13 @@ class NucleiPatchDataset(Dataset):
     """Dataset for training with balanced patch sampling."""
 
     def __init__(self, img_dir: str, mask_dir: str, tile: int = 512, fg_ratio: float = 0.5,
-                 n_channels: int = 1):
+                 n_channels: int = 1, uses_z_coord: bool = False):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
         self.tile = tile
         self.fg_ratio = fg_ratio
         self.n_channels = n_channels  # 1 for 2D, 3 for 2.5D
+        self.uses_z_coord = uses_z_coord
 
         # Find valid pairs
         self.images = sorted([
@@ -97,7 +99,33 @@ class NucleiPatchDataset(Dataset):
         self._img_cache = {}
         self._mask_cache = {}
         self._positive_pixels = {}
+
+        # Parse z-coordinates from filenames if needed
+        self._z_coords = {}  # fname -> normalized z value (0-1)
+        if self.uses_z_coord:
+            self._parse_z_coords()
+
         self._load_all()
+
+    def _parse_z_coords(self):
+        """Parse z-index from filenames (slice####_cap*.tif) and normalize to 0-1."""
+        z_pattern = re.compile(r'slice(\d+)')
+        z_indices = {}
+        for fname in self.images:
+            m = z_pattern.search(fname)
+            if m:
+                z_indices[fname] = int(m.group(1))
+            else:
+                z_indices[fname] = 0
+                print(f"Warning: could not parse z-index from '{fname}', using 0")
+
+        max_z = max(z_indices.values()) if z_indices else 1
+        if max_z == 0:
+            max_z = 1
+        for fname, z in z_indices.items():
+            self._z_coords[fname] = z / max_z
+        print(f"Z-coord: parsed {len(self._z_coords)} files, z range 0-{max_z}, "
+              f"normalized to 0.0-1.0")
 
     def _load_all(self):
         """Load and cache all images."""
@@ -208,9 +236,12 @@ class NucleiPatchDataset(Dataset):
         ip = os.path.join(self.img_dir, fname)
         mp = os.path.join(self.mask_dir, fname)
 
+        # Total output channels: image channels + 1 if z-coord
+        out_channels = self.n_channels + (1 if self.uses_z_coord else 0)
+
         if ip not in self._img_cache:
-            # Return correct shape based on n_channels
-            return (torch.zeros((self.n_channels, self.tile, self.tile)),
+            # Return correct shape based on total channels
+            return (torch.zeros((out_channels, self.tile, self.tile)),
                     torch.zeros((1, self.tile, self.tile)))
 
         img = self._img_cache[ip]
@@ -240,6 +271,12 @@ class NucleiPatchDataset(Dataset):
         else:
             # 2D: (H, W) -> (1, H, W)
             patch_img = torch.tensor(patch_img.copy()[None, ...], dtype=torch.float32)
+
+        # Append z-coordinate channel if needed
+        if self.uses_z_coord:
+            z_val = self._z_coords.get(fname, 0.0)
+            z_channel = torch.full((1, patch_img.shape[1], patch_img.shape[2]), z_val, dtype=torch.float32)
+            patch_img = torch.cat([patch_img, z_channel], dim=0)
 
         patch_msk = torch.tensor(patch_msk.copy()[None, ...], dtype=torch.float32)
         return patch_img, patch_msk
@@ -706,10 +743,11 @@ class TrainWorker(QThread):
             architecture = self.config.get('architecture', 'unet')
 
             # Detect architecture variants
-            from ..models.architectures import get_n_context_slices
+            from ..models.architectures import get_n_context_slices, uses_z_coord
             is_25d = '25d' in architecture.lower()
             is_sam2 = 'sam2' in architecture.lower()
             n_channels = get_n_context_slices(architecture)
+            add_z_coord = uses_z_coord(architecture)
 
             if is_25d:
                 # Deep 2.5D uses a separate folder (11-channel stacks)
@@ -754,20 +792,22 @@ class TrainWorker(QThread):
                 torch.set_float32_matmul_precision("high")
 
             # Create datasets
-            self.log.emit(f"Loading training data (n_channels={n_channels})...")
+            if add_z_coord:
+                self.log.emit(f"Loading training data (n_channels={n_channels} + z-coord)...")
+            else:
+                self.log.emit(f"Loading training data (n_channels={n_channels})...")
             if is_sam2 and sam2_dir:
                 train_ds = NucleiPatchDatasetSAM2(train_images, train_masks, sam2_dir,
                                                   tile=tile_size, fg_ratio=0.5, n_channels=n_channels)
             else:
                 train_ds = NucleiPatchDataset(train_images, train_masks, tile=tile_size, fg_ratio=0.5,
-                                              n_channels=n_channels)
+                                              n_channels=n_channels, uses_z_coord=add_z_coord)
 
             val_ds = None
             if val_images and val_masks and os.path.exists(val_images):
                 self.log.emit("Loading validation data...")
-                # Validation doesn't need SAM2 features for now (uses same dataset type)
                 val_ds = NucleiPatchDataset(val_images, val_masks, tile=tile_size, fg_ratio=0.0,
-                                           n_channels=n_channels)
+                                           n_channels=n_channels, uses_z_coord=add_z_coord)
 
             # Platform-specific DataLoader settings
             import platform
@@ -830,7 +870,11 @@ class TrainWorker(QThread):
             print(f"  Tile size:       {tile_size}")
             print(f"  Max epochs:      {num_epochs}")
             print(f"  Device:          {device}")
-            print(f"  Input channels:  {n_channels} ({'2.5D mode' if is_25d else '2D mode'})")
+            model_n_channels = n_channels + (1 if add_z_coord else 0)
+            if add_z_coord:
+                print(f"  Input channels:  {model_n_channels} ({n_channels} image + 1 z-coord, {'2.5D mode' if is_25d else '2D mode'})")
+            else:
+                print(f"  Input channels:  {n_channels} ({'2.5D mode' if is_25d else '2D mode'})")
 
             # Dataset info
             num_images = len(train_ds.images)
@@ -845,7 +889,7 @@ class TrainWorker(QThread):
             print(f"  Checkpoint:      {checkpoint_path}")
 
             # Create model
-            model = ModelClass(n_channels=n_channels, n_classes=1).to(device)
+            model = ModelClass(n_channels=model_n_channels, n_classes=1).to(device)
             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
             scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 

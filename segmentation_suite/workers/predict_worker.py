@@ -127,16 +127,21 @@ class PredictWorker(QThread):
             # Detect architecture variants
             is_25d = '25d' in architecture.lower()
             is_sam2 = 'sam2' in architecture.lower()
-            from ..models.architectures import get_n_context_slices
+            from ..models.architectures import get_n_context_slices, uses_z_coord
             n_channels = get_n_context_slices(architecture)
+            add_z_coord = uses_z_coord(architecture)
+            model_n_channels = n_channels + (1 if add_z_coord else 0)
 
             device = get_device()
             self.log.emit(f"Using device: {device}")
 
             # Load model
             self.log.emit(f"Loading model ({architecture}) from {checkpoint_path}...")
-            self.log.emit(f"  Mode: {'2.5D' if is_25d else '2D'} (n_channels={n_channels})")
-            model = load_model(checkpoint_path, n_channels=n_channels, device=device, architecture=architecture)
+            if add_z_coord:
+                self.log.emit(f"  Mode: {'2.5D' if is_25d else '2D'} (n_channels={model_n_channels}: {n_channels} image + z-coord)")
+            else:
+                self.log.emit(f"  Mode: {'2.5D' if is_25d else '2D'} (n_channels={n_channels})")
+            model = load_model(checkpoint_path, n_channels=model_n_channels, device=device, architecture=architecture)
 
             # Initialize SAM2 predictor if needed (for on-the-fly feature extraction)
             sam2_predictor = None
@@ -162,7 +167,7 @@ class PredictWorker(QThread):
                 self.log.emit(f"Processing {name}...")
                 self._predict_folder(model, input_dir, output_dir, patch_size, overlap, name, device,
                                     is_25d=is_25d, is_sam2=is_sam2, sam2_predictor=sam2_predictor,
-                                    architecture=architecture)
+                                    architecture=architecture, add_z_coord=add_z_coord)
 
             # Check if we were stopped vs completed
             if self.should_stop:
@@ -176,7 +181,8 @@ class PredictWorker(QThread):
             self.finished.emit(False, {"error": str(e)})
 
     def _predict_folder(self, model, input_dir, output_dir, patch_size, overlap, name, device,
-                        is_25d=False, is_sam2=False, sam2_predictor=None, architecture='unet'):
+                        is_25d=False, is_sam2=False, sam2_predictor=None, architecture='unet',
+                        add_z_coord=False):
         """Predict on all images in a folder."""
         # Find all images
         image_files = sorted([
@@ -314,6 +320,12 @@ class PredictWorker(QThread):
                                 patch[None, None, ...],
                                 dtype=torch.float32
                             )
+
+                        # Append z-coordinate channel if needed
+                        if add_z_coord:
+                            z_val = i / max(total - 1, 1)
+                            z_ch = torch.full((1, 1, patch_size, patch_size), z_val, dtype=torch.float32)
+                            tensor = torch.cat([tensor, z_ch], dim=1)
 
                         patch_batch.append((tensor, y, x, ph, pw))
 

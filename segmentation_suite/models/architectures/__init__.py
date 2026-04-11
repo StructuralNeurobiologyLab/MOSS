@@ -26,6 +26,7 @@ _architecture_checkpoints: Dict[str, str] = {}  # Pretrained checkpoint paths
 _architecture_training_v2: Dict[str, bool] = {}  # v2 training improvements flag
 _architecture_n_context: Dict[str, int] = {}  # N_CONTEXT_SLICES for 2.5D variants
 _architecture_slice_spacing: Dict[str, int] = {}  # SLICE_SPACING for 2.5D variants
+_architecture_uses_z_coord: Dict[str, bool] = {}  # USES_Z_COORD flag
 _loaded = False
 
 
@@ -84,6 +85,9 @@ def _load_architectures():
             spacing = getattr(module, 'SLICE_SPACING', None)
             if spacing is not None:
                 _architecture_slice_spacing[arch_id] = spacing
+
+            if getattr(module, 'USES_Z_COORD', False):
+                _architecture_uses_z_coord[arch_id] = True
 
             # Debug output (commented out for cleaner startup)
             # print(f"Loaded architecture: {arch_id} ({module.ARCHITECTURE_NAME})")
@@ -214,3 +218,9 @@ def get_slice_spacing(arch_id: str) -> int:
     if arch_id in _architecture_slice_spacing:
         return _architecture_slice_spacing[arch_id]
     return 3  # Default spacing
+
+
+def uses_z_coord(arch_id: str) -> bool:
+    """Check if architecture uses a z-coordinate input channel."""
+    _load_architectures()
+    return _architecture_uses_z_coord.get(arch_id, False)

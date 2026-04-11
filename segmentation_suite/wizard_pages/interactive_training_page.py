@@ -743,7 +743,8 @@ class InteractiveTrainingPage(QWidget):
         # Submit pre-cropped image — bounds reflect the padded region
         # so the worker knows where to trim
         self.predict_worker.request_prediction(
-            image, (x_min_pad, y_min_pad, x_max_pad, y_max_pad), idx
+            image, (x_min_pad, y_min_pad, x_max_pad, y_max_pad), idx,
+            total_slices=len(self.image_files)
         )
 
     def _on_prediction_ready(self, prediction: np.ndarray, bounds: tuple, request_slice_idx: int = -1):
