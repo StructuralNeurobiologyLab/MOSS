@@ -1058,7 +1058,6 @@ class SegmentationCombinedPage(QWidget):
         # Primary views
         self.moss_xy_check = QCheckBox("XY (original orientation)")
         self.moss_xy_check.setChecked(True)
-        self.moss_xy_check.setEnabled(False)  # Always required
         reslice_layout.addWidget(self.moss_xy_check)
 
         self.moss_xz_check = QCheckBox("XZ (side view along Y)")
@@ -1722,7 +1721,9 @@ class SegmentationCombinedPage(QWidget):
             return
 
         # Determine which views to use
-        views_to_run = ['xy']  # Always include XY
+        views_to_run = []
+        if self.moss_xy_check.isChecked():
+            views_to_run.append('xy')
         if self.moss_xz_check.isChecked():
             views_to_run.append('xz')
         if self.moss_yz_check.isChecked():
@@ -1893,18 +1894,19 @@ class SegmentationCombinedPage(QWidget):
         # Build views list for prediction
         views = []
 
-        # XY view - predict on original input
-        xy_pred_dir = Path(config['predict_dir']) / "xy"
-        xy_pred_dir.mkdir(parents=True, exist_ok=True)
-        views.append({
-            'name': 'xy',
-            'input_dir': config['input_dir'],
-            'output_dir': str(xy_pred_dir),
-        })
+        # XY view - predict on original input (only if selected)
+        if 'xy' in config['views']:
+            xy_pred_dir = Path(config['predict_dir']) / "xy"
+            xy_pred_dir.mkdir(parents=True, exist_ok=True)
+            views.append({
+                'name': 'xy',
+                'input_dir': config['input_dir'],
+                'output_dir': str(xy_pred_dir),
+            })
 
         # XZ view
         if 'xz' in config['views']:
-            xz_input = Path(config['reslice_dir']) / "xz"
+            xz_input = Path(config['reslice_dir']) / "xz_reslice"
             xz_pred = Path(config['predict_dir']) / "xz"
             xz_pred.mkdir(parents=True, exist_ok=True)
             if xz_input.exists():
@@ -1916,7 +1918,7 @@ class SegmentationCombinedPage(QWidget):
 
         # YZ view
         if 'yz' in config['views']:
-            yz_input = Path(config['reslice_dir']) / "yz"
+            yz_input = Path(config['reslice_dir']) / "yz_reslice"
             yz_pred = Path(config['predict_dir']) / "yz"
             yz_pred.mkdir(parents=True, exist_ok=True)
             if yz_input.exists():
@@ -1945,7 +1947,9 @@ class SegmentationCombinedPage(QWidget):
         architecture = 'unet'
 
         # Check for specific architectures (order matters - most specific first)
-        if 'unet_deep_dice_dwarf25d_v2' in checkpoint_lower:
+        if 'unet_deep_dice_dwarf25d_zcoord' in checkpoint_lower or 'dwarf25d_zcoord' in checkpoint_lower:
+            architecture = 'unet_deep_dice_dwarf25d_zcoord'
+        elif 'unet_deep_dice_dwarf25d_v2' in checkpoint_lower:
             architecture = 'unet_deep_dice_dwarf25d_v2'
         elif 'unet_deep_dice_25d_v2' in checkpoint_lower:
             architecture = 'unet_deep_dice_25d_v2'
