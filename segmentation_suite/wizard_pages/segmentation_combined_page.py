@@ -1737,8 +1737,12 @@ class SegmentationCombinedPage(QWidget):
         if self.moss_diag_zx30_check.isChecked():
             diagonals.append({'angle': 30, 'axes': (0, 2), 'name': 'diag_zx30'})
 
-        # Set up output directories
+        # Set up output directories — use subproject folder when active
         output_base = self.project_dir if self.project_dir else Path(input_dir).parent
+        if (self.project_dir and has_subprojects(str(self.project_dir))
+                and self._moss_sp_combo.currentText()):
+            sp_name = self._moss_sp_combo.currentText()
+            output_base = Path(get_subproject_dir(str(self.project_dir), sp_name))
         reslice_dir = output_base / "reslices"
         predict_dir = output_base / "predictions"
         heatmap_dir = output_base / "heatmap"
