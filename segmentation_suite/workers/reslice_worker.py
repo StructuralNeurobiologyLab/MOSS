@@ -154,14 +154,22 @@ class ResliceWorker(QThread):
                 xz_dir = output_base / "xz_reslice"
                 xz_dir.mkdir(exist_ok=True, parents=True)
                 output_dirs['xz'] = str(xz_dir)
-                self._create_xz_reslice(image_paths, xz_dir, y_size, x_size, batch_size, max_workers)
+                existing_xz = len(list(xz_dir.glob("xz_slice_*.tif")))
+                if existing_xz >= y_size:
+                    self.log.emit(f"XZ reslice already complete ({existing_xz} slices) — skipping")
+                else:
+                    self._create_xz_reslice(image_paths, xz_dir, y_size, x_size, batch_size, max_workers)
 
             # YZ reslice
             if create_yz and not self.should_stop:
                 yz_dir = output_base / "yz_reslice"
                 yz_dir.mkdir(exist_ok=True, parents=True)
                 output_dirs['yz'] = str(yz_dir)
-                self._create_yz_reslice(image_paths, yz_dir, y_size, x_size, batch_size, max_workers)
+                existing_yz = len(list(yz_dir.glob("yz_slice_*.tif")))
+                if existing_yz >= x_size:
+                    self.log.emit(f"YZ reslice already complete ({existing_yz} slices) — skipping")
+                else:
+                    self._create_yz_reslice(image_paths, yz_dir, y_size, x_size, batch_size, max_workers)
 
             # Diagonal reslices
             for diag_config in diagonals:
@@ -171,6 +179,10 @@ class ResliceWorker(QThread):
                 diag_dir = output_base / name
                 diag_dir.mkdir(exist_ok=True, parents=True)
                 output_dirs[name] = str(diag_dir)
+                existing_diag = len(list(diag_dir.glob(f"{name}_slice_*.tif")))
+                if existing_diag >= total_z:
+                    self.log.emit(f"{name} reslice already complete ({existing_diag} slices) — skipping")
+                    continue
                 self._create_diagonal_reslice(
                     image_paths, diag_dir,
                     diag_config['angle'], diag_config['axes'],
