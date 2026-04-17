@@ -61,18 +61,29 @@ class RotateWorker(QThread):
             xy_dir = Path(self.config['xy_dir'])
             diagonals = self.config['diagonals']
 
-            # Get reference dimensions from XY
-            xy_files = sorted(list(xy_dir.glob("*_pred.tif")) +
-                             list(xy_dir.glob("*_pred.png")) +
-                             list(xy_dir.glob("*.tif")))
+            # Get reference dimensions from XY predictions or input images
+            is_zarr = (xy_dir.suffix == '.zarr' or (xy_dir / '.zarray').exists()
+                       or (xy_dir / '.zgroup').exists())
 
-            if not xy_files:
-                self.finished.emit(False, {"error": "No XY reference files found"})
-                return
+            if is_zarr:
+                from ..zarr_image_source import ZarrImageSource
+                zarr_src = ZarrImageSource(str(xy_dir))
+                y_size = zarr_src.height
+                x_size = zarr_src.width
+                total_z = zarr_src.num_slices
+                self.log.emit(f"Reference dimensions from Zarr: Z={total_z}, Y={y_size}, X={x_size}")
+            else:
+                xy_files = sorted(list(xy_dir.glob("*_pred.tif")) +
+                                 list(xy_dir.glob("*_pred.png")) +
+                                 list(xy_dir.glob("*.tif")))
 
-            first_xy = load_mask_slice(xy_files[0])
-            y_size, x_size = first_xy.shape
-            total_z = len(xy_files)
+                if not xy_files:
+                    self.finished.emit(False, {"error": "No XY reference files found"})
+                    return
+
+                first_xy = load_mask_slice(xy_files[0])
+                y_size, x_size = first_xy.shape
+                total_z = len(xy_files)
 
             self.log.emit(f"Reference dimensions: Z={total_z}, Y={y_size}, X={x_size}")
 

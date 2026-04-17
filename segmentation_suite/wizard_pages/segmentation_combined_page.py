@@ -2029,7 +2029,7 @@ class SegmentationCombinedPage(QWidget):
 
     def _run_moss_rotation_step(self):
         """Step 3: Rotate diagonal predictions back to XY orientation."""
-        from ..workers.rotation_worker import RotationWorker
+        from ..workers.rotate_worker import RotateWorker
 
         config = self._moss_workflow_config
         has_diagonals = len(config['diagonals']) > 0
@@ -2058,13 +2058,22 @@ class SegmentationCombinedPage(QWidget):
                 'output_dir': str(rotated_dir),
             })
 
+        # xy_dir for reference dimensions — use XY predictions if available,
+        # otherwise fall back to the input image directory
+        xy_pred_dir = Path(config['predict_dir']) / "xy"
+        if xy_pred_dir.exists() and any(xy_pred_dir.glob("*.tif")):
+            xy_ref = str(xy_pred_dir)
+        else:
+            xy_ref = config['input_dir']
+
         rotation_config = {
+            'xy_dir': xy_ref,
             'diagonals': diagonal_configs,
             'max_workers': 8,
         }
 
         self._log(f"Rotating {len(diagonal_configs)} diagonal predictions...")
-        self.rotation_worker = RotationWorker(rotation_config)
+        self.rotation_worker = RotateWorker(rotation_config)
         self.rotation_worker.progress.connect(
             lambda name, cur, tot: self._on_moss_progress(f"Rotating {name}", 50 + (cur * 16 // max(tot, 1)))
         )
