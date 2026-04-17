@@ -102,8 +102,6 @@ class ViewportPredictWorker(QThread):
             from ..models.architectures import get_n_context_slices, uses_z_coord
             self._n_channels = get_n_context_slices(architecture)
             self._uses_z_coord = uses_z_coord(architecture)
-            if self._uses_z_coord:
-                self._n_channels += 1  # Extra channel for z-coordinate
             self.model = None  # Clear cached model
             # Clear checkpoint path — caller must set_checkpoint() after this
             self.checkpoint_path = None
@@ -234,7 +232,8 @@ class ViewportPredictWorker(QThread):
                 return False
 
             # Load from the copy with correct architecture (always on CPU)
-            self.model = load_model(temp_path, n_channels=self._n_channels, device=self.device,
+            model_n_ch = self._n_channels + (1 if self._uses_z_coord else 0)
+            self.model = load_model(temp_path, n_channels=model_n_ch, device=self.device,
                                    architecture=self.architecture)
             self._last_reload_time = time.time()
             self._last_checkpoint_mtime = os.path.getmtime(self.checkpoint_path)
