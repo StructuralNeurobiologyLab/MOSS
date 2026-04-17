@@ -1789,20 +1789,33 @@ class SegmentationCombinedPage(QWidget):
         reslice_dir = Path(config['reslice_dir'])
 
         # Count input images to get z_size
-        input_images = sorted(input_dir.glob("*.tif"))
-        if not input_images:
-            input_images = sorted(input_dir.glob("*.png"))
-        if not input_images:
-            return False
+        is_zarr = (input_dir.suffix == '.zarr' or (input_dir / '.zarray').exists()
+                   or (input_dir / '.zgroup').exists())
 
-        z_size = len(input_images)
+        if is_zarr:
+            try:
+                from ..zarr_image_source import ZarrImageSource
+                zarr_src = ZarrImageSource(str(input_dir))
+                z_size = zarr_src.num_slices
+                y_size = zarr_src.height
+                x_size = zarr_src.width
+            except Exception:
+                return False
+        else:
+            input_images = sorted(input_dir.glob("*.tif"))
+            if not input_images:
+                input_images = sorted(input_dir.glob("*.png"))
+            if not input_images:
+                return False
 
-        # Get x/y dimensions from first image
-        try:
-            first_img = np.array(PILImage.open(input_images[0]))
-            y_size, x_size = first_img.shape[:2]
-        except Exception:
-            return False
+            z_size = len(input_images)
+
+            # Get x/y dimensions from first image
+            try:
+                first_img = np.array(PILImage.open(input_images[0]))
+                y_size, x_size = first_img.shape[:2]
+            except Exception:
+                return False
 
         # Check XZ reslice
         if 'xz' in config['views']:

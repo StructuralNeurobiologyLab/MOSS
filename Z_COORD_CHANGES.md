@@ -29,6 +29,18 @@ gradients, beam effects that vary with depth).
 | `segmentation_suite/models/architectures/__init__.py` | Store/expose `USES_Z_COORD` flag |
 | `segmentation_suite/workers/train_worker.py` | Parse z from filenames, append z-channel in dataset |
 | `segmentation_suite/workers/predict_worker.py` | Append z-channel during inference |
+| `segmentation_suite/workers/viewport_predict_worker.py` | Append z-channel during live viewport prediction; fixed `_n_channels` inflation bug |
+| `segmentation_suite/wizard_pages/interactive_training_page.py` | Pass `total_slices` to viewport predictor |
+| `segmentation_suite/wizard_pages/segmentation_combined_page.py` | Add zcoord to architecture detection; add zarr support for reslice completeness check |
+| `segmentation_suite/workers/reslice_worker.py` | Add zarr volume support for all reslice types (XZ, YZ, diagonal) |
+
+## Bugs found and fixed
+1. **viewport _n_channels inflation** — adding +1 to `_n_channels` for z-coord caused
+   the caller to try loading 12 image slices instead of 11, breaking live predictions.
+2. **architecture detection** — checkpoint name `..._dwarf25d_zcoord.pth` matched
+   the generic `dwarf25d` pattern, loading the wrong 11-ch model class.
+3. **zarr + reslice** — reslice worker only looked for .tif/.png files, failing
+   immediately on zarr input with "No images found".
 
 ## How to revert
 ```bash

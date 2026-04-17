@@ -113,20 +113,37 @@ class ResliceWorker(QThread):
 
             output_dirs = {}
 
-            # Find all images
-            image_paths = sorted(input_dir.glob("*.tif"))
-            if not image_paths:
-                image_paths = sorted(input_dir.glob("*.png"))
-            if not image_paths:
-                self.finished.emit(False, {"error": "No images found"})
-                return
+            # Detect Zarr input
+            is_zarr = (input_dir.suffix == '.zarr' or (input_dir / '.zarray').exists()
+                       or (input_dir / '.zgroup').exists())
+            self._zarr_source = None
 
-            self.log.emit(f"Found {len(image_paths)} images")
-            total_z = len(image_paths)
+            if is_zarr:
+                from ..zarr_image_source import ZarrImageSource
+                self.log.emit(f"Opening Zarr volume: {input_dir}")
+                self._zarr_source = ZarrImageSource(str(input_dir))
+                total_z = self._zarr_source.num_slices
+                y_size = self._zarr_source.height
+                x_size = self._zarr_source.width
+                # Create placeholder image_paths list (indices only, used for batch counting)
+                image_paths = list(range(total_z))
+                self.log.emit(f"Zarr volume: {total_z} slices, {y_size} x {x_size}")
+            else:
+                # Find all images
+                image_paths = sorted(input_dir.glob("*.tif"))
+                if not image_paths:
+                    image_paths = sorted(input_dir.glob("*.png"))
+                if not image_paths:
+                    self.finished.emit(False, {"error": "No images found"})
+                    return
 
-            # Get dimensions from first image
-            first_img = load_image(image_paths[0])
-            y_size, x_size = first_img.shape[:2]
+                self.log.emit(f"Found {len(image_paths)} images")
+                total_z = len(image_paths)
+
+                # Get dimensions from first image
+                first_img = load_image(image_paths[0])
+                y_size, x_size = first_img.shape[:2]
+
             self.log.emit(f"Image dimensions: {y_size} x {x_size}")
 
             # Process in batches
@@ -172,10 +189,18 @@ class ResliceWorker(QThread):
             self.finished.emit(False, {"error": str(e)})
 
     def _load_batch(self, image_paths, max_workers):
-        """Load a batch of images."""
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            images = list(executor.map(load_image, image_paths))
-        images = [img for img in images if img is not None]
+        """Load a batch of images (from files or zarr)."""
+        if self._zarr_source is not None:
+            # image_paths are z-indices for zarr
+            images = []
+            for z_idx in image_paths:
+                img = self._zarr_source.get_slice(z_idx, pyramid_level=0)
+                if img is not None:
+                    images.append(img)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                images = list(executor.map(load_image, image_paths))
+            images = [img for img in images if img is not None]
         if not images:
             return None
         return np.stack(images, axis=0)
@@ -293,10 +318,13 @@ class ResliceWorker(QThread):
         # Load full volume (this may need chunking for very large volumes)
         self.log.emit(f"Loading full volume for {name}...")
         all_images = []
-        for i, path in enumerate(image_paths):
+        for i in range(total_z):
             if self.should_stop:
                 return
-            img = load_image(path)
+            if self._zarr_source is not None:
+                img = self._zarr_source.get_slice(i, pyramid_level=0)
+            else:
+                img = load_image(image_paths[i])
             if img is not None:
                 all_images.append(img)
             if (i + 1) % 100 == 0:
