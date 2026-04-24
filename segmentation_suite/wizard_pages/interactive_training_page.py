@@ -1134,6 +1134,7 @@ class InteractiveTrainingPage(QWidget):
     def _save_3d_session(self):
         """Save the 3D volume from the current session."""
         if not self._3d_mode_active or not self._3d_masks:
+            print("[3D] Save failed: no 3D data (session not active or no masks)")
             self.status_label.setText("No 3D data to save")
             self._cancel_3d_session()
             return
@@ -1142,6 +1143,7 @@ class InteractiveTrainingPage(QWidget):
         self._capture_current_slice_for_3d()
 
         if not self.train_images_3d_dir or not self.train_masks_3d_dir:
+            print("[3D] Save failed: 3D training directories not set up")
             self.status_label.setText("3D training directories not set up")
             self._cancel_3d_session()
             return
@@ -1153,8 +1155,13 @@ class InteractiveTrainingPage(QWidget):
 
             # Get sorted slice indices
             slice_indices = sorted(self._3d_masks.keys())
+            print(f"[3D] Saving session: {len(slice_indices)} slices, indices={slice_indices}")
             if len(slice_indices) < 2:
-                self.status_label.setText("Need at least 2 slices for 3D data")
+                print("[3D] Save failed: need at least 2 slices")
+                self.status_label.setText(
+                    f"Need at least 2 slices for 3D (got {len(slice_indices)}). "
+                    "Navigate to more slices and paint before saving."
+                )
                 self._cancel_3d_session()
                 return
 
@@ -1169,20 +1176,38 @@ class InteractiveTrainingPage(QWidget):
                 mask_crop = self._3d_masks[idx]
                 mask_volume.append(mask_crop)
 
-                # Image crop
-                if idx in self.images:
+                # Image crop — load from zarr or cached images
+                img = None
+                if self.use_zarr and self.zarr_source is not None:
+                    img_crop = self.zarr_source.get_tile(
+                        idx, crop_y, crop_y + crop_h, crop_x, crop_x + crop_w,
+                        pyramid_level=0
+                    )
+                elif idx in self.images:
                     img = self.images[idx]
                     img_crop = img[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w].copy()
-                    # Normalize to uint8
-                    img_min, img_max = img_crop.min(), img_crop.max()
-                    if img_max > img_min:
-                        img_crop = ((img_crop - img_min) / (img_max - img_min) * 255).astype(np.uint8)
-                    else:
-                        img_crop = img_crop.astype(np.uint8)
-                    image_volume.append(img_crop)
+                else:
+                    print(f"[3D] Warning: no image data for slice {idx}, skipping")
+                    mask_volume.pop()  # Remove the mask we just added
+                    continue
+
+                # Normalize to uint8
+                img_min, img_max = img_crop.min(), img_crop.max()
+                if img_max > img_min:
+                    img_crop = ((img_crop - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+                else:
+                    img_crop = img_crop.astype(np.uint8)
+                image_volume.append(img_crop)
 
             if len(image_volume) != len(mask_volume):
+                print(f"[3D] Save failed: image/mask mismatch ({len(image_volume)} vs {len(mask_volume)})")
                 self.status_label.setText("Image/mask mismatch in 3D session")
+                self._cancel_3d_session()
+                return
+
+            if len(image_volume) < 2:
+                print(f"[3D] Save failed: only {len(image_volume)} valid slices after loading")
+                self.status_label.setText("Not enough valid slices for 3D data")
                 self._cancel_3d_session()
                 return
 
