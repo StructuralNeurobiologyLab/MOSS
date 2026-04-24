@@ -55,8 +55,11 @@ class ViewportPredictWorker(QThread):
         self._is_25d = False
         self._is_sam2 = False
         self._is_lsd = False  # LSD boundary model needs watershed post-processing
+        self._is_3d = False
         self._n_channels = 1
         self._uses_z_coord = False
+        self._3d_patch_depth = 32
+        self._3d_patch_size = 128
 
         # SAM2 predictor (cached, initialized on first use)
         self._sam2_predictor = None
@@ -99,9 +102,18 @@ class ViewportPredictWorker(QThread):
             self._is_sam2 = 'sam2' in architecture.lower()
             self._is_lsd = 'lsd' in architecture.lower()  # LSD needs watershed
             # Get n_channels from architecture metadata
-            from ..models.architectures import get_n_context_slices, uses_z_coord
-            self._n_channels = get_n_context_slices(architecture)
-            self._uses_z_coord = uses_z_coord(architecture)
+            from ..models.architectures import (get_n_context_slices, uses_z_coord,
+                                                 is_3d_architecture, get_3d_patch_depth, get_3d_patch_size)
+            self._is_3d = is_3d_architecture(architecture)
+            if self._is_3d:
+                self._n_channels = 1
+                self._uses_z_coord = False
+                self._is_25d = False
+                self._3d_patch_depth = get_3d_patch_depth(architecture)
+                self._3d_patch_size = get_3d_patch_size(architecture)
+            else:
+                self._n_channels = get_n_context_slices(architecture)
+                self._uses_z_coord = uses_z_coord(architecture)
             self.model = None  # Clear cached model
             # Clear checkpoint path — caller must set_checkpoint() after this
             self.checkpoint_path = None
@@ -443,8 +455,12 @@ class ViewportPredictWorker(QThread):
             try:
                 # Image is pre-cropped to viewport+padding by the caller.
                 # Bounds reflect the padded region coordinates in full-image space.
-                z_normalized = slice_idx / max(total_sl - 1, 1) if self._uses_z_coord and total_sl > 0 else None
-                prediction = self._predict(image, z_normalized=z_normalized)
+                if self._is_3d and image.ndim == 3:
+                    # 3D volume (D, H, W) — predict and return center slice
+                    prediction = self._predict_3d(image)
+                else:
+                    z_normalized = slice_idx / max(total_sl - 1, 1) if self._uses_z_coord and total_sl > 0 else None
+                    prediction = self._predict(image, z_normalized=z_normalized)
 
                 if prediction is None:
                     continue
@@ -554,6 +570,55 @@ class ViewportPredictWorker(QThread):
 
         except Exception as e:
             # Return None on any prediction error
+            return None
+
+    def _predict_3d(self, volume: np.ndarray) -> np.ndarray:
+        """
+        Run 3D prediction on a volume block and return center slice.
+
+        Args:
+            volume: 3D array (D, H, W)
+
+        Returns:
+            Prediction mask for center slice (uint8, 0-255) or None
+        """
+        if self.model is None:
+            return None
+
+        try:
+            vol = volume.astype(np.float32)
+            center_z = vol.shape[0] // 2
+
+            # Normalize
+            v_min, v_max = vol.min(), vol.max()
+            if v_max > v_min:
+                vol = (vol - v_min) / (v_max - v_min)
+
+            # Pad to multiple of 16 (3D model has fewer levels, needs less padding)
+            d, h, w = vol.shape
+            pad_d = (16 - d % 16) % 16
+            pad_h = (16 - h % 16) % 16
+            pad_w = (16 - w % 16) % 16
+            if pad_d > 0 or pad_h > 0 or pad_w > 0:
+                vol = np.pad(vol, ((0, pad_d), (0, pad_h), (0, pad_w)), mode='reflect')
+
+            # (D, H, W) -> (1, 1, D, H, W)
+            tensor = torch.tensor(vol[None, None, ...], dtype=torch.float32).to(self.device)
+
+            with torch.inference_mode():
+                output = self.model(tensor)
+                pred_3d = torch.sigmoid(output)[0, 0].cpu().numpy()
+
+            # Extract center slice prediction and remove padding
+            pred = pred_3d[center_z, :h, :w]
+
+            if not np.isfinite(pred).all():
+                pred = np.nan_to_num(pred, nan=0.0, posinf=1.0, neginf=0.0)
+
+            return (pred * 255).astype(np.uint8)
+
+        except Exception as e:
+            print(f"[ViewportPredict3D] Error: {e}")
             return None
 
     def _watershed_from_boundaries(self, boundary_prob: np.ndarray) -> np.ndarray:

@@ -1967,7 +1967,9 @@ class SegmentationCombinedPage(QWidget):
         architecture = 'unet'
 
         # Check for specific architectures (order matters - most specific first)
-        if 'unet_deep_dice_dwarf25d_zcoord' in checkpoint_lower or 'dwarf25d_zcoord' in checkpoint_lower:
+        if 'unet_3d' in checkpoint_lower:
+            architecture = 'unet_3d'
+        elif 'unet_deep_dice_dwarf25d_zcoord' in checkpoint_lower or 'dwarf25d_zcoord' in checkpoint_lower:
             architecture = 'unet_deep_dice_dwarf25d_zcoord'
         elif 'unet_deep_dice_dwarf25d_v2' in checkpoint_lower:
             architecture = 'unet_deep_dice_dwarf25d_v2'

@@ -449,6 +449,158 @@ class NucleiPatchDatasetSAM2(Dataset):
         return patch_img, patch_msk, sam2_feat
 
 
+class Volumetric3DPatchDataset(Dataset):
+    """Dataset for 3D U-Net training with volumetric patches."""
+
+    def __init__(self, img_dir: str, mask_dir: str,
+                 patch_depth: int = 32, patch_size: int = 128, fg_ratio: float = 0.5):
+        self.img_dir = img_dir
+        self.mask_dir = mask_dir
+        self.patch_depth = patch_depth
+        self.patch_size = patch_size
+        self.fg_ratio = fg_ratio
+
+        # Find valid 3D pairs
+        self.volumes = sorted([
+            f for f in os.listdir(img_dir)
+            if f.lower().endswith((".tif", ".tiff"))
+        ])
+
+        self._img_cache = {}
+        self._mask_cache = {}
+        self._positive_voxels = {}
+        self._load_all()
+
+    def _load_all(self):
+        """Load and cache all 3D volumes."""
+        import tifffile
+        print(f"Loading {len(self.volumes)} 3D volume pairs...")
+        for fname in self.volumes:
+            ip = os.path.join(self.img_dir, fname)
+            mp = os.path.join(self.mask_dir, fname)
+
+            if not os.path.exists(ip) or not os.path.exists(mp):
+                continue
+
+            try:
+                img = tifffile.imread(ip).astype(np.float32)
+                mask = tifffile.imread(mp).astype(np.float32)
+            except Exception as e:
+                print(f"Failed to read 3D volume {fname}: {e}")
+                continue
+
+            # Ensure 3D: (Z, H, W)
+            if img.ndim == 2:
+                img = img[None, ...]
+            if mask.ndim == 2:
+                mask = mask[None, ...]
+
+            mask = (mask > 0.5).astype(np.float32)
+
+            self._img_cache[ip] = img
+            self._mask_cache[mp] = mask
+
+            pos = np.argwhere(mask > 0)
+            if len(pos) > 0:
+                self._positive_voxels[fname] = pos
+
+            print(f"  {fname}: shape={img.shape}")
+
+        print(f"Cached {len(self._img_cache)} 3D volume pairs.")
+
+    def __len__(self):
+        num_volumes = len(self.volumes)
+        if num_volumes == 0:
+            return 0
+        target_samples = 2000
+        multiplier = max(1, target_samples // num_volumes)
+        return num_volumes * multiplier
+
+    def _random_crop_3d(self, img, mask, z, y, x):
+        """Extract a 3D patch, padding if needed."""
+        d, h, w = self.patch_depth, self.patch_size, self.patch_size
+        vol_d, vol_h, vol_w = img.shape
+
+        z1 = min(z + d, vol_d)
+        y1 = min(y + h, vol_h)
+        x1 = min(x + w, vol_w)
+
+        patch_img = img[z:z1, y:y1, x:x1]
+        patch_msk = mask[z:z1, y:y1, x:x1]
+
+        # Pad if needed
+        pad_d = d - patch_img.shape[0]
+        pad_h = h - patch_img.shape[1]
+        pad_w = w - patch_img.shape[2]
+        if pad_d > 0 or pad_h > 0 or pad_w > 0:
+            patch_img = np.pad(patch_img, ((0, pad_d), (0, pad_h), (0, pad_w)), mode="reflect")
+            patch_msk = np.pad(patch_msk, ((0, pad_d), (0, pad_h), (0, pad_w)), mode="reflect")
+
+        return patch_img, patch_msk
+
+    def _augment_3d(self, img, mask):
+        """Apply 3D augmentations."""
+        # Random flips along each axis
+        if random.random() < 0.5:
+            img = np.flip(img, axis=0).copy()
+            mask = np.flip(mask, axis=0).copy()
+        if random.random() < 0.5:
+            img = np.flip(img, axis=1).copy()
+            mask = np.flip(mask, axis=1).copy()
+        if random.random() < 0.5:
+            img = np.flip(img, axis=2).copy()
+            mask = np.flip(mask, axis=2).copy()
+        # Random 90-degree rotation in XY plane
+        k = random.randint(0, 3)
+        if k:
+            img = np.rot90(img, k, axes=(1, 2)).copy()
+            mask = np.rot90(mask, k, axes=(1, 2)).copy()
+        # Intensity augmentation
+        if random.random() < 0.3:
+            img = np.clip(img * random.uniform(0.8, 1.2) +
+                          random.uniform(-0.1, 0.1), 0, 1).copy()
+        return img, mask
+
+    def __getitem__(self, _):
+        fname = random.choice(self.volumes)
+        ip = os.path.join(self.img_dir, fname)
+        mp = os.path.join(self.mask_dir, fname)
+
+        if ip not in self._img_cache:
+            return (torch.zeros((1, self.patch_depth, self.patch_size, self.patch_size)),
+                    torch.zeros((1, self.patch_depth, self.patch_size, self.patch_size)))
+
+        img = self._img_cache[ip]
+        mask = self._mask_cache[mp]
+        vol_d, vol_h, vol_w = img.shape
+
+        d, h, w = self.patch_depth, self.patch_size, self.patch_size
+
+        # Foreground-biased sampling
+        if fname in self._positive_voxels and random.random() < self.fg_ratio:
+            vz, vy, vx = random.choice(self._positive_voxels[fname])
+            z = max(0, min(int(vz) - d // 2, vol_d - d))
+            y = max(0, min(int(vy) - h // 2, vol_h - h))
+            x = max(0, min(int(vx) - w // 2, vol_w - w))
+        else:
+            z = random.randint(0, max(0, vol_d - d))
+            y = random.randint(0, max(0, vol_h - h))
+            x = random.randint(0, max(0, vol_w - w))
+
+        patch_img, patch_msk = self._random_crop_3d(img, mask, z, y, x)
+
+        # Normalize
+        m, M = patch_img.min(), patch_img.max()
+        patch_img = (patch_img - m) / (M - m + 1e-8)
+
+        patch_img, patch_msk = self._augment_3d(patch_img, patch_msk)
+
+        # (D, H, W) -> (1, D, H, W) for single-channel 3D
+        patch_img = torch.tensor(patch_img.copy()[None, ...], dtype=torch.float32)
+        patch_msk = torch.tensor(patch_msk.copy()[None, ...], dtype=torch.float32)
+        return patch_img, patch_msk
+
+
 class TrainWorker(QThread):
     """Background worker for UNet training."""
 
@@ -743,11 +895,13 @@ class TrainWorker(QThread):
             architecture = self.config.get('architecture', 'unet')
 
             # Detect architecture variants
-            from ..models.architectures import get_n_context_slices, uses_z_coord
-            is_25d = '25d' in architecture.lower()
+            from ..models.architectures import (get_n_context_slices, uses_z_coord,
+                                                 is_3d_architecture, get_3d_patch_depth, get_3d_patch_size)
+            is_3d = is_3d_architecture(architecture)
+            is_25d = '25d' in architecture.lower() and not is_3d
             is_sam2 = 'sam2' in architecture.lower()
-            n_channels = get_n_context_slices(architecture)
-            add_z_coord = uses_z_coord(architecture)
+            n_channels = 1 if is_3d else get_n_context_slices(architecture)
+            add_z_coord = False if is_3d else uses_z_coord(architecture)
 
             if is_25d:
                 # Deep 2.5D uses a separate folder (11-channel stacks)
@@ -792,22 +946,44 @@ class TrainWorker(QThread):
                 torch.set_float32_matmul_precision("high")
 
             # Create datasets
-            if add_z_coord:
-                self.log.emit(f"Loading training data (n_channels={n_channels} + z-coord)...")
-            else:
-                self.log.emit(f"Loading training data (n_channels={n_channels})...")
-            if is_sam2 and sam2_dir:
-                train_ds = NucleiPatchDatasetSAM2(train_images, train_masks, sam2_dir,
-                                                  tile=tile_size, fg_ratio=0.5, n_channels=n_channels)
-            else:
-                train_ds = NucleiPatchDataset(train_images, train_masks, tile=tile_size, fg_ratio=0.5,
-                                              n_channels=n_channels, uses_z_coord=add_z_coord)
+            if is_3d:
+                patch_depth = get_3d_patch_depth(architecture)
+                patch_size_3d = get_3d_patch_size(architecture)
+                # Use 3D training directories
+                train_images_3d = train_images.replace('train_images', 'train_images_3d')
+                train_masks_3d = train_masks.replace('train_masks', 'train_masks_3d')
+                if os.path.isdir(train_images_3d) and os.path.isdir(train_masks_3d):
+                    train_images = train_images_3d
+                    train_masks = train_masks_3d
+                else:
+                    self.log.emit(f"ERROR: 3D training folders not found")
+                    self.log.emit(f"  Expected: {train_images_3d}")
+                    self.log.emit(f"  Use 3D GT mode to capture volumetric training data.")
+                    self.finished.emit(False, "3D training data not found")
+                    return
 
-            val_ds = None
-            if val_images and val_masks and os.path.exists(val_images):
-                self.log.emit("Loading validation data...")
-                val_ds = NucleiPatchDataset(val_images, val_masks, tile=tile_size, fg_ratio=0.0,
-                                           n_channels=n_channels, uses_z_coord=add_z_coord)
+                self.log.emit(f"Loading 3D training data (patch={patch_depth}x{patch_size_3d}x{patch_size_3d})...")
+                train_ds = Volumetric3DPatchDataset(train_images, train_masks,
+                                                    patch_depth=patch_depth, patch_size=patch_size_3d,
+                                                    fg_ratio=0.5)
+                val_ds = None  # 3D validation not yet supported
+            else:
+                if add_z_coord:
+                    self.log.emit(f"Loading training data (n_channels={n_channels} + z-coord)...")
+                else:
+                    self.log.emit(f"Loading training data (n_channels={n_channels})...")
+                if is_sam2 and sam2_dir:
+                    train_ds = NucleiPatchDatasetSAM2(train_images, train_masks, sam2_dir,
+                                                      tile=tile_size, fg_ratio=0.5, n_channels=n_channels)
+                else:
+                    train_ds = NucleiPatchDataset(train_images, train_masks, tile=tile_size, fg_ratio=0.5,
+                                                  n_channels=n_channels, uses_z_coord=add_z_coord)
+
+                val_ds = None
+                if val_images and val_masks and os.path.exists(val_images):
+                    self.log.emit("Loading validation data...")
+                    val_ds = NucleiPatchDataset(val_images, val_masks, tile=tile_size, fg_ratio=0.0,
+                                               n_channels=n_channels, uses_z_coord=add_z_coord)
 
             # Platform-specific DataLoader settings
             import platform
@@ -871,13 +1047,15 @@ class TrainWorker(QThread):
             print(f"  Max epochs:      {num_epochs}")
             print(f"  Device:          {device}")
             model_n_channels = n_channels + (1 if add_z_coord else 0)
-            if add_z_coord:
+            if is_3d:
+                print(f"  Input channels:  {model_n_channels} (3D mode, patch={patch_depth}x{patch_size_3d}x{patch_size_3d})")
+            elif add_z_coord:
                 print(f"  Input channels:  {model_n_channels} ({n_channels} image + 1 z-coord, {'2.5D mode' if is_25d else '2D mode'})")
             else:
                 print(f"  Input channels:  {n_channels} ({'2.5D mode' if is_25d else '2D mode'})")
 
             # Dataset info
-            num_images = len(train_ds.images)
+            num_images = len(train_ds.volumes) if is_3d else len(train_ds.images)
             samples_per_epoch = len(train_ds)
             multiplier = samples_per_epoch // num_images if num_images > 0 else 0
             batches_per_epoch = len(train_loader)

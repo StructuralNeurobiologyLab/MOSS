@@ -731,8 +731,26 @@ class InteractiveTrainingPage(QWidget):
         else:
             return
 
+        # For 3D architectures, load a block of slices as (D, H, W)
+        if self.predict_worker._is_3d:
+            depth = self.predict_worker._3d_patch_depth
+            half_d = depth // 2
+            total = len(self.image_files)
+            slices_3d = []
+            for dz in range(-half_d, half_d):
+                z_idx = max(0, min(total - 1, idx + dz))
+                if self.use_zarr and self.zarr_source is not None:
+                    tile, _ = self.zarr_source.get_tile_native(
+                        z_idx, y_min_pad, y_max_pad, x_min_pad, x_max_pad, pyramid_level=0
+                    )
+                    slices_3d.append(tile)
+                elif z_idx in self.images:
+                    slices_3d.append(self.images[z_idx][y_min_pad:y_max_pad, x_min_pad:x_max_pad].copy())
+                else:
+                    slices_3d.append(image.copy())  # Fallback to center slice
+            image = np.stack(slices_3d, axis=0)  # (D, H, W)
         # For 2.5D architectures, load adjacent slice crops and stack
-        if self.predict_worker.is_25d():
+        elif self.predict_worker.is_25d():
             n_expected = self.predict_worker._n_channels
             adjacent = self._load_adjacent_slice_crops(
                 idx, y_min_pad, y_max_pad, x_min_pad, x_max_pad, n_expected

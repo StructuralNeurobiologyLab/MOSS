@@ -125,11 +125,13 @@ class PredictWorker(QThread):
             overlap = self.config.get('overlap', 64)
 
             # Detect architecture variants
-            is_25d = '25d' in architecture.lower()
+            from ..models.architectures import (get_n_context_slices, uses_z_coord,
+                                                 is_3d_architecture, get_3d_patch_depth, get_3d_patch_size)
+            is_3d = is_3d_architecture(architecture)
+            is_25d = '25d' in architecture.lower() and not is_3d
             is_sam2 = 'sam2' in architecture.lower()
-            from ..models.architectures import get_n_context_slices, uses_z_coord
-            n_channels = get_n_context_slices(architecture)
-            add_z_coord = uses_z_coord(architecture)
+            n_channels = 1 if is_3d else get_n_context_slices(architecture)
+            add_z_coord = False if is_3d else uses_z_coord(architecture)
             model_n_channels = n_channels + (1 if add_z_coord else 0)
 
             device = get_device()
@@ -137,7 +139,9 @@ class PredictWorker(QThread):
 
             # Load model
             self.log.emit(f"Loading model ({architecture}) from {checkpoint_path}...")
-            if add_z_coord:
+            if is_3d:
+                self.log.emit(f"  Mode: 3D volumetric (n_channels={model_n_channels})")
+            elif add_z_coord:
                 self.log.emit(f"  Mode: {'2.5D' if is_25d else '2D'} (n_channels={model_n_channels}: {n_channels} image + z-coord)")
             else:
                 self.log.emit(f"  Mode: {'2.5D' if is_25d else '2D'} (n_channels={n_channels})")
@@ -165,9 +169,15 @@ class PredictWorker(QThread):
                 output_dirs[name] = str(output_dir)
 
                 self.log.emit(f"Processing {name}...")
-                self._predict_folder(model, input_dir, output_dir, patch_size, overlap, name, device,
-                                    is_25d=is_25d, is_sam2=is_sam2, sam2_predictor=sam2_predictor,
-                                    architecture=architecture, add_z_coord=add_z_coord)
+                if is_3d:
+                    patch_depth = get_3d_patch_depth(architecture)
+                    patch_size_3d = get_3d_patch_size(architecture)
+                    self._predict_folder_3d(model, input_dir, output_dir, patch_size_3d,
+                                            patch_depth, overlap, name, device)
+                else:
+                    self._predict_folder(model, input_dir, output_dir, patch_size, overlap, name, device,
+                                        is_25d=is_25d, is_sam2=is_sam2, sam2_predictor=sam2_predictor,
+                                        architecture=architecture, add_z_coord=add_z_coord)
 
             # Check if we were stopped vs completed
             if self.should_stop:
@@ -392,3 +402,108 @@ class PredictWorker(QThread):
             pred = preds[idx, 0, :ph, :pw]
             pred_full[y:y+ph, x:x+pw] += pred
             count[y:y+ph, x:x+pw] += 1
+
+    def _predict_folder_3d(self, model, input_dir, output_dir, patch_size, patch_depth,
+                           overlap, name, device):
+        """Predict on a folder of images using 3D sliding window."""
+        # Find all images
+        image_files = sorted([
+            f for f in input_dir.iterdir()
+            if f.suffix.lower() in ('.tif', '.tiff', '.png', '.jpg')
+        ])
+
+        total_z = len(image_files)
+        if total_z == 0:
+            self.log.emit(f"No images found in {name}")
+            return
+
+        # Load first image to get dimensions
+        first_img = np.array(Image.open(image_files[0]))
+        if first_img.ndim == 3:
+            first_img = first_img[..., 0]
+        h, w = first_img.shape
+
+        self.log.emit(f"3D prediction: {total_z} slices, {h}x{w}, "
+                      f"patch={patch_depth}x{patch_size}x{patch_size}")
+
+        # Allocate output volume and count arrays
+        pred_volume = np.zeros((total_z, h, w), dtype=np.float32)
+        count_volume = np.zeros((total_z, h, w), dtype=np.float32)
+
+        # Sliding window parameters
+        stride_z = max(1, patch_depth - overlap)
+        stride_xy = max(1, patch_size - overlap)
+
+        # Preload all slices (needed for 3D blocks)
+        self.log.emit(f"Loading volume into memory...")
+        volume = np.zeros((total_z, h, w), dtype=np.float32)
+        for i, f in enumerate(image_files):
+            img = np.array(Image.open(f))
+            if img.ndim == 3:
+                img = img[..., 0]
+            volume[i] = img.astype(np.float32)
+
+        # 3D sliding window
+        with torch.no_grad():
+            total_blocks = 0
+            for z in range(0, total_z, stride_z):
+                z_end = min(z + patch_depth, total_z)
+                z_start = max(0, z_end - patch_depth)  # Ensure full depth patch
+                actual_d = z_end - z_start
+
+                for y in range(0, h, stride_xy):
+                    for x in range(0, w, stride_xy):
+                        if self.should_stop:
+                            return
+
+                        # Extract 3D patch
+                        y_end = min(y + patch_size, h)
+                        x_end = min(x + patch_size, w)
+                        patch = volume[z_start:z_end, y:y_end, x:x_end]
+
+                        ph, pw = patch.shape[1], patch.shape[2]
+
+                        if patch.max() == 0:
+                            continue
+
+                        # Pad if needed
+                        pad_d = patch_depth - patch.shape[0]
+                        pad_h = patch_size - ph
+                        pad_w = patch_size - pw
+                        if pad_d > 0 or pad_h > 0 or pad_w > 0:
+                            patch = np.pad(patch, ((0, pad_d), (0, pad_h), (0, pad_w)))
+
+                        # Normalize
+                        p_min, p_max = patch.min(), patch.max()
+                        if p_max > p_min:
+                            patch = (patch - p_min) / (p_max - p_min)
+
+                        # (D, H, W) -> (1, 1, D, H, W)
+                        tensor = torch.tensor(
+                            patch[None, None, ...], dtype=torch.float32
+                        ).to(device)
+
+                        pred = torch.sigmoid(model(tensor))[0, 0].cpu().numpy()
+
+                        # Place result (only the valid region)
+                        pred_volume[z_start:z_end, y:y_end, x:x_end] += pred[:actual_d, :ph, :pw]
+                        count_volume[z_start:z_end, y:y_end, x:x_end] += 1
+
+                        total_blocks += 1
+
+                self.progress.emit(name, min(z + stride_z, total_z), total_z)
+
+        self.log.emit(f"Processed {total_blocks} 3D blocks")
+
+        # Normalize and save per-slice
+        pred_volume /= np.maximum(count_volume, 1e-8)
+
+        for i, image_path in enumerate(image_files):
+            mask_bin = ((pred_volume[i] > 0.5) * 255).astype(np.uint8)
+            output_path = output_dir / f"{image_path.stem}_pred.tif"
+            Image.fromarray(mask_bin).save(output_path, compression='tiff_lzw')
+
+        del volume, pred_volume, count_volume
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()

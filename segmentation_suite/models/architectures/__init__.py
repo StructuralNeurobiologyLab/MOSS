@@ -27,6 +27,9 @@ _architecture_training_v2: Dict[str, bool] = {}  # v2 training improvements flag
 _architecture_n_context: Dict[str, int] = {}  # N_CONTEXT_SLICES for 2.5D variants
 _architecture_slice_spacing: Dict[str, int] = {}  # SLICE_SPACING for 2.5D variants
 _architecture_uses_z_coord: Dict[str, bool] = {}  # USES_Z_COORD flag
+_architecture_is_3d: Dict[str, bool] = {}  # IS_3D flag for volumetric models
+_architecture_patch_depth: Dict[str, int] = {}  # PATCH_DEPTH for 3D models
+_architecture_patch_size: Dict[str, int] = {}  # PATCH_SIZE for 3D models
 _loaded = False
 
 
@@ -88,6 +91,15 @@ def _load_architectures():
 
             if getattr(module, 'USES_Z_COORD', False):
                 _architecture_uses_z_coord[arch_id] = True
+
+            if getattr(module, 'IS_3D', False):
+                _architecture_is_3d[arch_id] = True
+            patch_depth = getattr(module, 'PATCH_DEPTH', None)
+            if patch_depth is not None:
+                _architecture_patch_depth[arch_id] = patch_depth
+            patch_size = getattr(module, 'PATCH_SIZE', None)
+            if patch_size is not None:
+                _architecture_patch_size[arch_id] = patch_size
 
             # Debug output (commented out for cleaner startup)
             # print(f"Loaded architecture: {arch_id} ({module.ARCHITECTURE_NAME})")
@@ -224,3 +236,21 @@ def uses_z_coord(arch_id: str) -> bool:
     """Check if architecture uses a z-coordinate input channel."""
     _load_architectures()
     return _architecture_uses_z_coord.get(arch_id, False)
+
+
+def is_3d_architecture(arch_id: str) -> bool:
+    """Check if architecture is a 3D volumetric model."""
+    _load_architectures()
+    return _architecture_is_3d.get(arch_id, False)
+
+
+def get_3d_patch_depth(arch_id: str) -> int:
+    """Get the Z depth for 3D model patches. Default 32."""
+    _load_architectures()
+    return _architecture_patch_depth.get(arch_id, 32)
+
+
+def get_3d_patch_size(arch_id: str) -> int:
+    """Get the XY size for 3D model patches. Default 128."""
+    _load_architectures()
+    return _architecture_patch_size.get(arch_id, 128)
