@@ -18,6 +18,8 @@ ARCHITECTURE_DESCRIPTION = (
     "but requires more memory and compute."
 )
 
+HIDDEN = True
+
 
 class DoubleConv(nn.Module):
     """Two consecutive convolution blocks with BatchNorm and ReLU."""

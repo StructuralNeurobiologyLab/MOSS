@@ -29,6 +29,8 @@ ARCHITECTURE_DESCRIPTION = (
 )
 PREFERRED_LOSS = 'bce'
 
+HIDDEN = True
+
 # Path to pretrained checkpoint (relative to this file's parent directory)
 import os
 from pathlib import Path

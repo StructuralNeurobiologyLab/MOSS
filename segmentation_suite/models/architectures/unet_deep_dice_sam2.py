@@ -33,6 +33,8 @@ PREFERRED_LOSS = 'dice'
 # Flag to indicate this model requires SAM2 features
 REQUIRES_SAM2_FEATURES = True
 
+HIDDEN = True
+
 
 class DoubleConv(nn.Module):
     """Two consecutive convolution blocks with BatchNorm and ReLU."""

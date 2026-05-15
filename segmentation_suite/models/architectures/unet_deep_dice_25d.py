@@ -28,6 +28,8 @@ N_CONTEXT_SLICES = 3
 N_FLANKING_SLICES = 1  # Slices on each side of center
 SLICE_SPACING = 3  # Distance between slices (z-3, z, z+3)
 
+HIDDEN = True
+
 
 class DoubleConv(nn.Module):
     """Two consecutive convolution blocks with BatchNorm and ReLU."""

@@ -26,6 +26,8 @@ PREFERRED_LOSS = 'bce_dice'
 TRAINING_V2 = True
 IS_3D = True
 
+HIDDEN = True
+
 # 3D patch defaults
 PATCH_DEPTH = 32    # Z slices per patch
 PATCH_SIZE = 128    # XY size per patch

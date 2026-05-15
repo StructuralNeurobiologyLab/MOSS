@@ -22,6 +22,8 @@ ARCHITECTURE_DESCRIPTION = (
 # Optional: specify preferred loss function (checked by train_worker)
 PREFERRED_LOSS = 'dice'
 
+HIDDEN = True
+
 
 class DoubleConv(nn.Module):
     """Two consecutive convolution blocks with BatchNorm and ReLU."""

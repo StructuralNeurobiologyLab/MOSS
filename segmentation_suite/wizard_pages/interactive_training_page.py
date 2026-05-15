@@ -927,17 +927,37 @@ class InteractiveTrainingPage(QWidget):
 
         row2.addSeparator()
 
-        # 3D Ground Truth toggle
+        # 3D Ground Truth toggle (hidden — kept for future use)
         self._3d_gt_checkbox = QCheckBox("3D GT")
         self._3d_gt_checkbox.setChecked(False)
         self._3d_gt_checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._3d_gt_checkbox.setToolTip(
-            "3D Ground Truth mode:\n"
-            "When enabled, Tab locks the crop box (turns blue) and keeps it fixed across slices.\n"
-            "Paint on multiple slices, then click the checkmark to save the 3D volume."
-        )
         self._3d_gt_checkbox.stateChanged.connect(self._on_3d_gt_mode_changed)
-        row2.addWidget(self._3d_gt_checkbox)
+        self._3d_gt_checkbox.setVisible(False)
+
+        # Crop size selector — 3 square outline buttons of increasing size
+        self._crop_size_buttons = {}
+        self._current_crop_size = 256
+        for label, size, btn_px in [("S", 128, 14), ("M", 256, 20), ("L", 512, 26)]:
+            btn = QPushButton()
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setCheckable(True)
+            btn.setFixedSize(scaled(btn_px), scaled(btn_px))
+            btn.setToolTip(f"Crop size: {size}x{size}")
+            btn.setStyleSheet("""
+                QPushButton {
+                    border: 2px solid #CCCCCC;
+                    background: transparent;
+                }
+                QPushButton:checked {
+                    border: 2px solid #FFD700;
+                    background: rgba(255, 215, 0, 50);
+                }
+            """)
+            btn.clicked.connect(lambda checked, s=size: self._on_crop_size_btn(s))
+            row2.addWidget(btn)
+            self._crop_size_buttons[size] = btn
+        # Default to Medium
+        self._crop_size_buttons[256].setChecked(True)
 
         row2.addSeparator()
 
@@ -1081,6 +1101,15 @@ class InteractiveTrainingPage(QWidget):
 
     def on_crop_alpha_changed(self, value: int):
         self.canvas.set_crop_preview_alpha(value / 100.0)
+
+    def _on_crop_size_btn(self, size: int):
+        """Handle crop size button click."""
+        # Uncheck all, check the clicked one
+        for s, btn in self._crop_size_buttons.items():
+            btn.setChecked(s == size)
+        if hasattr(self, 'canvas'):
+            self.canvas.set_crop_size(size)
+        self._current_crop_size = size
 
     def _on_3d_gt_mode_changed(self, state: int):
         """Handle 3D Ground Truth mode toggle."""
@@ -3089,7 +3118,7 @@ class InteractiveTrainingPage(QWidget):
             'resume_checkpoint': resume_checkpoint,  # Resume from existing checkpoint
             'num_epochs': self.config.get('num_epochs', 50000),
             'batch_size': self.config.get('batch_size', 2),
-            'tile_size': 256,
+            'tile_size': getattr(self, '_current_crop_size', 256),
             'learning_rate': self.config.get('learning_rate', 1e-4),
             'architecture': self.current_architecture,  # Pass architecture to worker
         }

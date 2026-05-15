@@ -30,6 +30,7 @@ _architecture_uses_z_coord: Dict[str, bool] = {}  # USES_Z_COORD flag
 _architecture_is_3d: Dict[str, bool] = {}  # IS_3D flag for volumetric models
 _architecture_patch_depth: Dict[str, int] = {}  # PATCH_DEPTH for 3D models
 _architecture_patch_size: Dict[str, int] = {}  # PATCH_SIZE for 3D models
+_architecture_hidden: Dict[str, bool] = {}  # HIDDEN flag - kept but not shown in UI
 _loaded = False
 
 
@@ -101,6 +102,9 @@ def _load_architectures():
             if patch_size is not None:
                 _architecture_patch_size[arch_id] = patch_size
 
+            if getattr(module, 'HIDDEN', False):
+                _architecture_hidden[arch_id] = True
+
             # Debug output (commented out for cleaner startup)
             # print(f"Loaded architecture: {arch_id} ({module.ARCHITECTURE_NAME})")
 
@@ -110,20 +114,21 @@ def _load_architectures():
     _loaded = True
 
 
-def get_available_architectures() -> Dict[str, str]:
+def get_available_architectures(include_hidden: bool = False) -> Dict[str, str]:
     """
     Get dict of available architectures: {architecture_id: display_name}
 
     Always includes built-in architectures plus any discovered from files.
+    Hidden architectures are excluded unless include_hidden=True.
     """
     _load_architectures()
 
-    # Start with built-in architectures from unet.py
-    from ..unet import ARCHITECTURE_NAMES as builtin_names
-    result = dict(builtin_names)
+    # Start with discovered architectures (file-based)
+    result = dict(_architecture_names)
 
-    # Add discovered architectures (may override built-ins)
-    result.update(_architecture_names)
+    # Filter out hidden architectures unless requested
+    if not include_hidden:
+        result = {k: v for k, v in result.items() if k not in _architecture_hidden}
 
     return result
 

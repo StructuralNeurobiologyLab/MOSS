@@ -19,6 +19,8 @@ ARCHITECTURE_DESCRIPTION = (
 )
 PREFERRED_LOSS = 'bce'
 
+HIDDEN = True
+
 DEFAULT_NEIGHBORHOOD: List[Tuple[int, int, int]] = [
     (1, 0, 0), (0, 1, 0), (0, 0, 1),
     (3, 0, 0), (0, 3, 0), (0, 0, 3),
