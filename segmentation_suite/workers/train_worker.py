@@ -904,14 +904,19 @@ class TrainWorker(QThread):
             add_z_coord = False if is_3d else uses_z_coord(architecture)
 
             if is_25d:
-                # Deep 2.5D uses a separate folder (11-channel stacks)
+                # Deep 2.5D uses a separate folder (multi-channel stacks)
                 if 'dwarf25d' in architecture.lower():
                     suffix = 'dwarf25d'
+                    train_images_25d = self.config.get('train_images_dwarf25d',
+                        train_images.replace('train_images', 'train_images_dwarf25d'))
+                    train_masks_25d = self.config.get('train_masks_dwarf25d',
+                        train_masks.replace('train_masks', 'train_masks_dwarf25d'))
                 else:
                     suffix = '25d'
-
-                train_images_25d = train_images.replace('train_images', f'train_images_{suffix}')
-                train_masks_25d = train_masks.replace('train_masks', f'train_masks_{suffix}')
+                    train_images_25d = self.config.get('train_images_25d',
+                        train_images.replace('train_images', 'train_images_25d'))
+                    train_masks_25d = self.config.get('train_masks_25d',
+                        train_masks.replace('train_masks', 'train_masks_25d'))
 
                 if os.path.isdir(train_images_25d) and os.path.isdir(train_masks_25d):
                     train_images = train_images_25d
@@ -1097,6 +1102,11 @@ class TrainWorker(QThread):
                 elif "optimizer_state_dict" in ckpt:
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 start_epoch = ckpt.get("epoch", 0) + 1 if isinstance(ckpt, dict) and "epoch" in ckpt else 0
+                # Lock tile_size from checkpoint (backwards compatible: default 256)
+                saved_tile_size = ckpt.get("tile_size", 256) if isinstance(ckpt, dict) else 256
+                if saved_tile_size != tile_size:
+                    self.log.emit(f"Resuming with tile_size={saved_tile_size} (from checkpoint, ignoring current {tile_size})")
+                    tile_size = saved_tile_size
                 print(f"  Resuming from:   epoch {start_epoch}")
             else:
                 print(f"  Starting:        from scratch")
@@ -1220,6 +1230,7 @@ class TrainWorker(QThread):
                     "epoch": epoch,
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
+                    "tile_size": tile_size,
                 }, checkpoint_path)
 
                 # Notify that model was updated

@@ -397,6 +397,7 @@ class InteractiveTrainingPage(QWidget):
     def _populate_architecture_combo(self):
         """Populate the architecture dropdown with available architectures."""
         from ..models.unet import get_available_architectures
+        from ..models.architectures import get_checkpoint_filename
 
         self.arch_combo.blockSignals(True)
         self.arch_combo.clear()
@@ -409,9 +410,24 @@ class InteractiveTrainingPage(QWidget):
         self._arch_id_to_name = {}
 
         for arch_id, display_name in architectures.items():
-            self.arch_combo.addItem(display_name)
-            self._arch_name_to_id[display_name] = arch_id
-            self._arch_id_to_name[arch_id] = display_name
+            # Check checkpoint for tile_size indicator
+            indicator = ""
+            if self.project_dir:
+                working_dir = self._get_working_dir()
+                ckpt_path = working_dir / get_checkpoint_filename(arch_id)
+                if ckpt_path.exists():
+                    try:
+                        import torch
+                        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+                        ts = ckpt.get("tile_size", 256) if isinstance(ckpt, dict) else 256
+                        indicator = f" [{ts}]"
+                    except Exception:
+                        indicator = " [?]"
+
+            combo_name = f"{display_name}{indicator}"
+            self.arch_combo.addItem(combo_name)
+            self._arch_name_to_id[combo_name] = arch_id
+            self._arch_id_to_name[arch_id] = combo_name
 
         # Select current architecture
         if self.current_architecture in self._arch_id_to_name:
@@ -577,9 +593,25 @@ class InteractiveTrainingPage(QWidget):
         for arch_id, display_name in architectures.items():
             # Use shorter names for the smaller dropdown
             short_name = display_name.replace('UNet ', '').replace('(', '').replace(')', '')
-            self.pred_model_combo.addItem(short_name)
-            self._pred_name_to_id[short_name] = arch_id
-            self._pred_id_to_name[arch_id] = short_name
+
+            # Check checkpoint for tile_size indicator
+            indicator = ""
+            if self.project_dir:
+                working_dir = self._get_working_dir()
+                ckpt_path = working_dir / get_checkpoint_filename(arch_id)
+                if ckpt_path.exists():
+                    try:
+                        import torch
+                        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+                        ts = ckpt.get("tile_size", 256) if isinstance(ckpt, dict) else 256
+                        indicator = f" [{ts}]"
+                    except Exception:
+                        indicator = " [?]"
+
+            combo_name = f"{short_name}{indicator}"
+            self.pred_model_combo.addItem(combo_name)
+            self._pred_name_to_id[combo_name] = arch_id
+            self._pred_id_to_name[arch_id] = combo_name
 
         # Select current prediction architecture
         if self.prediction_architecture in self._pred_id_to_name:
@@ -937,7 +969,7 @@ class InteractiveTrainingPage(QWidget):
         # Crop size selector — 3 square outline buttons of increasing size
         self._crop_size_buttons = {}
         self._current_crop_size = 256
-        for label, size, btn_px in [("S", 128, 14), ("M", 256, 20), ("L", 512, 26)]:
+        for label, size, btn_px in [("S", 128, 7), ("M", 256, 10), ("L", 512, 13)]:
             btn = QPushButton()
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             btn.setCheckable(True)
@@ -945,17 +977,21 @@ class InteractiveTrainingPage(QWidget):
             btn.setToolTip(f"Crop size: {size}x{size}")
             btn.setStyleSheet("""
                 QPushButton {
-                    border: 2px solid #CCCCCC;
+                    border: 1px solid #CCCCCC;
                     background: transparent;
                 }
                 QPushButton:checked {
-                    border: 2px solid #FFD700;
+                    border: 1px solid #FFD700;
                     background: rgba(255, 215, 0, 50);
                 }
             """)
             btn.clicked.connect(lambda checked, s=size: self._on_crop_size_btn(s))
             row2.addWidget(btn)
             self._crop_size_buttons[size] = btn
+            # Add spacing between buttons
+            spacer = QWidget()
+            spacer.setFixedWidth(scaled(4))
+            row2.addWidget(spacer)
         # Default to Medium
         self._crop_size_buttons[256].setChecked(True)
 
@@ -1110,6 +1146,9 @@ class InteractiveTrainingPage(QWidget):
         if hasattr(self, 'canvas'):
             self.canvas.set_crop_size(size)
         self._current_crop_size = size
+        # Re-resolve training directories for new crop size
+        if self.project_dir:
+            self._resolve_working_dirs()
 
     def _on_3d_gt_mode_changed(self, state: int):
         """Handle 3D Ground Truth mode toggle."""
@@ -1556,17 +1595,20 @@ class InteractiveTrainingPage(QWidget):
         if not self.project_dir:
             return
 
+        tile_size = getattr(self, '_current_crop_size', 256)
+
         if has_subprojects(str(self.project_dir)):
             sp_name = get_active_subproject(str(self.project_dir))
             self._active_subproject = sp_name
-            paths = get_subproject_paths(str(self.project_dir), sp_name)
+            paths = get_subproject_paths(str(self.project_dir), sp_name, tile_size=tile_size)
             self.train_images_dir = paths["train_images_dir"]
             self.train_masks_dir = paths["train_masks_dir"]
             self.train_images_25d_dir = paths["train_images_25d_dir"]
             self.train_masks_25d_dir = paths["train_masks_25d_dir"]
+            self.train_images_dwarf25d_dir = paths["train_images_dwarf25d_dir"]
+            self.train_masks_dwarf25d_dir = paths["train_masks_dwarf25d_dir"]
             self.masks_dir = paths["masks_dir"]
-            base = paths["subproject_dir"]
-            print(f"[Training] Using subproject '{sp_name}' dirs")
+            print(f"[Training] Using subproject '{sp_name}' dirs (crop_size={tile_size})")
 
             # Restore per-subproject architecture state (unless locked by multi-user session)
             if not self._architecture_locked:
@@ -1582,15 +1624,15 @@ class InteractiveTrainingPage(QWidget):
         else:
             # Legacy flat layout
             self._active_subproject = None
-            self.train_images_dir = self.project_dir / 'train_images'
-            self.train_masks_dir = self.project_dir / 'train_masks'
-            self.train_images_25d_dir = self.project_dir / 'train_images_25d'
-            self.train_masks_25d_dir = self.project_dir / 'train_masks_25d'
+            from ..project_config import get_training_folder_names
+            folders = get_training_folder_names(tile_size)
+            self.train_images_dir = self.project_dir / folders["images"]
+            self.train_masks_dir = self.project_dir / folders["masks"]
+            self.train_images_25d_dir = self.project_dir / folders["images_25d"]
+            self.train_masks_25d_dir = self.project_dir / folders["masks_25d"]
+            self.train_images_dwarf25d_dir = self.project_dir / folders["images_dwarf25d"]
+            self.train_masks_dwarf25d_dir = self.project_dir / folders["masks_dwarf25d"]
             self.masks_dir = self.project_dir / 'masks'
-            base = self.project_dir
-
-        self.train_images_dwarf25d_dir = base / 'train_images_dwarf25d'
-        self.train_masks_dwarf25d_dir = base / 'train_masks_dwarf25d'
 
         self.train_images_dir.mkdir(parents=True, exist_ok=True)
         self.train_masks_dir.mkdir(parents=True, exist_ok=True)
@@ -3114,6 +3156,10 @@ class InteractiveTrainingPage(QWidget):
         config = {
             'train_images': str(self.train_images_dir),
             'train_masks': str(self.train_masks_dir),
+            'train_images_25d': str(self.train_images_25d_dir),
+            'train_masks_25d': str(self.train_masks_25d_dir),
+            'train_images_dwarf25d': str(self.train_images_dwarf25d_dir),
+            'train_masks_dwarf25d': str(self.train_masks_dwarf25d_dir),
             'checkpoint_path': str(checkpoint_path),
             'resume_checkpoint': resume_checkpoint,  # Resume from existing checkpoint
             'num_epochs': self.config.get('num_epochs', 50000),

@@ -377,23 +377,47 @@ def save_subproject_config(project_dir: str, subproject_name: str, config: dict)
         return False
 
 
-def get_subproject_paths(project_dir: str, subproject_name: str) -> dict:
+def get_training_folder_names(tile_size: int = 256) -> dict:
+    """Get folder names for training data based on tile/crop size.
+
+    256 is the legacy default (no suffix). 128 and 512 get a size suffix.
+    Returns dict with keys: images, masks, images_25d, masks_25d,
+    images_dwarf25d, masks_dwarf25d.
+    """
+    suffix = "" if tile_size == 256 else f"_{tile_size}"
+    return {
+        "images": f"train_images{suffix}",
+        "masks": f"train_masks{suffix}",
+        "images_25d": f"train_images{suffix}_25d",
+        "masks_25d": f"train_masks{suffix}_25d",
+        "images_dwarf25d": f"train_images{suffix}_dwarf25d",
+        "masks_dwarf25d": f"train_masks{suffix}_dwarf25d",
+    }
+
+
+def get_subproject_paths(project_dir: str, subproject_name: str, tile_size: int = 256) -> dict:
     """Get all relevant paths for a subproject.
+
+    Args:
+        project_dir: Project root directory
+        subproject_name: Subproject name
+        tile_size: Crop/tile size (128, 256, 512). 256 uses legacy folder names.
 
     Returns a dict with keys: masks_dir, train_images_dir, train_masks_dir,
     train_images_25d_dir, train_masks_25d_dir, and checkpoint base dir.
     All paths are absolute Path objects.
     """
     sp_dir = get_subproject_dir(project_dir, subproject_name)
+    folders = get_training_folder_names(tile_size)
     return {
         "subproject_dir": sp_dir,
         "masks_dir": sp_dir / "masks",
-        "train_images_dir": sp_dir / "train_images",
-        "train_masks_dir": sp_dir / "train_masks",
-        "train_images_25d_dir": sp_dir / "train_images_25d",
-        "train_masks_25d_dir": sp_dir / "train_masks_25d",
-        "train_images_dwarf25d_dir": sp_dir / "train_images_dwarf25d",
-        "train_masks_dwarf25d_dir": sp_dir / "train_masks_dwarf25d",
+        "train_images_dir": sp_dir / folders["images"],
+        "train_masks_dir": sp_dir / folders["masks"],
+        "train_images_25d_dir": sp_dir / folders["images_25d"],
+        "train_masks_25d_dir": sp_dir / folders["masks_25d"],
+        "train_images_dwarf25d_dir": sp_dir / folders["images_dwarf25d"],
+        "train_masks_dwarf25d_dir": sp_dir / folders["masks_dwarf25d"],
         "train_images_3d_dir": sp_dir / "train_images_3d",
         "train_masks_3d_dir": sp_dir / "train_masks_3d",
         "sam2_features_dir": sp_dir / "sam2_features",
