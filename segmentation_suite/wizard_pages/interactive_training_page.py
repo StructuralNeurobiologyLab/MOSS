@@ -2684,7 +2684,7 @@ class InteractiveTrainingPage(QWidget):
             "prediction_architecture": self.prediction_architecture,
 
             # Training parameters from config
-            "num_epochs": self.config.get("num_epochs", 5000),
+            "num_epochs": self.config.get("num_epochs", 50000),
             "batch_size": self.config.get("batch_size", 2),
             "tile_size": self.config.get("tile_size", 256),
             "learning_rate": self.config.get("learning_rate", 0.0001),
@@ -3087,7 +3087,7 @@ class InteractiveTrainingPage(QWidget):
             'train_masks': str(self.train_masks_dir),
             'checkpoint_path': str(checkpoint_path),
             'resume_checkpoint': resume_checkpoint,  # Resume from existing checkpoint
-            'num_epochs': self.config.get('num_epochs', 5000),
+            'num_epochs': self.config.get('num_epochs', 50000),
             'batch_size': self.config.get('batch_size', 2),
             'tile_size': 256,
             'learning_rate': self.config.get('learning_rate', 1e-4),

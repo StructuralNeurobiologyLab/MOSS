@@ -1221,7 +1221,7 @@ class HomePage(QWidget):
             'train_masks_dir': str(self.project_dir / 'train_masks'),
             'checkpoint_path': str(self.project_dir / 'checkpoint.pth'),
             'interactive': True,
-            'num_epochs': 5000,
+            'num_epochs': 50000,
             'batch_size': 2,
             'learning_rate': 0.0001,
             'tile_size': 512,

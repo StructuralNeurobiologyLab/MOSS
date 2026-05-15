@@ -28,7 +28,7 @@ def get_default_config() -> dict:
         "checkpoint_path": "checkpoint.pth",
 
         # Training parameters
-        "num_epochs": 5000,
+        "num_epochs": 50000,
         "batch_size": 2,
         "tile_size": 256,
         "learning_rate": 0.0001,

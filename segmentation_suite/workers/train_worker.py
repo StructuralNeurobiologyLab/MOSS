@@ -887,7 +887,7 @@ class TrainWorker(QThread):
             val_images = self.config.get('val_images')
             val_masks = self.config.get('val_masks')
             checkpoint_path = self.config.get('checkpoint_path', 'checkpoint.pth')
-            num_epochs = self.config.get('num_epochs', 5000)
+            num_epochs = self.config.get('num_epochs', 50000)
             batch_size = self.config.get('batch_size', 2)
             tile_size = self.config.get('tile_size', 512)
             learning_rate = self.config.get('learning_rate', 1e-4)
