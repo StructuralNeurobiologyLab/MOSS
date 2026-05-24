@@ -1330,9 +1330,15 @@ class HomePage(QWidget):
                 total_size = sum(sum(f.stat().st_size for f in z.rglob('*') if f.is_file()) for z in valid_zarr)
                 size_str = f"{total_size / 1e9:.1f} GB" if total_size > 1e9 else f"{total_size / 1e6:.1f} MB"
 
-                # Check if Zarr might be incomplete (small size compared to TIFFs)
-                # Allow re-convert if TIFFs exist
-                if has_tiffs_for_conversion and total_size < 100 * 1e6:  # Less than 100MB suggests incomplete
+                # Check if pyramids are missing (takes priority over re-convert)
+                needs_pyramids = self._check_zarr_missing_pyramids(valid_zarr[0])
+
+                if needs_pyramids:
+                    self.zarr_card.set_status(
+                        True, f"{len(valid_zarr)} Zarr volume(s), {size_str} (no pyramids)",
+                        show_action=True, action_override="Generate Pyramids"
+                    )
+                elif has_tiffs_for_conversion and total_size < 100 * 1e6:  # Less than 100MB suggests incomplete
                     self.zarr_card.set_status(
                         True, f"{size_str} (may be incomplete)",
                         show_action=True, show_secondary=True,
@@ -1346,15 +1352,7 @@ class HomePage(QWidget):
                         action_override="Re-convert"
                     )
                 else:
-                    # No TIFFs, just show Zarr info — check if pyramids are missing
-                    needs_pyramids = self._check_zarr_missing_pyramids(valid_zarr[0])
-                    if needs_pyramids:
-                        self.zarr_card.set_status(
-                            True, f"{len(valid_zarr)} Zarr volume(s), {size_str} (no pyramids)",
-                            show_action=True, action_override="Generate Pyramids"
-                        )
-                    else:
-                        self.zarr_card.set_status(True, f"{len(valid_zarr)} Zarr volume(s), {size_str}", show_action=False)
+                    self.zarr_card.set_status(True, f"{len(valid_zarr)} Zarr volume(s), {size_str}", show_action=False)
             else:
                 # Show both Convert (if TIFFs exist) and Load buttons
                 self.zarr_card.set_status(False, "No valid Zarr volumes", show_action=has_tiffs_for_conversion, show_secondary=True)
