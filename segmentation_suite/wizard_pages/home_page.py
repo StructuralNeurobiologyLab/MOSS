@@ -1673,6 +1673,7 @@ class HomePage(QWidget):
         class PyramidWorker(QThread):
             finished = pyqtSignal(bool, str)
             progress = pyqtSignal(str)
+            progress_percent = pyqtSignal(int, str)  # percent, status text
 
             def __init__(self, zarr_path):
                 super().__init__()
@@ -1704,16 +1705,20 @@ class HomePage(QWidget):
                     self.progress.emit(f"Source: {z_size}x{y_size}x{x_size}")
 
                     # Generate each level
-                    for factor in [2, 4, 8]:
-                        level_name = f"s{factor}"
-                        if level_name in group:
-                            self.progress.emit(f"Level {level_name} already exists, skipping")
-                            continue
+                    # Total work: sum of slices across all levels for progress
+                    levels_to_do = [(f, f"s{f}") for f in [2, 4, 8] if f"s{f}" not in group]
+                    total_slices_all = sum(z_size // f for f, _ in levels_to_do)
+                    slices_done = 0
 
+                    for factor, level_name in levels_to_do:
                         new_z = z_size // factor
                         new_y = y_size // factor
                         new_x = x_size // factor
                         self.progress.emit(f"Generating {level_name} ({new_z}x{new_y}x{new_x})...")
+                        self.progress_percent.emit(
+                            int(100 * slices_done / max(total_slices_all, 1)),
+                            f"Generating {level_name}..."
+                        )
 
                         # Create output array
                         out = group.create_dataset(
@@ -1735,7 +1740,10 @@ class HomePage(QWidget):
                             # Handle rounding
                             out[z_out] = downsampled[:new_y, :new_x].astype(source.dtype)
 
-                            if (z_out + 1) % 100 == 0:
+                            slices_done += 1
+                            if (z_out + 1) % 50 == 0:
+                                pct = int(100 * slices_done / max(total_slices_all, 1))
+                                self.progress_percent.emit(pct, f"{level_name}: {z_out+1}/{new_z}")
                                 self.progress.emit(f"  {level_name}: {z_out+1}/{new_z} slices")
 
                     self.finished.emit(True, "Pyramids generated successfully!")
@@ -1744,7 +1752,11 @@ class HomePage(QWidget):
 
         self._pyramid_worker = PyramidWorker(zarr_path)
         self._pyramid_worker.progress.connect(lambda msg: print(f"[Pyramids] {msg}"))
+        self._pyramid_worker.progress_percent.connect(
+            lambda pct, msg: self.zarr_card.set_progress(pct, msg)
+        )
         self._pyramid_worker.finished.connect(self._on_pyramid_generation_finished)
+        self.zarr_card.set_progress(0, "Starting pyramid generation...")
         self._pyramid_worker.start()
 
     def _on_pyramid_generation_finished(self, success: bool, message: str):
