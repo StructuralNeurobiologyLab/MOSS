@@ -1116,6 +1116,7 @@ class InteractiveTrainingPage(QWidget):
                 self._capture_current_slice_for_3d()
             self.save_current_slice()
             self.current_slice_index = value
+            self._evict_stale_image_cache()
             self._check_and_extend_window()
             self.load_current_slice()
 
@@ -2101,6 +2102,7 @@ class InteractiveTrainingPage(QWidget):
             # Preload target slice's mask NOW (highest priority)
             self._preload_mask_async(target_slice)
             self.current_slice_index = target_slice
+            self._evict_stale_image_cache()
             self._check_and_extend_window()
             # Queue directional prefetch BEFORE loading (prefetch backward)
             if hasattr(self.canvas, 'queue_directional_preload'):
@@ -2121,6 +2123,7 @@ class InteractiveTrainingPage(QWidget):
             # Preload target slice's mask NOW (highest priority)
             self._preload_mask_async(target_slice)
             self.current_slice_index = target_slice
+            self._evict_stale_image_cache()
             self._check_and_extend_window()
             # Queue directional prefetch BEFORE loading (prefetch forward)
             if hasattr(self.canvas, 'queue_directional_preload'):
@@ -2129,6 +2132,22 @@ class InteractiveTrainingPage(QWidget):
             self._preload_adjacent_masks(self.current_slice_index, direction=+1)
             self.load_current_slice()
             self._prefetch_adjacent_slices()
+
+    def _evict_stale_image_cache(self):
+        """In zarr mode, evict cached full-res slices that are far from current position.
+
+        Keeps only the current slice ± 2 to avoid unbounded RAM growth from
+        _load_adjacent_slices caching full-res slices during crop saving.
+        """
+        if not self.use_zarr:
+            return  # TIFF mode keeps everything cached — no eviction
+
+        keep_radius = 2
+        current = self.current_slice_index
+        to_evict = [idx for idx in self.images.keys()
+                    if abs(idx - current) > keep_radius]
+        for idx in to_evict:
+            del self.images[idx]
 
     def _prefetch_adjacent_slices(self):
         """Pre-fetch adjacent slices in background for 2.5D prediction."""
