@@ -1346,8 +1346,15 @@ class HomePage(QWidget):
                         action_override="Re-convert"
                     )
                 else:
-                    # No TIFFs, just show Zarr info
-                    self.zarr_card.set_status(True, f"{len(valid_zarr)} Zarr volume(s), {size_str}", show_action=False)
+                    # No TIFFs, just show Zarr info — check if pyramids are missing
+                    needs_pyramids = self._check_zarr_missing_pyramids(valid_zarr[0])
+                    if needs_pyramids:
+                        self.zarr_card.set_status(
+                            True, f"{len(valid_zarr)} Zarr volume(s), {size_str} (no pyramids)",
+                            show_action=True, action_override="Generate Pyramids"
+                        )
+                    else:
+                        self.zarr_card.set_status(True, f"{len(valid_zarr)} Zarr volume(s), {size_str}", show_action=False)
             else:
                 # Show both Convert (if TIFFs exist) and Load buttons
                 self.zarr_card.set_status(False, "No valid Zarr volumes", show_action=has_tiffs_for_conversion, show_secondary=True)
@@ -1508,9 +1515,14 @@ class HomePage(QWidget):
                     "No TIFF files found in selected directory")
 
     def _on_convert_to_zarr(self):
-        """Handle Convert to Zarr button click."""
+        """Handle Convert to Zarr / Generate Pyramids button click."""
         if not self.project_dir:
             QMessageBox.warning(self, "No Project", "Please load or create a project first.")
+            return
+
+        # Check if this is a "Generate Pyramids" action
+        if self.zarr_card.action_btn and self.zarr_card.action_btn.text() == "Generate Pyramids":
+            self._generate_pyramids()
             return
 
         # Look for TIFF directories - check raw_images_dir from config
@@ -1608,6 +1620,142 @@ class HomePage(QWidget):
                         print(f"Warning: Could not delete {zarr_dir}: {e}")
 
             self._start_zarr_conversion(tiff_source)
+
+    def _check_zarr_missing_pyramids(self, zarr_path) -> bool:
+        """Check if a zarr volume is missing pyramid/downsampled levels."""
+        try:
+            import zarr
+            group = zarr.open_group(str(zarr_path), mode='r')
+            attrs = dict(group.attrs) if hasattr(group, 'attrs') else {}
+
+            # Has multiscales metadata = has pyramids
+            if 'multiscales' in attrs:
+                return False
+
+            # Check for standard pyramid paths
+            standard_paths = ['0', 's1', 's2', 's3']
+            found_levels = sum(1 for p in standard_paths if p in group)
+            if found_levels >= 2:
+                return False
+
+            # Only a single array (like 'volume') = missing pyramids
+            return True
+        except Exception:
+            return False
+
+    def _generate_pyramids(self):
+        """Generate 2x, 4x, 8x downsampled pyramid levels for the zarr volume."""
+        zarr_dirs = list(self.project_dir.glob("**/*.zarr"))
+        valid_zarr = [z for z in zarr_dirs if (z / '.zarray').exists() or any(z.glob('*/.zarray')) or any(z.glob('*/zarr.json'))]
+
+        if not valid_zarr:
+            QMessageBox.warning(self, "No Zarr", "No valid Zarr volume found.")
+            return
+
+        zarr_path = valid_zarr[0]
+
+        reply = QMessageBox.question(
+            self, "Generate Pyramids",
+            f"Generate 2x, 4x, and 8x downsampled pyramid levels for:\n"
+            f"{zarr_path.name}\n\n"
+            "This may take a while for large volumes but will greatly\n"
+            "improve navigation and rendering performance.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Run pyramid generation in a thread
+        self.zarr_card.set_status(True, "Generating pyramids...", show_action=False)
+
+        from PyQt6.QtCore import QThread, pyqtSignal
+
+        class PyramidWorker(QThread):
+            finished = pyqtSignal(bool, str)
+            progress = pyqtSignal(str)
+
+            def __init__(self, zarr_path):
+                super().__init__()
+                self.zarr_path = zarr_path
+
+            def run(self):
+                try:
+                    import zarr
+                    import numpy as np
+                    from scipy.ndimage import zoom
+
+                    self.progress.emit("Opening zarr volume...")
+                    group = zarr.open_group(str(self.zarr_path), mode='r+')
+
+                    # Find the source array
+                    source_key = None
+                    for key in group.keys():
+                        item = group[key]
+                        if isinstance(item, zarr.Array) and len(item.shape) == 3:
+                            source_key = key
+                            break
+
+                    if source_key is None:
+                        self.finished.emit(False, "No 3D array found in zarr")
+                        return
+
+                    source = group[source_key]
+                    z_size, y_size, x_size = source.shape
+                    self.progress.emit(f"Source: {z_size}x{y_size}x{x_size}")
+
+                    # Generate each level
+                    for factor in [2, 4, 8]:
+                        level_name = f"s{factor}"
+                        if level_name in group:
+                            self.progress.emit(f"Level {level_name} already exists, skipping")
+                            continue
+
+                        new_z = z_size // factor
+                        new_y = y_size // factor
+                        new_x = x_size // factor
+                        self.progress.emit(f"Generating {level_name} ({new_z}x{new_y}x{new_x})...")
+
+                        # Create output array
+                        out = group.create_dataset(
+                            level_name,
+                            shape=(new_z, new_y, new_x),
+                            chunks=(1, min(1024, new_y), min(1024, new_x)),
+                            dtype=source.dtype,
+                        )
+
+                        # Process slice by slice (memory efficient)
+                        for z_out in range(new_z):
+                            z_in = z_out * factor
+                            # Average 'factor' slices together
+                            z_end = min(z_in + factor, z_size)
+                            chunk = np.array(source[z_in:z_end], dtype=np.float32)
+                            avg_slice = chunk.mean(axis=0)
+                            # Downsample XY
+                            downsampled = zoom(avg_slice, 1.0 / factor, order=1)
+                            # Handle rounding
+                            out[z_out] = downsampled[:new_y, :new_x].astype(source.dtype)
+
+                            if (z_out + 1) % 100 == 0:
+                                self.progress.emit(f"  {level_name}: {z_out+1}/{new_z} slices")
+
+                    self.finished.emit(True, "Pyramids generated successfully!")
+                except Exception as e:
+                    self.finished.emit(False, str(e))
+
+        self._pyramid_worker = PyramidWorker(zarr_path)
+        self._pyramid_worker.progress.connect(lambda msg: print(f"[Pyramids] {msg}"))
+        self._pyramid_worker.finished.connect(self._on_pyramid_generation_finished)
+        self._pyramid_worker.start()
+
+    def _on_pyramid_generation_finished(self, success: bool, message: str):
+        """Handle pyramid generation completion."""
+        if success:
+            QMessageBox.information(self, "Pyramids Generated", message)
+        else:
+            QMessageBox.warning(self, "Pyramid Generation Failed", f"Error: {message}")
+        self._scan_project()
 
     def _on_load_existing_zarr(self):
         """Handle Load Existing Zarr button click."""

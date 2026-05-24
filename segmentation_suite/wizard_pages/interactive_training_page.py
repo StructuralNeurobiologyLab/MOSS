@@ -1550,6 +1550,16 @@ class InteractiveTrainingPage(QWidget):
                     self.current_slice_index = max(0, min(saved_index, num_slices - 1))
 
                     print(f"[Training] Initialized {num_slices} zarr slices, starting at slice {self.current_slice_index}")
+
+                    # Warn if zarr lacks pyramid levels
+                    if self.zarr_source._missing_pyramids:
+                        QMessageBox.warning(
+                            self, "Missing Pyramid Levels",
+                            "This Zarr volume has no downsampled pyramid levels.\n\n"
+                            "Navigation and rendering may be slow at zoomed-out views.\n"
+                            "Use the 'Generate Pyramids' button on the Home tab to create "
+                            "2x, 4x, and 8x downsampled levels for better performance."
+                        )
                 except Exception as e:
                     print(f"[Training] Failed to load Zarr store: {e}")
                     self.use_zarr = False

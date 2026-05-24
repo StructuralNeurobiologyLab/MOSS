@@ -45,6 +45,7 @@ class ZarrImageSource:
         # Discover pyramid structure
         self.pyramid_paths = []  # List of dataset paths (e.g., ['0', 's1', 's2', 's3'])
         self.downsample_factors = []  # Downsample factor for each level
+        self._missing_pyramids = False  # True if only full-res found (no downsampled levels)
         self._discover_pyramid_levels()
 
         # Store volume metadata
@@ -175,10 +176,25 @@ class ZarrImageSource:
                 self.pyramid_paths = ['0']
                 self.downsample_factors = [1]
 
+            # Final fallback: find any array in the group (e.g. 'volume')
+            if not self.pyramid_paths:
+                import zarr as zarr_module
+                for key in self.zarr_group.keys():
+                    item = self.zarr_group[key]
+                    if isinstance(item, zarr_module.Array) and len(item.shape) >= 2:
+                        self.pyramid_paths = [key]
+                        self.downsample_factors = [1]
+                        self._missing_pyramids = True
+                        print(f"[ZarrImageSource] WARNING: No standard pyramid structure found.")
+                        print(f"[ZarrImageSource] Using array '{key}' as single full-res level.")
+                        print(f"[ZarrImageSource] Performance may be slow without downsampled levels.")
+                        break
+
         if self.pyramid_paths:
-            print(f"[ZarrImageSource] Discovered {len(self.pyramid_paths)} pyramid levels:")
-            for path, factor in zip(self.pyramid_paths, self.downsample_factors):
-                print(f"  {path}: {factor}x downsample")
+            if not getattr(self, '_missing_pyramids', False):
+                print(f"[ZarrImageSource] Discovered {len(self.pyramid_paths)} pyramid levels:")
+                for path, factor in zip(self.pyramid_paths, self.downsample_factors):
+                    print(f"  {path}: {factor}x downsample")
 
     def _load_metadata(self):
         """Load volume metadata from the first pyramid level."""
