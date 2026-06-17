@@ -7,12 +7,40 @@ MOSS-lite is the first version of MOSS and my personal copy. All future work and
 ## Features
 
 - **Interactive Training**: Paint masks on images and train U-Net models in real-time
-- **Multiple Architectures**: UNet, UNetDeep, UNetDeepDice, 2.5D models
+- **Multiple Architectures**: Standard UNet plus a family of "Deep Dice v2" 2D and 2.5D models (see [Architectures](#architectures))
+- **Large Volumes (OME-Zarr / Pyramids)**: Load multiscale `.zarr` stores with automatic resolution selection by zoom level, or generate pyramids from TIFF stacks (see [Loading Data](#loading-data))
+- **Selectable Crop Size**: Train at 128, 256, or 512 px tiles
 - **Live Predictions**: See model predictions as you work
 - **Refiner Mode**: Train a refinement model that learns from your edits
-- **Batch Processing**: Reslice, predict, and vote across multiple views
+- **Subprojects**: Organize multiple labels/targets within a single project
+- **Reslice & Voting**: Generate orthogonal/diagonal views and combine predictions across them for consensus segmentation
 - **Mask Editing Tools**: Brush, eraser, fill, and component-based editing
 - **Multi-User Training**: Collaborate with others anywhere (requires relay server)
+
+## Architectures
+
+MOSS ships several model architectures, selectable from the training UI:
+
+| Architecture | Notes |
+|---|---|
+| **UNet (Standard)** | Baseline 2D U-Net. |
+| **UNet Deep Dice v2 (Stable)** | Recommended default. Combined BCE+Dice loss, gradient clipping, robust resume. |
+| **UNet Deep Dice 2.5D v2 (Stable)** | 2.5D variant taking 3 z-slices (z−3, z, z+3) as input channels. |
+| **UNet Deep 2.5D v2 (11-slice)** | Wider z-context: 11 channels spanning z−10…z+10 (every 2nd slice). |
+| **UNet Deep 2.5D v2 (11-slice + Z-coord)** | As above, plus a z-coordinate channel encoding the slice's normalized depth — useful when appearance varies systematically with depth. |
+
+The "v2" models are recommended for new projects. (A few additional experimental architectures exist in the codebase but are hidden from the UI.)
+
+## Loading Data
+
+MOSS reads both image stacks and chunked volumes:
+
+- **TIFF stacks** (`.tif`, `.tiff`), plus PNG and JPEG. Single-channel grayscale is recommended.
+- **OME-Zarr / multiscale pyramids** (`.zarr` directories, zarr v2 and v3). MOSS reads the `multiscales` metadata and automatically renders from the appropriate pyramid level for the current zoom, so very large volumes stay responsive.
+
+### Generating pyramids from TIFF
+
+For large datasets, convert a TIFF stack to a pyramidal OME-Zarr from the home screen via **Generate Pyramids**. This writes a multi-level (4-level) OME-Zarr store; subsequent loads use the downsampled levels when zoomed out. Volumes without a pyramid structure still load via a zarr fallback path.
 
 ## Installation
 
@@ -125,28 +153,38 @@ python -m segmentation_suite
 | S | Toggle predictions |
 | Space | Accept hovered prediction component |
 | Shift + Space | Accept ALL predictions (replace mask) |
-| Tab | Capture crop for training (refiner mode) |
+| Tab | Capture crop for training |
 | Ctrl + S | Save project |
 | Ctrl + Z | Undo |
 | +/- | Zoom in/out |
+| [ / ] | Decrease / increase brush size |
 | Shift + Scroll | Adjust brush size |
 
 ## Project Structure
 
-When you create a project, the following folders are created:
+When you create a project, MOSS lays out roughly the following:
 
 ```
 project_folder/
-├── project_config.json    # Project settings
-├── masks/                 # Saved masks (mask_00000.tif, etc.)
-├── train_images/          # Training image crops
-├── train_masks/           # Training mask crops
-├── checkpoint_*.pth       # Model checkpoints (per architecture)
-├── refiner_images/        # Refiner training data
-├── refiner_masks_before/  # Mask state before edits
-├── refiner_masks_after/   # Mask state after edits
-└── refiner_checkpoint.pth # Refiner model checkpoint
+├── project.json              # Project settings
+├── masks/                    # Saved masks (mask_00000.tif, etc.)
+├── train_images/             # Training image crops (256 px default)
+├── train_masks/              # Training mask crops (256 px default)
+├── train_images_128/ 512/    # Crop-size-specific folders (when 128/512 selected)
+├── train_masks_128/ 512/     #   (mirrors train_images_*)
+├── train_images_25d/ ...     # 2.5D / 11-slice variants, per crop size
+├── checkpoint*.pth           # Model checkpoints (per architecture)
+├── refiner_images/           # Refiner training data
+├── refiner_masks_before/     # Mask state before edits
+├── refiner_masks_after/      # Mask state after edits
+└── refiner_checkpoint.pth    # Refiner model checkpoint
 ```
+
+Notes:
+
+- The project config file is named **`project.json`**.
+- Training data is organized **per crop size**: the default 256 px uses `train_images`/`train_masks`, while 128 and 512 px get suffixed folders (`train_images_128`, `train_images_512`, …). 2.5D architectures use parallel `_25d` / `_dwarf25d` folders, and 3D uses `train_images_3d` / `train_masks_3d`.
+- Projects that use **subprojects** nest the per-label data under `subprojects/<name>/`, each with its own `project.json`, `masks/`, and training folders.
 
 ## Requirements
 
@@ -180,7 +218,7 @@ Reduce batch size in the training settings or use a smaller tile size.
 
 ### Images not loading
 
-Supported formats: TIFF (.tif, .tiff), PNG, JPEG. For best results, use single-channel grayscale TIFF images.
+Supported formats: TIFF (.tif, .tiff), PNG, JPEG, and OME-Zarr (`.zarr`) stores. For best results, use single-channel grayscale images. See [Loading Data](#loading-data) for large-volume / pyramid handling.
 
 ### PyQt6 on Linux clusters (`undefined symbol: FT_Get_Colorline_Stops`)
 
