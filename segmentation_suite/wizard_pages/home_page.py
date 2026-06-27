@@ -1483,6 +1483,22 @@ class HomePage(QWidget):
             # User declined, proceed anyway (might be slow)
             self.start_training.emit()
 
+    def _clear_stale_data(self):
+        """Remove old raw_data.zarr and clear raw_images_dir from config on re-import."""
+        import shutil
+        old_zarr = self.project_dir / 'raw_data.zarr'
+        if old_zarr.exists() or old_zarr.is_symlink():
+            print(f"[Import] Removing stale zarr: {old_zarr}")
+            if old_zarr.is_symlink():
+                old_zarr.unlink()
+            else:
+                shutil.rmtree(old_zarr)
+        # Clear config reference
+        if 'raw_images_dir' in self._config:
+            self._config.pop('raw_images_dir')
+            from ..project_config import save_project_config
+            save_project_config(str(self.project_dir), self._config)
+
     def _on_import_data(self):
         """Handle Import Data button click - opens file dialog for TIFFs or Zarr."""
         if not self.project_dir:
@@ -1510,6 +1526,8 @@ class HomePage(QWidget):
         # Check for TIFFs
         tiff_files = list(path.glob("*.tif")) + list(path.glob("*.tiff"))
         if tiff_files:
+            # Clear old data references before setting new ones
+            self._clear_stale_data()
             # Store as raw_images_dir in config (reference, don't copy)
             self._config['raw_images_dir'] = str(path)
             from ..project_config import save_project_config
@@ -1806,6 +1824,9 @@ class HomePage(QWidget):
                 f"A valid Zarr should contain a .zarray (v2) or zarr.json (v3) file."
             )
             return
+
+        # Clear old data before linking new zarr
+        self._clear_stale_data()
 
         # Use 'raw_data.zarr' as the canonical name in the project
         dest_name = 'raw_data.zarr' if zarr_path.name != 'raw_data.zarr' else zarr_path.name
