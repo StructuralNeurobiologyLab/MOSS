@@ -652,7 +652,7 @@ class HomePage(QWidget):
         data_label.setMinimumWidth(scaled(120))
         data_label.setStyleSheet("color: #cccccc;")
         self.raw_data_input = QLineEdit()
-        self.raw_data_input.setPlaceholderText("(Optional) TIFF images folder")
+        self.raw_data_input.setPlaceholderText("(Optional) TIFF folder or Zarr volume")
         self.raw_data_input.setStyleSheet("""
             QLineEdit {
                 background-color: #3d3d3d;
@@ -957,7 +957,7 @@ class HomePage(QWidget):
 
     def _browse_raw_data(self):
         """Browse for raw data directory."""
-        folder = QFileDialog.getExistingDirectory(self, "Select TIFF Images Folder")
+        folder = QFileDialog.getExistingDirectory(self, "Select TIFF Folder or Zarr Volume")
         if folder:
             self.raw_data_input.setText(folder)
 
@@ -1484,33 +1484,44 @@ class HomePage(QWidget):
             self.start_training.emit()
 
     def _on_import_data(self):
-        """Handle Import Data button click - opens file dialog."""
+        """Handle Import Data button click - opens file dialog for TIFFs or Zarr."""
         if not self.project_dir:
             QMessageBox.warning(self, "No Project", "Please load or create a project first.")
             return
 
         path = QFileDialog.getExistingDirectory(
-            self, "Select TIFF Directory or Project Folder",
+            self, "Select Data Folder (TIFF directory or Zarr volume)",
             str(self.project_dir)
         )
-        if path:
-            path = Path(path)
-            tiff_files = list(path.glob("*.tif")) + list(path.glob("*.tiff"))
-            if tiff_files:
-                # Create a 'train_images' subdirectory in project and copy
-                data_dir = self.project_dir / "train_images"
-                data_dir.mkdir(parents=True, exist_ok=True)
-                import shutil
-                for f in tiff_files:
-                    dest = data_dir / f.name
-                    if not dest.exists():
-                        shutil.copy2(f, dest)
-                self._scan_project()
-                QMessageBox.information(self, "Import Complete",
-                    f"Imported {len(tiff_files)} TIFF files to {data_dir}")
-            else:
-                QMessageBox.warning(self, "No TIFF Files",
-                    "No TIFF files found in selected directory")
+        if not path:
+            return
+
+        path = Path(path)
+
+        # Check if selected path is a Zarr volume
+        is_zarr = (path.suffix == '.zarr' or (path / '.zarray').exists()
+                   or (path / '.zgroup').exists() or (path / 'zarr.json').exists())
+
+        if is_zarr:
+            # Link/copy the Zarr volume into the project
+            self._link_zarr_to_project(path)
+            return
+
+        # Check for TIFFs
+        tiff_files = list(path.glob("*.tif")) + list(path.glob("*.tiff"))
+        if tiff_files:
+            # Store as raw_images_dir in config (reference, don't copy)
+            self._config['raw_images_dir'] = str(path)
+            from ..project_config import save_project_config
+            save_project_config(str(self.project_dir), self._config)
+            self._scan_project()
+            QMessageBox.information(self, "Data Linked",
+                f"Linked {len(tiff_files)} TIFF files from:\n{path}\n\n"
+                "To use with MOSS, convert to Zarr using the Zarr Volume card below.")
+        else:
+            QMessageBox.warning(self, "No Data Found",
+                "No TIFF files or Zarr volume found in selected directory.\n\n"
+                "Select a folder containing .tif/.tiff files, or a .zarr directory.")
 
     def _on_convert_to_zarr(self):
         """Handle Convert to Zarr / Generate Pyramids button click."""
@@ -1543,29 +1554,26 @@ class HomePage(QWidget):
         if not tiff_dirs:
             # Ask user to select a directory
             path = QFileDialog.getExistingDirectory(
-                self, "Select TIFF Directory to Convert",
+                self, "Select TIFF Directory or Zarr Volume",
                 str(self.project_dir)
             )
             if path:
                 path_obj = Path(path)
 
-                # Check if this is already a Zarr directory
-                if path_obj.suffix == '.zarr' or (path_obj / '.zgroup').exists():
-                    QMessageBox.information(self, "Already Zarr Format",
-                        f"The selected directory is already in Zarr format:\n{path_obj.name}\n\n"
-                        "No conversion needed. If you want to use this Zarr volume, "
-                        "create a symbolic link named 'raw_data.zarr' in your project directory.")
+                # Check if this is already a Zarr directory — link it instead
+                is_zarr = (path_obj.suffix == '.zarr' or (path_obj / '.zgroup').exists()
+                           or (path_obj / 'zarr.json').exists() or (path_obj / '.zarray').exists())
+                if is_zarr:
+                    self._link_zarr_to_project(path_obj)
                     return
 
                 tiff_files = list(path_obj.glob("*.tif")) + list(path_obj.glob("*.tiff"))
                 if tiff_files:
                     tiff_dirs.append(path)
                 else:
-                    QMessageBox.warning(self, "No TIFF Files",
-                        "No TIFF files found in selected directory.\n\n"
-                        "Note: This function converts TIFF images to Zarr format. "
-                        "If you already have a Zarr volume, link it as 'raw_data.zarr' "
-                        "in your project directory instead.")
+                    QMessageBox.warning(self, "No Data Found",
+                        "No TIFF files or Zarr volume found in selected directory.\n\n"
+                        "Select a folder containing .tif/.tiff files or a .zarr directory.")
                     return
             else:
                 return
@@ -1782,10 +1790,15 @@ class HomePage(QWidget):
         if not path:
             return
 
-        zarr_path = Path(path)
+        self._link_zarr_to_project(Path(path))
 
+    def _link_zarr_to_project(self, zarr_path: Path):
+        """Validate and link/copy a Zarr volume into the project."""
         # Validate it's a Zarr volume (v2 uses .zarray, v3 uses zarr.json)
-        is_valid_zarr = (zarr_path / '.zarray').exists() or any(zarr_path.glob('*/.zarray')) or any(zarr_path.glob('*/zarr.json'))
+        is_valid_zarr = ((zarr_path / '.zarray').exists()
+                         or any(zarr_path.glob('*/.zarray'))
+                         or any(zarr_path.glob('*/zarr.json'))
+                         or (zarr_path / 'zarr.json').exists())
         if not is_valid_zarr:
             QMessageBox.warning(
                 self, "Invalid Zarr",
@@ -1794,13 +1807,20 @@ class HomePage(QWidget):
             )
             return
 
-        # Copy or symlink to project directory
-        dest_path = self.project_dir / zarr_path.name
+        # Use 'raw_data.zarr' as the canonical name in the project
+        dest_name = 'raw_data.zarr' if zarr_path.name != 'raw_data.zarr' else zarr_path.name
+        dest_path = self.project_dir / dest_name
+
+        # Skip if already pointing to the same location
+        if dest_path.exists() and dest_path.is_symlink() and dest_path.resolve() == zarr_path.resolve():
+            QMessageBox.information(self, "Already Linked",
+                f"This Zarr volume is already linked to the project.")
+            return
 
         if dest_path.exists():
             reply = QMessageBox.question(
                 self, "Zarr Exists",
-                f"'{zarr_path.name}' already exists in project.\n\nReplace it?",
+                f"'{dest_name}' already exists in project.\n\nReplace it?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
@@ -1818,7 +1838,7 @@ class HomePage(QWidget):
             dest_path.symlink_to(zarr_path)
             QMessageBox.information(
                 self, "Zarr Loaded",
-                f"Linked Zarr volume: {zarr_path.name}\n\n"
+                f"Linked Zarr volume as {dest_name}\n\n"
                 f"Original location: {zarr_path}"
             )
         except OSError:
@@ -1833,9 +1853,14 @@ class HomePage(QWidget):
             if reply == QMessageBox.StandardButton.Yes:
                 import shutil
                 shutil.copytree(zarr_path, dest_path)
-                QMessageBox.information(self, "Zarr Copied", f"Copied Zarr volume: {zarr_path.name}")
+                QMessageBox.information(self, "Zarr Copied", f"Copied Zarr volume: {dest_name}")
             else:
                 return
+
+        # Update config to point to the zarr
+        self._config['raw_images_dir'] = str(dest_path)
+        from ..project_config import save_project_config
+        save_project_config(str(self.project_dir), self._config)
 
         # Refresh to show the new Zarr
         self._scan_project()
