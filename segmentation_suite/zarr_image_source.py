@@ -164,21 +164,41 @@ class ZarrImageSource:
 
                 self.downsample_factors.append(scale_factor)
         else:
-            # Fallback: check for common pyramid level names
-            common_paths = ['0', 's1', 's2', 's3', 's4']
-            for i, path in enumerate(common_paths):
-                if path in self.zarr_group:
-                    self.pyramid_paths.append(path)
-                    self.downsample_factors.append(2 ** i)
+            import zarr as zarr_module
+
+            # Check for 'volume' + sN naming (e.g. volume, s2, s4, s8)
+            if 'volume' in self.zarr_group:
+                item = self.zarr_group['volume']
+                if isinstance(item, zarr_module.Array) and len(item.shape) >= 2:
+                    self.pyramid_paths.append('volume')
+                    self.downsample_factors.append(1)
+                    # Look for sN downsampled levels relative to volume
+                    vol_shape = item.shape
+                    for sn in ['s2', 's4', 's8', 's16']:
+                        if sn in self.zarr_group:
+                            sn_item = self.zarr_group[sn]
+                            if isinstance(sn_item, zarr_module.Array) and len(sn_item.shape) >= 2:
+                                # Compute actual downsample factor from shape ratio
+                                factor = vol_shape[0] // sn_item.shape[0]
+                                if factor > 1:
+                                    self.pyramid_paths.append(sn)
+                                    self.downsample_factors.append(factor)
+
+            # Fallback: check for standard numeric pyramid level names
+            if not self.pyramid_paths:
+                common_paths = ['0', 's1', 's2', 's3', 's4']
+                for i, path in enumerate(common_paths):
+                    if path in self.zarr_group:
+                        self.pyramid_paths.append(path)
+                        self.downsample_factors.append(2 ** i)
 
             # Last resort: use only level '0' if it exists
             if not self.pyramid_paths and '0' in self.zarr_group:
                 self.pyramid_paths = ['0']
                 self.downsample_factors = [1]
 
-            # Final fallback: find any array in the group (e.g. 'volume')
+            # Final fallback: find any array in the group
             if not self.pyramid_paths:
-                import zarr as zarr_module
                 for key in self.zarr_group.keys():
                     item = self.zarr_group[key]
                     if isinstance(item, zarr_module.Array) and len(item.shape) >= 2:
