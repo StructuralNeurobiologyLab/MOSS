@@ -47,11 +47,14 @@ dependencies = [
     "zarr>=3.0.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
 [project.scripts]
 moss = "segmentation_suite.launcher:main"
 
 [project.urls]
-Homepage = "https://github.com/nelsmedina/MOSS_full"
+Homepage = "https://github.com/StructuralNeurobiologyLab/MOSS"
 
 [tool.setuptools.packages.find]
 where = ["."]

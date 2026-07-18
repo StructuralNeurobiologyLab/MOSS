@@ -2,7 +2,8 @@
 
 A PyQt6-based interactive segmentation tool with U-Net training, prediction, and mask editing capabilities. MOSS provides an intuitive interface for training deep learning models on microscopy images through direct annotation and real-time feedback.
 
-MOSS-lite is the first version of MOSS and my personal copy. All future work and updates will be reflected in https://github.com/StructuralNeurobiologyLab/MOSS . 
+This is the actively maintained MOSS repository: https://github.com/StructuralNeurobiologyLab/MOSS
+It supersedes the original *MOSS-lite* prototype; all ongoing work lands here.
 
 ## Features
 
@@ -140,6 +141,18 @@ Or run as a Python module:
 python -m segmentation_suite
 ```
 
+### Try it on real data (no annotation needed)
+
+To verify a complete pipeline end to end in a few minutes, use the worked example
+in [`examples/fafb_lsd_demo/`](examples/fafb_lsd_demo/). It downloads a small public
+FAFB electron-microscopy block, builds a MOSS project preconfigured with the bundled
+pretrained LSD membrane model, and renders a preview:
+
+```bash
+pip install -r examples/fafb_lsd_demo/requirements.txt
+python examples/fafb_lsd_demo/build_demo.py --preset quick --out ./demo_project
+```
+
 ## Keyboard Shortcuts
 
 | Key | Action |
@@ -256,7 +269,7 @@ If you use MOSS in your research, please cite:
 
 ```
 Medina, N. (2025). MOSS: Microscopy Oriented Segmentation with Supervision [Computer software].
-https://github.com/nelsmedina/MOSS
+https://github.com/StructuralNeurobiologyLab/MOSS
 ```
 
 ## License
