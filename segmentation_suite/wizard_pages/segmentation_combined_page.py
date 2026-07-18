@@ -1996,11 +1996,23 @@ class SegmentationCombinedPage(QWidget):
         elif 'dice' in checkpoint_lower:
             architecture = 'unet_deep_dice'
 
+        # Larger patches = fewer forward passes, but a 1024 patch's activations
+        # overflow small-VRAM GPUs (<8 GB), forcing the driver to page GPU memory
+        # to system RAM (100% util but ~seconds/slice). Cap to 512 on such cards.
+        # Big GPUs and CPU keep 1024 (unchanged).
+        import torch as _torch
+        try:
+            _total_gb = (_torch.cuda.get_device_properties(0).total_memory / 1e9
+                         if _torch.cuda.is_available() else 999)
+        except Exception:
+            _total_gb = 999
+        _patch_size = 1024 if _total_gb >= 8 else 512
+
         predict_config = {
             'checkpoint_path': checkpoint_path,
             'architecture': architecture,
             'views': views,
-            'patch_size': 1024,  # Larger patches = fewer forward passes
+            'patch_size': _patch_size,
             'overlap': 64,
         }
 

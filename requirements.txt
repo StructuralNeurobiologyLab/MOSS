@@ -1,5 +1,11 @@
 # Core dependencies
-PyQt6>=6.4.0
+# PyQt6: wheels >=6.8 fail to import on Windows with
+#   "DLL load failed while importing QtCore: The specified procedure could not be found"
+# Pin Windows to the last known-good release (binding + Qt6 runtime kept in lockstep).
+# Other platforms track the latest 6.4+.
+PyQt6>=6.4.0; sys_platform != "win32"
+PyQt6==6.7.1; sys_platform == "win32"
+PyQt6-Qt6==6.7.1; sys_platform == "win32"
 numpy>=1.24.0
 scipy>=1.10.0
 Pillow>=9.0.0

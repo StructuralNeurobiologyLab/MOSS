@@ -204,6 +204,21 @@ If you get errors about PyQt6, try:
 pip install PyQt6 --force-reinstall
 ```
 
+### PyQt6 on Windows (`DLL load failed while importing QtCore: The specified procedure could not be found`)
+
+PyQt6 wheels **6.8 and newer fail to load on some Windows systems** with this error
+(it also appears as a failure importing `QtWidgets`). The dependency files pin Windows
+to the last known-good release, so a fresh install avoids it. If you hit it in an
+existing environment, pin the binding **and** the Qt6 runtime together:
+
+```bash
+pip install "PyQt6==6.7.1" "PyQt6-Qt6==6.7.1"
+```
+
+The conda-forge `pyqt6` build is an alternative, but note that older `conda`
+versions mis-detect the Windows build number (`__win=0`) and refuse to install
+recent `qtbase`; upgrading `conda` or using the pip pin above avoids that.
+
 ### PyTorch MPS issues on Mac
 
 For Apple Silicon Macs, ensure you have a recent PyTorch version:
