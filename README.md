@@ -44,9 +44,17 @@ For large datasets, convert a TIFF stack to a pyramidal OME-Zarr from the home s
 
 ## Installation
 
+### Recommended: let an AI coding agent set it up
 
+The quickest and most reliable way to get MOSS running — especially across
+platforms — is to point an AI coding agent (e.g. Claude Code) at this repository
+and ask it to install and launch MOSS. The agent reads `environment.yml` /
+`conda-lock.yml`, detects your OS and GPU, and works around the platform-specific
+quirks that otherwise trip up a manual install: Windows PyQt6 wheel failures,
+conda virtual-package (`__win`) detection, CUDA-vs-CPU PyTorch selection, and so
+on. To install by hand instead, use one of the options below.
 
-### Option 1: conda environment (Recommended)
+### Option 1: conda environment (recommended for manual setup)
 
 ```bash
 # Create environment from file
@@ -122,9 +130,9 @@ The fix is to replace the pip PyQt6 with the conda-forge build.
 conda env create -f environment.yml
 conda activate moss
 
-# 2. Replace pip PyQt6 with conda-forge version
+# 2. Replace pip PyQt6 with conda-forge version (kept below 6.8 to match the pins)
 pip uninstall -y PyQt6 PyQt6-Qt6 PyQt6-sip
-conda install -c conda-forge pyqt6
+conda install -c conda-forge "pyqt6<6.8"
 
 # 3. Install the package
 pip install -e .
@@ -210,7 +218,7 @@ Notes:
 ## Requirements
 
 - Python 3.9+
-- PyQt6 6.4+
+- PyQt6 6.4–6.7 (`< 6.8`; newer wheels have a Windows load bug and aren't lockable cross-platform)
 - PyTorch 2.0+
 - CUDA (optional, for GPU acceleration)
 - macOS MPS (optional, for Apple Silicon acceleration)
@@ -260,11 +268,11 @@ Supported formats: TIFF (.tif, .tiff), PNG, JPEG, and OME-Zarr (`.zarr`) stores.
 ### PyQt6 on Linux clusters (`undefined symbol: FT_Get_Colorline_Stops`)
 
 Pip-installed PyQt6 bundles binaries compiled against newer system libraries than most
-clusters have. Replace it with the conda-forge build:
+clusters have. Replace it with the conda-forge build (kept below 6.8 to match the pins):
 
 ```bash
 pip uninstall -y PyQt6 PyQt6-Qt6 PyQt6-sip
-conda install -c conda-forge pyqt6
+conda install -c conda-forge "pyqt6<6.8"
 ```
 
 ## Author
