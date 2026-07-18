@@ -588,7 +588,19 @@ class InteractiveTrainingPage(QWidget):
         self._pred_name_to_id = {}
         self._pred_id_to_name = {}
 
+        # Include pretrained models that are hidden from the trainable-architecture
+        # list (e.g. the LSD boundary/membrane model) so their ready-to-use
+        # predictions can be selected here and overlaid live on the raw data.
+        # NB: the module-level get_available_architectures() (from models.unet)
+        # takes no args, so query the registry directly for the hidden ones.
+        from ..models.architectures import (
+            is_pretrained_architecture,
+            get_available_architectures as _registry_architectures,
+        )
         architectures = get_available_architectures()
+        for arch_id, name in _registry_architectures(include_hidden=True).items():
+            if arch_id not in architectures and is_pretrained_architecture(arch_id):
+                architectures[arch_id] = name
 
         for arch_id, display_name in architectures.items():
             # Use shorter names for the smaller dropdown

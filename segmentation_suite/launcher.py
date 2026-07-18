@@ -409,8 +409,26 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _configure_stdio_utf8():
+    """Make stdout/stderr UTF-8 and tolerant of un-encodable characters.
+
+    Debug prints containing non-Latin-1 characters (e.g. the '->' arrow) otherwise
+    raise UnicodeEncodeError under a cp1252 console or whenever output is redirected
+    or piped — and if that happens inside a Qt paintEvent it can crash the GUI.
+    errors="replace" makes such prints lossy at worst, never fatal.
+    """
+    import sys as _sys
+    for stream in (_sys.stdout, _sys.stderr):
+        try:
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main():
     """Main entry point."""
+    _configure_stdio_utf8()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
