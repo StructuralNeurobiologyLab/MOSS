@@ -1431,12 +1431,16 @@ class SegmentationCombinedPage(QWidget):
             )
             return
 
-        # Model path
-        model_path = Path('/home/nmedina/projects/em-pipeline/pretrained_models/lsd_mtlsd_checkpoint.pth')
-        if not model_path.exists():
+        # Model path — resolve the pretrained LSD checkpoint shipped with MOSS
+        # via the architecture registry (portable across installs/platforms).
+        from ..models.architectures import get_pretrained_checkpoint
+        pretrained = get_pretrained_checkpoint('lsd_boundary_2d')
+        model_path = Path(pretrained) if pretrained else None
+        if model_path is None or not model_path.exists():
             QMessageBox.critical(
                 self, "Model Not Found",
-                f"LSD model not found at:\n{model_path}"
+                "Pretrained LSD model not found.\n\nExpected the checkpoint at "
+                "pretrained_models/lsd_mtlsd_checkpoint.pth in the MOSS install."
             )
             return
 
