@@ -964,13 +964,36 @@ class TrainingWizard(QMainWindow):
         # Emit signal to return to welcome page (when embedded in launcher)
         self.wizard_closed.emit()
 
+    def shutdown(self):
+        """Stop all background workers/sessions so the process can exit cleanly.
+
+        Safe to call more than once. Invoked on window close and by the parent
+        launcher's closeEvent — without this the training/predict QThreads keep
+        the process alive after the window is closed.
+        """
+        # Stop the training/prediction workers owned by the training page.
+        try:
+            if self.training_page:
+                self.training_page.cleanup()
+        except Exception as e:
+            print(f"[Wizard] Error cleaning up training page: {e}")
+        # Tear down any multi-user session.
+        if self._session_client:
+            try:
+                self._session_client.disconnect()
+            except Exception:
+                pass
+            self._session_client = None
+        if self._aggregation_server:
+            try:
+                self._aggregation_server.stop()
+            except Exception:
+                pass
+            self._aggregation_server = None
+
     def closeEvent(self, event):
         """Handle window close (when running standalone)."""
-        # Disconnect from session if connected
-        if self._session_client:
-            self._session_client.disconnect()
-        if self._aggregation_server:
-            self._aggregation_server.stop()
+        self.shutdown()
         self.wizard_closed.emit()
         event.accept()
 

@@ -395,6 +395,19 @@ class MainWindow(QMainWindow):
         if self._loading_overlay:
             self._loading_overlay.setGeometry(self.rect())
 
+    def closeEvent(self, event):
+        """Stop background workers on quit so the process exits cleanly.
+
+        The training/predict workers are QThreads that otherwise keep the
+        process alive after the window closes.
+        """
+        if self.training_wizard is not None:
+            try:
+                self.training_wizard.shutdown()
+            except Exception as e:
+                print(f"[MOSS] Error during shutdown: {e}")
+        super().closeEvent(event)
+
 
 def main():
     """Main entry point."""

@@ -12,7 +12,6 @@ It supersedes the original *MOSS-lite* prototype; all ongoing work lands here.
 - **Large Volumes (OME-Zarr / Pyramids)**: Load multiscale `.zarr` stores with automatic resolution selection by zoom level, or generate pyramids from TIFF stacks (see [Loading Data](#loading-data))
 - **Selectable Crop Size**: Train at 128, 256, or 512 px tiles
 - **Live Predictions**: See model predictions as you work
-- **Refiner Mode**: Train a refinement model that learns from your edits
 - **Subprojects**: Organize multiple labels/targets within a single project
 - **Reslice & Voting**: Generate orthogonal/diagonal views and combine predictions across them for consensus segmentation
 - **Mask Editing Tools**: Brush, eraser, fill, and component-based editing
@@ -186,11 +185,7 @@ project_folder/
 ├── train_images_128/ 512/    # Crop-size-specific folders (when 128/512 selected)
 ├── train_masks_128/ 512/     #   (mirrors train_images_*)
 ├── train_images_25d/ ...     # 2.5D / 11-slice variants, per crop size
-├── checkpoint*.pth           # Model checkpoints (per architecture)
-├── refiner_images/           # Refiner training data
-├── refiner_masks_before/     # Mask state before edits
-├── refiner_masks_after/      # Mask state after edits
-└── refiner_checkpoint.pth    # Refiner model checkpoint
+└── checkpoint*.pth           # Model checkpoints (per architecture)
 ```
 
 Notes:

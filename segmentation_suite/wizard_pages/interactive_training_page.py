@@ -1674,14 +1674,8 @@ class InteractiveTrainingPage(QWidget):
         if subproject_name == self._active_subproject:
             return
 
-        # Stop training if running
-        if self.train_worker and self.train_worker.isRunning():
-            self.train_worker.stop()
-            self.train_worker.wait(5000)
-            self.train_btn.setText("Start Training")
-            self.train_progress.setVisible(False)
-            self.arch_combo.setEnabled(True)
-            self.training_stopped.emit()
+        # Stop training if running (idempotent shared stop path)
+        self.stop_training(request_prediction=False)
 
         # Save current mask to disk before switching
         self.save_current_slice()
@@ -3128,10 +3122,55 @@ class InteractiveTrainingPage(QWidget):
             print(f"[Reset] Exception: {e}")
             QMessageBox.warning(self, "Error", f"Failed to archive model:\n{e}")
 
+    def stop_training(self, request_prediction: bool = True) -> bool:
+        """Stop the active training worker and reset the training UI.
+
+        Idempotent and safe to call whether or not training is running. This is
+        the single stop path shared by the Start/Stop toggle, project/subproject
+        switches, and shutdown, so worker teardown, the predict-worker GPU
+        hand-off, and the UI reset stay consistent (reviewer items 1/2/3/6).
+
+        Returns True if a running worker was stopped, else False.
+        """
+        worker = self.train_worker
+        if not (worker and worker.isRunning()):
+            return False
+
+        worker.stop()
+        # Never terminate() a CUDA thread — wait for the batch to finish naturally.
+        if not worker.wait(30000):
+            print("[Training] Worker still running after 30s, continuing anyway")
+
+        if hasattr(self, 'train_btn'):
+            self.train_btn.setText("Start Training")
+        if hasattr(self, 'train_progress'):
+            self.train_progress.setVisible(False)
+        if hasattr(self, 'arch_combo'):
+            self.arch_combo.setEnabled(True)  # Re-enable architecture selection
+
+        # Hand the GPU back to the predict worker.
+        if self.predict_worker:
+            self.predict_worker.set_training_active(False)
+
+        self.training_stopped.emit()
+
+        # Refresh the prediction with the latest checkpoint.
+        if request_prediction and self.show_predictions:
+            self._request_viewport_prediction(immediate=True)
+        return True
+
     def start_training(self):
-        """Start training worker."""
+        """Start the training worker, or stop it if it is already running."""
         if not self.project_dir:
             QMessageBox.warning(self, "Error", "No project directory set")
+            return
+
+        # Start/Stop toggle. This MUST come before the training-data check below
+        # so that "Stop Training" works even when the active project/subproject
+        # has no crops yet (e.g. immediately after switching projects) — otherwise
+        # Stop wrongly reports "No training data" and leaves the worker running.
+        if self.train_worker and self.train_worker.isRunning():
+            self.stop_training()
             return
 
         train_files = list(self.train_images_dir.glob("*.tif")) if self.train_images_dir else []
@@ -3140,24 +3179,6 @@ class InteractiveTrainingPage(QWidget):
             return
 
         from ..workers.train_worker import TrainWorker
-
-        if self.train_worker and self.train_worker.isRunning():
-            self.train_worker.stop()
-            # Never terminate() a CUDA thread — wait for batch to finish naturally
-            if not self.train_worker.wait(30000):
-                print("[Training] Worker still running after 30s, continuing anyway")
-            self.train_btn.setText("Start Training")
-            self.train_progress.setVisible(False)
-            self.arch_combo.setEnabled(True)  # Re-enable architecture selection
-            # Notify predict worker that training stopped - can use GPU now
-            if self.predict_worker:
-                self.predict_worker.set_training_active(False)
-            # Emit training stopped signal
-            self.training_stopped.emit()
-            # Request fresh prediction with main checkpoint
-            if self.show_predictions:
-                self._request_viewport_prediction(immediate=True)
-            return
 
         # Get architecture-specific checkpoint path
         checkpoint_path = self._get_checkpoint_path()
@@ -4056,16 +4077,10 @@ class InteractiveTrainingPage(QWidget):
         self.save_current_slice()
         self._save_project_config()
 
-        # Stop workers with timeouts to avoid hangs
-        if self.train_worker:
-            self.train_worker.stop()
-            # Never terminate() a CUDA thread — wait for batch to finish naturally
-            if not self.train_worker.wait(30000):
-                print("[Training] Worker still running after 30s during cleanup")
-            self.train_worker = None
-            # Notify predict worker that training stopped
-            if self.predict_worker:
-                self.predict_worker.set_training_active(False)
+        # Stop workers with timeouts to avoid hangs. Route the training worker
+        # through the shared stop path, then release the reference.
+        self.stop_training(request_prediction=False)
+        self.train_worker = None
 
         if self.predict_worker:
             self.predict_worker.stop()
