@@ -22,12 +22,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    # PyQt6 wheels >=6.8 fail to import on Windows ("DLL load failed while
-    # importing QtCore: The specified procedure could not be found"); pin
-    # Windows to the last known-good release. Other platforms track latest 6.4+.
-    "PyQt6>=6.4.0; sys_platform != 'win32'",
-    "PyQt6==6.7.1; sys_platform == 'win32'",
-    "PyQt6-Qt6==6.7.1; sys_platform == 'win32'",
+    # PyQt6 wheels >=6.8 fail to import on Windows (QtCore DLL load error) and
+    # their Qt6 runtime wheels are not lockable by conda-lock on Linux/macOS;
+    # cap below 6.8 on all platforms (binding + Qt6 runtime in the 6.7.x series).
+    "PyQt6>=6.4.0,<6.8",
+    "PyQt6-Qt6>=6.4.0,<6.8",
     "numpy>=1.24.0",
     "torch>=2.0.0",
     "torchvision>=0.15.0",

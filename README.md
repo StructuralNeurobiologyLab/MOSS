@@ -59,6 +59,19 @@ conda activate moss
 pip install -e .
 ```
 
+For a fully pinned, reproducible environment, install from the committed lock file
+instead of solving `environment.yml`:
+
+```bash
+conda-lock install --name moss conda-lock.yml
+conda activate moss
+pip install -e .
+```
+
+`conda-lock.yml` pins exact versions for `linux-64`, `osx-64`, `osx-arm64`, and
+`win-64`. Regenerate it after changing `environment.yml`:
+`conda-lock lock -f environment.yml -p linux-64 -p osx-64 -p osx-arm64 -p win-64`.
+
 ### Option 2: pip install
 
 #### Mac (Apple Silicon or Intel)
@@ -215,9 +228,10 @@ pip install PyQt6 --force-reinstall
 ### PyQt6 on Windows (`DLL load failed while importing QtCore: The specified procedure could not be found`)
 
 PyQt6 wheels **6.8 and newer fail to load on some Windows systems** with this error
-(it also appears as a failure importing `QtWidgets`). The dependency files pin Windows
-to the last known-good release, so a fresh install avoids it. If you hit it in an
-existing environment, pin the binding **and** the Qt6 runtime together:
+(it also appears as a failure importing `QtWidgets`). The dependency files cap PyQt6
+below 6.8 on all platforms (also required for a reproducible cross-platform
+`conda-lock`), so a fresh install avoids it. If you hit it in an existing
+environment, pin the binding **and** the Qt6 runtime together:
 
 ```bash
 pip install "PyQt6==6.7.1" "PyQt6-Qt6==6.7.1"
