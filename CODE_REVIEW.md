@@ -1,5 +1,40 @@
 # MOSS Code Review & Critique
 
+# July 2026 Follow-up
+
+*July 2026 — after a cross-platform install and bug-fix pass (commits `8de0ab6`…`8c006d3`).*
+
+## March concerns — where they stand now
+
+- **Worker coordination scattered** — *addressed.* The stop sequence (worker stop/wait, predict-worker GPU hand-off, UI reset, `training_stopped` signal) is consolidated into one idempotent `InteractiveTrainingPage.stop_training()`; `start_training`, `switch_subproject`, and `cleanup` all route through it. This closed a connected cluster of bugs: the app not quitting cleanly (`MainWindow` had no `closeEvent`, so training/predict QThreads kept the process alive), training continuing after a project switch, and "Stop Training" wrongly reporting "No training data" after a switch (the data check ran before the running-worker check).
+- **No tests** — *partially addressed.* Added `tests/test_project_config.py` (22 tests) over the pure config/path utilities flagged in March: default-merge, path resolution, subproject layout, `project_exists`. The stateful worker/subproject logic is still untested.
+- **`interactive_training_page.py` god object** — *unchanged.* Still ~3900 lines. Deliberately not refactored this pass (high risk, no rewrite requested).
+- **State tracked in too many places** — *unchanged.* The single-source-of-truth redesign was deferred. `stop_training()` removes one class of sync bug, but the redundant checkpoint/architecture state across root config, subproject config, page instance vars, and the predict worker remains.
+
+## New findings this pass
+
+### Cross-platform install was broken on Windows
+- PyQt6 wheels ≥6.8 fail to import on Windows (`DLL load failed while importing QtCore: The specified procedure could not be found`). Capped `PyQt6>=6.4.0,<6.8` across `environment.yml` / `requirements.txt` / `pyproject.toml`.
+- Recent `conda` mis-detects the Windows build number (`__win=0`), so conda-forge `qtbase` refuses to install — documented as a troubleshooting caveat.
+- Added a fully pinned multi-platform `conda-lock.yml` (linux-64 / osx-64 / osx-arm64 / win-64) for reproducible installs; the `<6.8` cap is also what makes the lock resolvable on Linux/macOS.
+
+### GPU multi-view prediction unusable on small cards
+- The Combined Segmentation multi-view predictor hardcoded a 1024-px patch. On <8 GB GPUs a batch overflows VRAM and the driver pages GPU memory to system RAM — 100% GPU utilisation but ~seconds per slice (slower than CPU). Now caps patch size to 512 on <8 GB GPUs; larger GPUs and CPU are unchanged.
+
+### Portability / documentation
+- LSD 2D preview used a hardcoded developer path (`/home/nmedina/...`); now resolves the bundled checkpoint via the architecture registry (`get_pretrained_checkpoint`).
+- Reconciled the citation and `pyproject` Homepage to the active repository, removed stale README content (vestigial `refiner_*` dirs, the removed "Refiner Mode" feature), and added a worked example (`examples/fafb_lsd_demo/`) that downloads a small public FAFB block, builds a MOSS project preconfigured with the bundled pretrained LSD membrane model, and renders a preview — a full pipeline a new user can verify in minutes.
+
+## Still open (tracked in TODO.md)
+
+- **LSD 3D "Run Segmentation" is genuinely broken, not just mis-wired.** `em_pipeline/pipeline.py`'s `SegmentationPipeline` imports `em_pipeline.strategies` and `em_pipeline.data.volume`, and **neither module exists in the repo**. The 3D watershed pipeline is incomplete. (The LSD 2D preview path works and does not use `SegmentationPipeline`.)
+- **Two reported runtime bugs still need a live repro** before a confident fix: loaded Zarr volumes becoming unavailable after project load, and trained-model predictions not appearing in the viewer (first suspects: the `show_predictions` toggle and whether the predict worker receives a checkpoint on project load — the latter is a symptom of the redundant-state issue above).
+- The structural items (god object, single source of truth) remain the main long-term risk, exactly as the March review predicted — the state-sync bugs fixed this pass are the kind it warned would keep appearing.
+
+---
+
+# March 2026 Review
+
 *March 2026*
 
 ## What Works Well
