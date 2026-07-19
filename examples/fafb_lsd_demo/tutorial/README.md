@@ -1,4 +1,4 @@
-# MOSS tutorial — from raw TIFFs to membrane predictions
+# MOSS tutorial — from raw TIFFs to predictions
 
 A complete, self-contained walkthrough of the MOSS workflow using a small block
 of real EM data that ships **inside this repo** — no download, no credentials, no
