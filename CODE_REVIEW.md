@@ -22,7 +22,7 @@
 - The Combined Segmentation multi-view predictor hardcoded a 1024-px patch. On <8 GB GPUs a batch overflows VRAM and the driver pages GPU memory to system RAM — 100% GPU utilisation but ~seconds per slice (slower than CPU). Now caps patch size to 512 on <8 GB GPUs; larger GPUs and CPU are unchanged.
 
 ### Portability / documentation
-- LSD 2D preview used a hardcoded developer path (`/home/nmedina/...`); now resolves the bundled checkpoint via the architecture registry (`get_pretrained_checkpoint`).
+- LSD 2D preview used a hardcoded absolute developer path; now resolves the bundled checkpoint via the architecture registry (`get_pretrained_checkpoint`).
 - Reconciled the citation and `pyproject` Homepage to the active repository, removed stale README content (vestigial `refiner_*` dirs, the removed "Refiner Mode" feature), and added a worked example (`examples/fafb_lsd_demo/`) that downloads a small public FAFB block, builds a MOSS project preconfigured with the bundled pretrained LSD membrane model, and renders a preview — a full pipeline a new user can verify in minutes.
 
 ## Still open (tracked in TODO.md)

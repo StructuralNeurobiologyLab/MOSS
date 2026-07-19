@@ -279,14 +279,23 @@ def predict_volume_2d(
 
 
 if __name__ == '__main__':
+    import argparse
+    from pathlib import Path
     import numpy as np
 
-    # Test loading
-    model_path = '/home/nmedina/projects/em-pipeline/pretrained_models/lsd_mtlsd_checkpoint.pth'
+    # Default to the checkpoint bundled with the repo; no hardcoded personal paths.
+    default_ckpt = Path(__file__).resolve().parent.parent / "pretrained_models" / "lsd_mtlsd_checkpoint.pth"
+    ap = argparse.ArgumentParser(description="Smoke-test the MtLSD compatibility loader.")
+    ap.add_argument("--model", default=str(default_ckpt),
+                    help="MtLSD checkpoint path (default: the bundled pretrained model).")
+    ap.add_argument("--volume", default=None,
+                    help="Optional .npy EM volume to run a real prediction on.")
+    args = ap.parse_args()
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    print(f"Loading model from {model_path}")
-    model = MtLsdModel.from_pretrained(model_path, device)
+    print(f"Loading model from {args.model}")
+    model = MtLsdModel.from_pretrained(args.model, device)
     print(f"Model loaded on {device}")
 
     # Test on dummy data
@@ -299,15 +308,13 @@ if __name__ == '__main__':
     print(f"Affinity range: [{aff.min():.3f}, {aff.max():.3f}]")
     print(f"LSD range: [{lsd.min():.3f}, {lsd.max():.3f}]")
 
-    # Test on real data
-    test_volume_path = '/home/nmedina/projects/em-pipeline/pretrained_models/test_crop/em_crop_50x512x512.npy'
-    volume = np.load(test_volume_path)
-    print(f"\nTest volume shape: {volume.shape}")
+    # Optionally test on a real volume, if one was provided on the command line.
+    if args.volume:
+        volume = np.load(args.volume)
+        print(f"\nTest volume shape: {volume.shape}")
+        test_volume = torch.from_numpy(volume[:5].astype(np.float32))
+        affinities, lsds = predict_volume_2d(model, test_volume, device, show_progress=True)
+        print(f"\nOutput affinities: {affinities.shape}")
+        print(f"Output LSDs: {lsds.shape}")
 
-    # Predict on first few slices
-    test_volume = torch.from_numpy(volume[:5].astype(np.float32))
-    affinities, lsds = predict_volume_2d(model, test_volume, device, show_progress=True)
-
-    print(f"\nOutput affinities: {affinities.shape}")
-    print(f"Output LSDs: {lsds.shape}")
     print("Model loading and prediction successful!")
