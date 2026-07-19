@@ -8,7 +8,7 @@ the repo; run this once before starting the tutorial.
 
 Requires ``cloud-volume`` for the download (public data, no credentials):
 
-    pip install cloud-volume        # or: pip install -r ../requirements.txt
+    pip install cloud-volume
 
 Then:
 
@@ -38,7 +38,7 @@ def main() -> None:
     except ImportError:
         sys.exit(
             "cloud-volume is required for the download.\n"
-            "  pip install cloud-volume   (or: pip install -r ../requirements.txt)"
+            "  pip install cloud-volume"
         )
 
     vol = CloudVolume(CLOUDPATH, mip=0, use_https=True, progress=True,

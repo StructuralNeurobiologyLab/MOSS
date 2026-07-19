@@ -16,7 +16,7 @@ once with the bundled script — a **512 × 512 × 256** block (256 TIFF slices,
 et al. 2018):
 
 ```bash
-cd examples/fafb_lsd_demo/tutorial
+cd examples/tutorial
 pip install cloud-volume        # one-time (public data, no credentials)
 python download_data.py         # writes raw_tiffs/
 ```
@@ -37,7 +37,7 @@ Raw Data at a folder of individual TIFF files (here, the bundled `raw_tiffs`
 folder) and letting MOSS generate the Zarr pyramid for you.
 
 ```
-<repo>/examples/fafb_lsd_demo/tutorial/raw_tiffs
+<repo>/examples/tutorial/raw_tiffs
 ```
 
 ![Create a project — name, location, and link the raw TIFF folder](media/tutorial_01_create_project.png)
