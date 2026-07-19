@@ -104,10 +104,4 @@ lives in `raw_data.zarr/`, and your painted labels / training crops are under th
 
 ---
 
-## Notes
 
-- Everything MOSS generates while you run the tutorial (`raw_data.zarr/`,
-  `predictions/`, `heatmap/`, checkpoints, …) is git-ignored, so re-running it
-  won't dirty the repo.
-- The GIFs are sped up 3× and have no audio. To regenerate one from a new screen
-  recording, use `scripts/mov_to_gif.sh recording.mov media/tutorial_clip_N.gif`.
