@@ -48,7 +48,7 @@ For large datasets, convert a TIFF stack to a pyramidal OME-Zarr from the home s
 
 The quickest and most reliable way to get MOSS running — especially across
 platforms — is to point an AI coding agent (e.g. Claude Code) at this repository
-and ask it to install and launch MOSS. The agent reads `environment.yml` /
+and ask it to install and launch MOSS in a safe and isolated environment (conda or other virtual environment). The agent reads `environment.yml` /
 `conda-lock.yml`, detects your OS and GPU, and works around the platform-specific
 quirks that otherwise trip up a manual install: Windows PyQt6 wheel failures,
 conda virtual-package (`__win`) detection, CUDA-vs-CPU PyTorch selection, and so
