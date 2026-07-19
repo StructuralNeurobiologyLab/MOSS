@@ -1,0 +1,5 @@
+# Generated demo projects (build_demo.py output) — never commit these.
+# The tutorial's small sample lives in tutorial/raw_tiffs/ and IS committed.
+demo_project/
+fafb_lsd_demo_project/
+.DS_Store

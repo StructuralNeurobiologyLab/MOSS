@@ -193,31 +193,53 @@ class PredictWorker(QThread):
     def _predict_folder(self, model, input_dir, output_dir, patch_size, overlap, name, device,
                         is_25d=False, is_sam2=False, sam2_predictor=None, architecture='unet',
                         add_z_coord=False):
-        """Predict on all images in a folder."""
-        # Find all images
-        image_files = sorted([
-            f for f in input_dir.iterdir()
-            if f.suffix.lower() in ('.tif', '.tiff', '.png', '.jpg')
-        ])
+        """Predict on all slices of a view (a folder of TIFFs, or a Zarr volume).
 
-        total = len(image_files)
-        self.log.emit(f"Found {total} images in {name}")
+        XY is the native orientation of the raw volume, so when the input is a Zarr
+        we read its slices directly rather than requiring a duplicated folder of XY
+        TIFFs. Resliced views (xz/yz/diagonals) are still passed in as image folders.
+        """
+        input_dir = Path(input_dir)
+        is_zarr = (input_dir.suffix == '.zarr' or (input_dir / '.zarray').exists()
+                   or (input_dir / '.zgroup').exists() or (input_dir / 'zarr.json').exists())
+
+        zarr_source = None
+        if is_zarr:
+            from ..zarr_image_source import ZarrImageSource
+            zarr_source = ZarrImageSource(str(input_dir))
+            total = zarr_source.num_slices
+            self.log.emit(f"Found {total} images in {name} (reading from Zarr volume)")
+
+            def stem_for(idx):
+                # Zero-padded so predictions sort by z, which the voting step relies on.
+                return f"{name}_slice_{idx:05d}"
+        else:
+            image_files = sorted([
+                f for f in input_dir.iterdir()
+                if f.suffix.lower() in ('.tif', '.tiff', '.png', '.jpg')
+            ])
+            total = len(image_files)
+            self.log.emit(f"Found {total} images in {name}")
+
+            def stem_for(idx):
+                return image_files[idx].stem
 
         stride = patch_size - overlap
 
-        # Image loading with LRU cache for 2.5D (adjacent slices overlap heavily)
+        # Slice loading with a small cache for 2.5D (adjacent slices overlap heavily).
         _slice_cache = {}
 
-        def load_image(path, idx=None):
-            """Load image as native dtype (uint8/uint16), with caching."""
-            if idx is not None and idx in _slice_cache:
+        def load_slice(idx):
+            """Load slice `idx` as a 2D native-dtype array (folder or Zarr), cached."""
+            if idx in _slice_cache:
                 return _slice_cache[idx]
-            img = Image.open(path)
-            arr = np.array(img)
-            if arr.ndim == 3:
+            if zarr_source is not None:
+                arr = zarr_source.get_slice(idx, pyramid_level=0)
+            else:
+                arr = np.array(Image.open(image_files[idx]))
+            if arr is not None and arr.ndim == 3:
                 arr = arr[..., 0]
-            if idx is not None:
-                _slice_cache[idx] = arr
+            _slice_cache[idx] = arr
             return arr
 
         # Pre-compute 2.5D parameters
@@ -230,12 +252,12 @@ class PredictWorker(QThread):
             max_cache_idx_range = n_flanking * slice_spacing + 1
 
         skipped = 0
-        for i, image_path in enumerate(image_files):
+        for i in range(total):
             if self.should_stop:
                 break
 
-            # Load center image
-            image = load_image(image_path, idx=i)
+            # Load center slice
+            image = load_slice(i)
             h, w = image.shape
 
             # For 2.5D, load adjacent slices (cached — most are reused)
@@ -244,7 +266,7 @@ class PredictWorker(QThread):
                 for k in range(-n_flanking, n_flanking + 1):
                     idx = i + k * slice_spacing
                     idx = max(0, min(total - 1, idx))
-                    adj = load_image(image_files[idx], idx=idx)
+                    adj = load_slice(idx)
                     if adj.shape != (h, w):
                         adj = np.resize(adj, (h, w))
                     slices.append(adj)
@@ -263,7 +285,7 @@ class PredictWorker(QThread):
             # Skip fully black images (save empty mask instead)
             img_min, img_max = int(image.min()), int(image.max())
             if img_max == img_min:
-                output_path = output_dir / f"{image_path.stem}_pred.tif"
+                output_path = output_dir / f"{stem_for(i)}_pred.tif"
                 Image.fromarray(np.zeros((h, w), dtype=np.uint8)).save(
                     output_path, compression='tiff_lzw'
                 )
@@ -355,7 +377,7 @@ class PredictWorker(QThread):
             mask_bin = ((pred_full > 0.5) * 255).astype(np.uint8)
 
             # Save with LZW compression
-            output_path = output_dir / f"{image_path.stem}_pred.tif"
+            output_path = output_dir / f"{stem_for(i)}_pred.tif"
             Image.fromarray(mask_bin).save(output_path, compression='tiff_lzw')
 
             # Progress

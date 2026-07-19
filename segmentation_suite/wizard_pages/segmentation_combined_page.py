@@ -1270,6 +1270,16 @@ class SegmentationCombinedPage(QWidget):
                 self.trained_model_label.setStyleSheet("color: #4CAF50;")
                 self._log(f"Found trained model: {latest_affinity.name}")
 
+    def refresh_subprojects(self):
+        """Re-scan the project's subprojects and update the selector + model.
+
+        Call this when the Segmentation tab becomes visible. set_config() only runs
+        on project load, so subprojects created later in the session (e.g. while
+        painting ground truth) wouldn't otherwise appear in the selector here.
+        """
+        self._refresh_subproject_combo()
+        self._update_moss_model_from_subproject()
+
     def _refresh_subproject_combo(self):
         """Populate subproject combo if project has subprojects."""
         if not self.project_dir or not has_subprojects(str(self.project_dir)):
@@ -2224,6 +2234,36 @@ class SegmentationCombinedPage(QWidget):
             self.voting_worker.wait()
         self._set_busy(False)
         self.status_label.setText("Cancelled")
+
+    def cleanup(self):
+        """Stop every worker and release device memory (called on app close).
+
+        Mirrors _cancel()'s teardown but without UI side effects, and adds a final
+        GPU/MPS cache flush so closing the window with the top X leaves no worker
+        thread or cached device allocation behind.
+        """
+        for name in ("conversion_worker", "segmentation_worker", "train_worker",
+                     "reslice_worker", "predict_worker", "rotation_worker",
+                     "voting_worker"):
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    if w.isRunning():
+                        w.stop()
+                        w.wait(10000)
+                except Exception:
+                    pass
+                setattr(self, name, None)
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
 
     def _set_busy(self, busy: bool):
         self._is_busy = busy

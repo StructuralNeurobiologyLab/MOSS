@@ -296,7 +296,12 @@ class TrainingWizard(QMainWindow):
 
     def connect_signals(self):
         """Connect page signals."""
+        # Turn off the Training tab's live predictions whenever we leave it, so its
+        # viewport predict worker doesn't share the GPU with another tab's inference
+        # (concurrent MPS/Metal use crashes the process). Fires on every page change.
+        self.stack.currentChanged.connect(self._on_stack_page_changed)
         # Home page signals - now includes project loading
+        self.home_page.project_loading.connect(self._on_project_loading)
         self.home_page.project_loaded.connect(self._on_project_loaded)
         self.home_page.start_training.connect(lambda: self._go_to_page(self.STEP_TRAINING))
         self.home_page.start_3d_segmentation.connect(lambda: self._go_to_page(self.STEP_SEGMENTATION))
@@ -392,6 +397,23 @@ class TrainingWizard(QMainWindow):
             self.stack.setCurrentIndex(current + 1)
             self._update_ui()
 
+    def _on_stack_page_changed(self, index: int):
+        """React to tab changes: turn off the Training tab's live predictions when we
+        leave it, and refresh the Segmentation tab's subproject list when we enter it."""
+        if index != self.STEP_TRAINING:
+            try:
+                self.training_page.disable_live_predictions()
+            except Exception as e:
+                print(f"[Wizard] Could not disable live predictions on tab change: {e}")
+        if index == self.STEP_SEGMENTATION:
+            # Subprojects created earlier in the session (while painting ground truth)
+            # won't be in the Segmentation selector unless we re-scan on entry — set_config
+            # only runs on project load.
+            try:
+                self.segmentation_page.refresh_subprojects()
+            except Exception as e:
+                print(f"[Wizard] Could not refresh subprojects on tab change: {e}")
+
     def _update_ui(self):
         """Update UI based on current step."""
         current = self.stack.currentIndex()
@@ -474,6 +496,17 @@ class TrainingWizard(QMainWindow):
         self.training_page.set_config(self.config)
         self.segmentation_page.set_config(self.config)
         self.export_page.set_config(self.config)
+
+    def _on_project_loading(self):
+        """Handle the start of a project load (before convert/scan can fail).
+
+        Cleanly stop any training carried over from the previous project the moment
+        a switch is initiated. Doing this here — rather than only after a successful
+        load — means an aborted TIFF->Zarr conversion or scan can't leave the old
+        worker training against stale data with the button still on "Stop Training"
+        (the state behind the bogus "paint some masks first" message). Idempotent.
+        """
+        self.training_page.stop_training(request_prediction=False)
 
     def _on_project_loaded(self):
         """Handle project loaded from home page."""
@@ -977,6 +1010,13 @@ class TrainingWizard(QMainWindow):
                 self.training_page.cleanup()
         except Exception as e:
             print(f"[Wizard] Error cleaning up training page: {e}")
+        # Stop the segmentation page's workers too, so closing the window releases
+        # their GPU/MPS memory as well (not just the training page's).
+        try:
+            if getattr(self, 'segmentation_page', None):
+                self.segmentation_page.cleanup()
+        except Exception as e:
+            print(f"[Wizard] Error cleaning up segmentation page: {e}")
         # Tear down any multi-user session.
         if self._session_client:
             try:

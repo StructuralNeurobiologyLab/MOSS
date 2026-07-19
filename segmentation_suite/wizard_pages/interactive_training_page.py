@@ -384,6 +384,20 @@ class InteractiveTrainingPage(QWidget):
         # The training will reload data when started again
         print("[Reviewer] Training data modified - will reload on next training start")
 
+    def disable_live_predictions(self):
+        """Uncheck the live-prediction toggle so the viewport predict worker stops
+        feeding the GPU.
+
+        Called when the user leaves the Training tab. The live overlay and another
+        tab's inference (e.g. the Segmentation reslice/predict pipeline) both use the
+        GPU; on Apple MPS, concurrent Metal command-buffer submission from two threads
+        aborts the process ("commit an already committed command buffer"). Unchecking
+        here routes through on_show_predictions_changed, which gates all request
+        feeding, so the worker goes idle. No-op if already off.
+        """
+        if getattr(self, 'show_pred_check', None) and self.show_pred_check.isChecked():
+            self.show_pred_check.setChecked(False)
+
     def on_show_predictions_changed(self, state):
         """Handle Show Predictions checkbox toggle."""
         self.show_predictions = (state == 2)  # Qt.CheckState.Checked
@@ -431,7 +445,7 @@ class InteractiveTrainingPage(QWidget):
 
         # Select current architecture
         if self.current_architecture in self._arch_id_to_name:
-            idx = self.arch_combo.findText(self._arch_id_to_name[self.current_architecture])
+            idx = self.arch_combo.findText(self._arch_id_to_name.get(self.current_architecture, self.current_architecture))
             if idx >= 0:
                 self.arch_combo.setCurrentIndex(idx)
 
@@ -454,7 +468,7 @@ class InteractiveTrainingPage(QWidget):
             )
             # Revert selection
             self.arch_combo.blockSignals(True)
-            idx = self.arch_combo.findText(self._arch_id_to_name[self.current_architecture])
+            idx = self.arch_combo.findText(self._arch_id_to_name.get(self.current_architecture, self.current_architecture))
             if idx >= 0:
                 self.arch_combo.setCurrentIndex(idx)
             self.arch_combo.blockSignals(False)
@@ -468,7 +482,7 @@ class InteractiveTrainingPage(QWidget):
             )
             # Revert selection
             self.arch_combo.blockSignals(True)
-            idx = self.arch_combo.findText(self._arch_id_to_name[self.current_architecture])
+            idx = self.arch_combo.findText(self._arch_id_to_name.get(self.current_architecture, self.current_architecture))
             if idx >= 0:
                 self.arch_combo.setCurrentIndex(idx)
             self.arch_combo.blockSignals(False)
@@ -508,11 +522,11 @@ class InteractiveTrainingPage(QWidget):
                 import torch
                 ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
                 epoch = ckpt.get('epoch', 0) + 1
-                self._show_temp_status(f"Loaded {self._arch_id_to_name[self.current_architecture]}: Epoch {epoch}")
+                self._show_temp_status(f"Loaded {self._arch_id_to_name.get(self.current_architecture, self.current_architecture)}: Epoch {epoch}")
             except Exception:
-                self._show_temp_status(f"Model available: {self._arch_id_to_name[self.current_architecture]}")
+                self._show_temp_status(f"Model available: {self._arch_id_to_name.get(self.current_architecture, self.current_architecture)}")
         else:
-            self._show_temp_status(f"No trained model for {self._arch_id_to_name[self.current_architecture]}")
+            self._show_temp_status(f"No trained model for {self._arch_id_to_name.get(self.current_architecture, self.current_architecture)}")
 
     def lock_architecture(self, architecture: str):
         """
@@ -530,11 +544,11 @@ class InteractiveTrainingPage(QWidget):
         if architecture and architecture in self._arch_id_to_name:
             self.current_architecture = architecture
             self.arch_combo.blockSignals(True)
-            idx = self.arch_combo.findText(self._arch_id_to_name[architecture])
+            idx = self.arch_combo.findText(self._arch_id_to_name.get(architecture, architecture))
             if idx >= 0:
                 self.arch_combo.setCurrentIndex(idx)
             self.arch_combo.blockSignals(False)
-            self._show_temp_status(f"Architecture set to {self._arch_id_to_name[architecture]} (locked)")
+            self._show_temp_status(f"Architecture set to {self._arch_id_to_name.get(architecture, architecture)} (locked)")
             self._try_apply_pending_weights()
         elif architecture:
             print(f"[Training] Warning: Unknown architecture {architecture}")
@@ -1918,7 +1932,7 @@ class InteractiveTrainingPage(QWidget):
                     # Update combo box (if populated)
                     if hasattr(self, '_arch_id_to_name') and saved_arch in self._arch_id_to_name:
                         self.arch_combo.blockSignals(True)
-                        idx = self.arch_combo.findText(self._arch_id_to_name[saved_arch])
+                        idx = self.arch_combo.findText(self._arch_id_to_name.get(saved_arch, saved_arch))
                         if idx >= 0:
                             self.arch_combo.setCurrentIndex(idx)
                         self.arch_combo.blockSignals(False)
@@ -3134,6 +3148,28 @@ class InteractiveTrainingPage(QWidget):
             print(f"[Reset] Exception: {e}")
             QMessageBox.warning(self, "Error", f"Failed to archive model:\n{e}")
 
+    def _free_device_memory(self):
+        """Drop the finished worker and return its GPU/MPS memory to the OS.
+
+        The train worker builds a fresh model + optimizer on the device each run.
+        When a run ends, those tensors are freed by Python but torch's caching
+        allocator keeps the blocks — so repeated start/stop cycles climb the memory
+        high-water mark and later runs start under memory pressure and slow down.
+        Clearing the worker reference plus emptying the allocator caches reclaims it.
+        Safe to call whenever no worker is running (idempotent).
+        """
+        self.train_worker = None
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+
     def stop_training(self, request_prediction: bool = True) -> bool:
         """Stop the active training worker and reset the training UI.
 
@@ -3163,6 +3199,10 @@ class InteractiveTrainingPage(QWidget):
         # Hand the GPU back to the predict worker.
         if self.predict_worker:
             self.predict_worker.set_training_active(False)
+
+        # Release the stopped worker and reclaim device memory (prevents the
+        # cumulative slowdown across repeated start/stop cycles).
+        self._free_device_memory()
 
         self.training_stopped.emit()
 
@@ -3298,6 +3338,11 @@ class InteractiveTrainingPage(QWidget):
         # Notify predict worker that training stopped - can use GPU now
         if self.predict_worker:
             self.predict_worker.set_training_active(False)
+
+        # The training thread has exited (that's what emitted this signal), so its
+        # model/optimizer are gone — reclaim the cached device memory now so back-to-
+        # back training runs don't accumulate allocations and slow down.
+        self._free_device_memory()
 
         # Emit training stopped signal
         self.training_stopped.emit()
@@ -4099,6 +4144,12 @@ class InteractiveTrainingPage(QWidget):
             if not self.predict_worker.wait(10000):
                 print("[Predict] Worker still running after 10s during cleanup")
             self.predict_worker = None
+
+        # Both workers are down now — flush the device caches a final time so the
+        # process exits without leaving GPU/MPS memory held. stop_training() above
+        # only reclaimed the train worker; the predict worker's model was freed just
+        # now, so empty the allocator once more to release it too.
+        self._free_device_memory()
 
     def closeEvent(self, event):
         self.cleanup()

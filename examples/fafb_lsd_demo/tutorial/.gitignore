@@ -1,0 +1,20 @@
+# The raw EM data is NOT committed (too large for the repo). Users fetch it with
+# download_data.py, which writes it here. Everything MOSS generates while running
+# the tutorial is also ignored, so the repo doesn't fill up with derived data.
+raw_tiffs/
+raw_data.zarr/
+predictions/
+heatmap/
+reslices/
+masks/
+train_images/
+train_masks/
+train_images_25d/
+train_masks_25d/
+train_images_dwarf25d/
+train_masks_dwarf25d/
+*.pth
+.DS_Store
+
+# Local preview (not for the repo)
+preview.html

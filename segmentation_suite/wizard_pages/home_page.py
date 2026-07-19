@@ -428,6 +428,7 @@ class HomePage(QWidget):
     start_training = pyqtSignal()  # Start 2D MOSS training
     start_3d_segmentation = pyqtSignal()  # Start 3D segmentation pipeline
     open_data_manager = pyqtSignal()  # Open data management
+    project_loading = pyqtSignal()  # Emitted when a project load is initiated (before convert/scan)
     project_loaded = pyqtSignal()  # Emitted when a project is loaded/created
 
     def __init__(self, parent=None):
@@ -1009,6 +1010,13 @@ class HomePage(QWidget):
 
     def _load_project(self, project_dir: str):
         """Load a project and switch to dashboard view."""
+        # Signal intent to switch projects *before* any fragile work (TIFF->Zarr
+        # conversion, project scan). Listeners (e.g. the wizard) use this to stop
+        # training carried over from the previous project. Emitting here — rather
+        # than only on project_loaded at the end — means an aborted convert/scan
+        # can't leave the old training worker running against stale data.
+        self.project_loading.emit()
+
         self.project_dir = Path(project_dir)
 
         # Save as last project

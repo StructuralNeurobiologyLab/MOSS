@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "project_name": "FAFB LSD membrane tutorial",
+  "raw_images_dir": "raw_tiffs",
+  "architecture": "lsd_boundary_2d",
+  "prediction_architecture": "lsd_boundary_2d",
+  "checkpoint_path": "checkpoint.pth",
+  "interactive_mode": true,
+  "tile_size": 256,
+  "notes": "Bundled 512x512x256 FAFB v14 CLAHE block (8 nm), shipped as individual TIFF slices in raw_tiffs/. On first load, MOSS converts the TIFFs to an OME-Zarr pyramid (raw_data.zarr). Live predictions use the bundled pretrained LSD boundary/membrane model."
+}
