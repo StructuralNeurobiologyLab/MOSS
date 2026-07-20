@@ -72,6 +72,19 @@ class OptimizedCanvas(PaintCanvas):
         self._paint_bounds_min = None  # (x, y)
         self._paint_bounds_max = None  # (x, y)
 
+        # Draggable / lockable crop-box handle (top-right of the yellow box).
+        # Unlocked: the box keeps auto-following your painting (old behavior), and you
+        # can drag the circle to nudge it. A single click locks it (circle -> lock
+        # icon): the box freezes in place, can't be dragged, and persists across
+        # captures until you click again to unlock.
+        self._crop_locked = False
+        # Fixed on-screen size — does NOT scale with the zoom level (only DPI).
+        self._crop_handle_radius = scaled(11)
+        self._crop_handle_pressed = False    # a press landed on the handle
+        self._crop_handle_moved = False      # moved past the click threshold since press
+        self._crop_handle_press_pos = None   # widget-space press point (for the threshold)
+        self._crop_drag_last_img = None      # last mouse pos in image coords while dragging
+
         # Suggestion hover state (for accepting specific components)
         self._hovered_component = None  # Binary mask of hovered connected component
         self._labeled_suggestion = None  # Cached labeled array
@@ -334,15 +347,56 @@ class OptimizedCanvas(PaintCanvas):
         """Clear the tracked painting bounds (call after capturing crop)."""
         self._paint_bounds_min = None
         self._paint_bounds_max = None
-        self._crop_preview_bounds = None
+        # A locked box stays put for the next capture; an unlocked one is reset.
+        if not self._crop_locked:
+            self._crop_preview_bounds = None
         self.update()
 
     def get_crop_bounds(self):
         """Get current crop preview bounds (x, y, w, h) in image coordinates."""
         return self._crop_preview_bounds
 
+    def _crop_handle_center(self):
+        """Screen-space (x, y) of the drag/lock handle at the crop box's top-right,
+        or None when there is no draggable box (e.g. hidden, or 3D session)."""
+        if not (self._crop_preview_visible and self._crop_preview_bounds is not None):
+            return None
+        if self._3d_session_active:
+            return None
+        h, w = self._get_image_dimensions()
+        if h is None:
+            return None
+        scaled_w = int(w * self.zoom_level)
+        scaled_h = int(h * self.zoom_level)
+        img_x = (self.width() - scaled_w) // 2 + self.offset.x()
+        img_y = (self.height() - scaled_h) // 2 + self.offset.y()
+        crop_x, crop_y, crop_w, crop_h = self._crop_preview_bounds
+        return (img_x + int((crop_x + crop_w) * self.zoom_level),
+                img_y + int(crop_y * self.zoom_level))
+
+    def _pos_on_crop_handle(self, pos):
+        """True if a widget-space QPoint is on the crop handle (with a little slop)."""
+        center = self._crop_handle_center()
+        if center is None:
+            return False
+        r = self._crop_handle_radius + scaled(4)  # generous hit target
+        return (pos.x() - center[0]) ** 2 + (pos.y() - center[1]) ** 2 <= r * r
+
+    def _screen_to_image(self, pos):
+        """Convert a widget-space QPoint to (px, py) image coordinates (may be OOB)."""
+        h, w = self._get_image_dimensions()
+        if h is None:
+            return None
+        img_x = (self.width() - int(w * self.zoom_level)) // 2 + self.offset.x()
+        img_y = (self.height() - int(h * self.zoom_level)) // 2 + self.offset.y()
+        return (int((pos.x() - img_x) / self.zoom_level),
+                int((pos.y() - img_y) / self.zoom_level))
+
     def _update_crop_preview_from_bounds(self):
         """Update crop preview box to center on painted region."""
+        # A locked box stays frozen; an unlocked box keeps following the paint stroke.
+        if self._crop_locked and self._crop_preview_bounds is not None:
+            return
         if self._paint_bounds_min is None or self._paint_bounds_max is None:
             return
 
@@ -667,6 +721,16 @@ class OptimizedCanvas(PaintCanvas):
                 self.cancel_3d_requested.emit()
                 return
 
+        # Crop-box handle: take priority over painting. A drag moves an unlocked box;
+        # a click (no drag) toggles the lock. A locked box can't be dragged.
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._pos_on_crop_handle(event.pos())):
+            self._crop_handle_pressed = True
+            self._crop_handle_moved = False
+            self._crop_handle_press_pos = event.pos()
+            self._crop_drag_last_img = self._screen_to_image(event.pos())
+            return
+
         # Right-click: temporarily switch to eraser
         if event.button() == Qt.MouseButton.RightButton:
             self._ensure_mask_exists()
@@ -702,6 +766,32 @@ class OptimizedCanvas(PaintCanvas):
         # Update cursor position for brush preview
         self.cursor_pos = event.pos()
 
+        # Interacting with the crop-box handle.
+        if self._crop_handle_pressed:
+            if self._crop_handle_press_pos is not None:
+                d = event.pos() - self._crop_handle_press_pos
+                thr = scaled(4)  # click vs. drag threshold
+                if d.x() * d.x() + d.y() * d.y() >= thr * thr:
+                    self._crop_handle_moved = True
+            # Only an unlocked box can be dragged; a locked box is frozen in place.
+            if self._crop_handle_moved and not self._crop_locked:
+                cur = self._screen_to_image(event.pos())
+                if (cur is not None and self._crop_drag_last_img is not None
+                        and self._crop_preview_bounds is not None):
+                    dx = cur[0] - self._crop_drag_last_img[0]
+                    dy = cur[1] - self._crop_drag_last_img[1]
+                    if dx or dy:
+                        h, w = self._get_image_dimensions()
+                        cx, cy, cw, ch = self._crop_preview_bounds
+                        max_x = (w - cw) if (w is not None and w >= cw) else 0
+                        max_y = (h - ch) if (h is not None and h >= ch) else 0
+                        nx = max(0, min(cx + dx, max_x))
+                        ny = max(0, min(cy + dy, max_y))
+                        self._crop_preview_bounds = (nx, ny, cw, ch)
+                        self._crop_drag_last_img = cur
+            self.update()
+            return
+
         if self.drawing:
             self.draw_at(event.pos())
         elif self.last_mouse_pos is not None:
@@ -734,6 +824,17 @@ class OptimizedCanvas(PaintCanvas):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release with button mappings."""
+        # End a crop-handle interaction. A press+release with no drag is a click,
+        # which toggles the lock (circle <-> lock icon).
+        if self._crop_handle_pressed:
+            self._crop_handle_pressed = False
+            if not self._crop_handle_moved:
+                self._crop_locked = not self._crop_locked
+            self._crop_drag_last_img = None
+            self._crop_handle_press_pos = None
+            self.update()
+            return
+
         # Right-click release: restore original erasing state
         if event.button() == Qt.MouseButton.RightButton:
             if hasattr(self, '_right_click_erasing') and self._right_click_erasing:
@@ -1238,8 +1339,12 @@ class OptimizedCanvas(PaintCanvas):
             # Blue solid line for 3D session
             pen = QPen(QColor(50, 150, 255, alpha), 3, Qt.PenStyle.SolidLine)
             marker_color = QColor(50, 150, 255, alpha)
+        elif self._crop_locked:
+            # Locked: blue dotted line so the locked state is unmistakable
+            pen = QPen(QColor(60, 160, 255, alpha), 2, Qt.PenStyle.DashLine)
+            marker_color = QColor(60, 160, 255, alpha)
         else:
-            # Yellow dotted line for normal mode
+            # Yellow dotted line for normal (unlocked) mode
             pen = QPen(QColor(255, 220, 50, alpha), 2, Qt.PenStyle.DashLine)
             marker_color = QColor(255, 220, 50, alpha)
 
@@ -1262,6 +1367,41 @@ class OptimizedCanvas(PaintCanvas):
         # Bottom-right
         painter.drawLine(screen_x + screen_w, screen_y + screen_h, screen_x + screen_w - marker_size, screen_y + screen_h)
         painter.drawLine(screen_x + screen_w, screen_y + screen_h, screen_x + screen_w, screen_y + screen_h - marker_size)
+
+        # Draggable / lockable handle at the top-right corner (normal mode only):
+        # a filled circle you can drag to move the box, or a lock outline when locked.
+        if not is_3d_mode:
+            hx = screen_x + screen_w
+            hy = screen_y
+            r = self._crop_handle_radius  # fixed screen size; does not scale with zoom
+            if self._crop_locked:
+                # Bold blue padlock at full opacity, over a dark halo so it stays
+                # legible on any EM background.
+                bw = int(r * 1.8)
+                bh = int(r * 1.5)
+                bx = hx - bw // 2
+                by = hy - bh // 2 + int(r * 0.35)
+                sw = int(bw * 0.58)
+                sh = int(bh * 1.05)
+                sx = hx - sw // 2
+                sy = by - sh + scaled(3)
+
+                def _draw_lock(color, width):
+                    pen = QPen(color, width)
+                    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                    painter.setPen(pen)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRoundedRect(bx, by, bw, bh, scaled(3), scaled(3))  # body
+                    painter.drawArc(sx, sy, sw, sh, 0, 180 * 16)                   # shackle
+
+                _draw_lock(QColor(0, 0, 0, 200), scaled(8))    # dark halo / outline
+                _draw_lock(QColor(70, 170, 255), scaled(5))    # bright blue lock
+            else:
+                # Filled yellow circle drag handle, full opacity with a dark outline.
+                painter.setBrush(QColor(255, 220, 50))
+                painter.setPen(QPen(QColor(20, 20, 20), scaled(2)))
+                painter.drawEllipse(hx - r, hy - r, 2 * r, 2 * r)
 
         # Draw hints based on mode
         if is_3d_mode:
