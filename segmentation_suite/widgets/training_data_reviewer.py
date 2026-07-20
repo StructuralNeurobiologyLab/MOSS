@@ -16,13 +16,15 @@ from typing import List, Optional, Tuple
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QSizePolicy, QWidget
+    QSizePolicy, QWidget, QSpinBox
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
 
 import numpy as np
 from PIL import Image
+
+from .paint_canvas import PaintCanvas
 # Disable PIL decompression bomb warning for large EM images
 Image.MAX_IMAGE_PIXELS = None
 
@@ -68,6 +70,10 @@ class TrainingDataReviewer(QDialog):
         self.current_index = 0
         self.discard_count = 0
         self._modified = False
+
+        # Paint-mode state: correct the current crop's mask in place with the brush.
+        self._paint_mode = False
+        self._canvas_dirty = False
 
         self._load_image_list()
         self._init_ui()
@@ -126,12 +132,54 @@ class TrainingDataReviewer(QDialog):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
 
+        # Top toolbar: brush toggle to correct this crop's mask in place.
+        top_bar = QHBoxLayout()
+        self.paint_toggle = QPushButton("\U0001F58C  Paint")
+        self.paint_toggle.setCheckable(True)
+        self.paint_toggle.setToolTip("Toggle painting to correct this crop's mask "
+                                     "(same brush/erase as the Ground Truth tab)")
+        self.paint_toggle.toggled.connect(self._toggle_paint)
+        top_bar.addWidget(self.paint_toggle)
+
+        self.eraser_toggle = QPushButton("Eraser")
+        self.eraser_toggle.setCheckable(True)
+        self.eraser_toggle.toggled.connect(self._toggle_eraser)
+        top_bar.addWidget(self.eraser_toggle)
+
+        brush_label = QLabel("Brush size:")
+        top_bar.addWidget(brush_label)
+        self.brush_size_spin = QSpinBox()
+        self.brush_size_spin.setRange(1, 200)
+        self.brush_size_spin.setValue(10)
+        self.brush_size_spin.setStyleSheet(
+            "QSpinBox { background:#333; color:#fff; border:1px solid #555; padding:4px; }")
+        self.brush_size_spin.valueChanged.connect(self._on_brush_size)
+        top_bar.addWidget(self.brush_size_spin)
+
+        # These only apply while painting; hidden until the brush is toggled on.
+        self._paint_controls = [self.eraser_toggle, brush_label, self.brush_size_spin]
+        for wdg in self._paint_controls:
+            wdg.setVisible(False)
+
+        top_bar.addStretch()
+        layout.addLayout(top_bar)
+
         # Image display (takes most of the space)
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.image_label.setMinimumSize(400, 400)
         layout.addWidget(self.image_label, stretch=1)
+
+        # Editable canvas (shown only in paint mode). Reuses the Ground Truth
+        # painting widget so brush/erase behave identically.
+        self.paint_canvas = PaintCanvas()
+        self.paint_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.paint_canvas.setMinimumSize(400, 400)
+        self.paint_canvas.setMouseTracking(True)
+        self.paint_canvas.edit_made.connect(self._on_canvas_edit)
+        self.paint_canvas.setVisible(False)
+        layout.addWidget(self.paint_canvas, stretch=1)
 
         # Bottom controls
         controls = QWidget()
@@ -250,10 +298,112 @@ class TrainingDataReviewer(QDialog):
         except Exception as e:
             self.image_label.setText(f"Error loading image:\n{e}")
 
+    # ------------------------------------------------------------------
+    # In-place mask correction (paint mode)
+    # ------------------------------------------------------------------
+    def _toggle_paint(self, on: bool):
+        """Enter/leave paint mode from the top-left brush toggle."""
+        if on and not self.image_files:
+            self.paint_toggle.setChecked(False)
+            return
+        self._paint_mode = on
+        for wdg in self._paint_controls:
+            wdg.setVisible(on)
+        if on:
+            self.paint_toggle.setText("\U0001F58C  Painting")
+            self._load_into_canvas()
+            self.image_label.setVisible(False)
+            self.paint_canvas.setVisible(True)
+            self.paint_canvas.set_tool('brush')
+            self.paint_canvas.set_brush_size(self.brush_size_spin.value())
+            QTimer.singleShot(0, self._fit_canvas)  # fit once the widget has its size
+        else:
+            self.paint_toggle.setText("\U0001F58C  Paint")
+            self.eraser_toggle.setChecked(False)
+            self._save_canvas_mask()
+            self.paint_canvas.setVisible(False)
+            self.image_label.setVisible(True)
+            if self.image_files:
+                self._display_image(self.image_files[self.current_index])
+
+    def _load_into_canvas(self):
+        """Load the current crop (image + mask) into the editable canvas."""
+        image_path = self.image_files[self.current_index]
+        img = Image.open(image_path)
+        img_array = np.array(img) if img.mode == 'L' else np.array(img.convert('L'))
+
+        mask_path = self.train_masks_dir / image_path.name
+        if mask_path.exists():
+            m = np.array(Image.open(mask_path).convert('L'))
+            if m.shape != img_array.shape:
+                m = np.zeros(img_array.shape, dtype=np.uint8)
+        else:
+            m = np.zeros(img_array.shape, dtype=np.uint8)
+
+        self.paint_canvas.set_image(img_array)
+        self.paint_canvas.set_mask(((m > 127).astype(np.uint8) * 255))
+        self._canvas_dirty = False
+        self._fit_canvas()
+
+    def _fit_canvas(self):
+        """Scale the canvas so the crop fills the view."""
+        img = getattr(self.paint_canvas, 'raw_image', None)
+        if img is None:
+            return
+        h, w = img.shape
+        cw = max(1, self.paint_canvas.width())
+        ch = max(1, self.paint_canvas.height())
+        self.paint_canvas.zoom_level = min(cw / w, ch / h) * 0.98
+        self.paint_canvas.offset = QPoint(0, 0)
+        self.paint_canvas.update()
+
+    def _on_canvas_edit(self, *args):
+        self._canvas_dirty = True
+
+    def _toggle_eraser(self, on: bool):
+        self.paint_canvas.set_tool('eraser' if on else 'brush')
+
+    def _on_brush_size(self, value: int):
+        self.paint_canvas.set_brush_size(value)
+
+    def _save_canvas_mask(self):
+        """Write the edited mask back to the crop's mask file(s) (auto-save)."""
+        if not self._canvas_dirty or self.paint_canvas.mask is None or not self.image_files:
+            return
+        name = self.image_files[self.current_index].name
+        mask = (self.paint_canvas.mask > 127).astype(np.uint8) * 255
+
+        # Always update the primary mask; update the 2.5D/dwarf copies only where a
+        # mask already exists for this crop (they mirror the same label).
+        targets = [self.train_masks_dir / name]
+        for d in (self.train_masks_25d_dir, self.train_masks_dwarf25d_dir):
+            if (d / name).exists():
+                targets.append(d / name)
+
+        saved = False
+        for p in targets:
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                # Match MOSS's mask format: LZW-compressed TIFF (falls back to plain
+                # save for any non-TIFF extension).
+                if p.suffix.lower() in ('.tif', '.tiff'):
+                    Image.fromarray(mask).save(p, compression='tiff_lzw')
+                else:
+                    Image.fromarray(mask).save(p)
+                saved = True
+            except Exception as e:
+                print(f"[Reviewer] Error saving mask {p}: {e}")
+        if saved:
+            self._modified = True
+            self._canvas_dirty = False
+            print(f"[Reviewer] Saved corrected mask: {name}")
+
     def _discard_current(self):
         """Discard the current image and its mask."""
         if not self.image_files:
             return
+        # Don't auto-save a crop we're about to discard.
+        self._canvas_dirty = False
 
         image_path = self.image_files[self.current_index]
 
@@ -347,19 +497,34 @@ class TrainingDataReviewer(QDialog):
         if self.current_index >= len(self.image_files):
             self.current_index = max(0, len(self.image_files) - 1)
 
-        self._update_display()
+        if self._paint_mode and self.image_files:
+            self._load_into_canvas()
+        else:
+            if self._paint_mode:  # nothing left to paint
+                self.paint_toggle.setChecked(False)
+            self._update_display()
 
     def _go_previous(self):
-        """Go to previous image."""
+        """Go to previous image (auto-saving any paint edits first)."""
         if self.image_files and self.current_index > 0:
+            if self._paint_mode:
+                self._save_canvas_mask()
             self.current_index -= 1
-            self._update_display()
+            if self._paint_mode:
+                self._load_into_canvas()
+            else:
+                self._update_display()
 
     def _go_next(self):
-        """Go to next image."""
+        """Go to next image (auto-saving any paint edits first)."""
         if self.image_files and self.current_index < len(self.image_files) - 1:
+            if self._paint_mode:
+                self._save_canvas_mask()
             self.current_index += 1
-            self._update_display()
+            if self._paint_mode:
+                self._load_into_canvas()
+            else:
+                self._update_display()
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle keyboard shortcuts."""
@@ -379,11 +544,15 @@ class TrainingDataReviewer(QDialog):
     def resizeEvent(self, event):
         """Handle resize to re-scale image."""
         super().resizeEvent(event)
-        if self.image_files:
+        if self._paint_mode:
+            self._fit_canvas()
+        elif self.image_files:
             self._display_image(self.image_files[self.current_index])
 
     def closeEvent(self, event):
-        """Emit signal if data was modified."""
+        """Auto-save any pending paint edit, then emit if data was modified."""
+        if self._paint_mode:
+            self._save_canvas_mask()
         if self._modified:
             self.data_modified.emit()
         super().closeEvent(event)
