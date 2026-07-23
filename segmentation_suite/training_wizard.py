@@ -259,6 +259,7 @@ class TrainingWizard(QMainWindow):
         self._project_registered = False
         # Show the "you are owner / you joined" notice at most once per session.
         self._session_notified = False
+        self._is_session_owner = False
 
         layout.addSpacing(scaled(10))
 
@@ -885,6 +886,14 @@ class TrainingWizard(QMainWindow):
 
         self._session_client = SyncClient(parent=self)
         self._session_client.display_name = name
+        # Stable per-project identity so reconnecting resumes the same role + crops.
+        try:
+            from .project_config import get_or_create_multi_user_id
+            pdir = self.training_page.project_dir
+            if pdir:
+                self._session_client.user_id = get_or_create_multi_user_id(str(pdir))
+        except Exception as e:
+            print(f"[Wizard] could not set persistent user id: {e}")
         self._session_client.connected.connect(self._on_lan_client_connected)
         self._session_client.disconnected.connect(self._on_session_disconnected)
         self._session_client.error.connect(self._on_session_error)
@@ -1001,10 +1010,27 @@ class TrainingWizard(QMainWindow):
     def _on_owner_assigned(self, is_owner: bool):
         """Hub told us we own this session — configure it via a popup, then register."""
         print(f"[Wizard] Owner assigned: {is_owner}")
+        self._is_session_owner = is_owner
         if not is_owner or not self._session_client:
             return
         if self._project_registered:
             return  # already registered this session — avoid register/re-welcome loop
+
+        # Resumed session: the hub is already configured, so DON'T prompt. The
+        # architecture / prediction / crop-size / subproject arrive via the usual
+        # received-handlers and lock the controls automatically.
+        if getattr(self._session_client, "session_configured", False):
+            self._project_registered = True
+            self.session_status_label.setText("● Multi-user OWNER (resumed session)")
+            if not self._session_notified:
+                self._session_notified = True
+                QMessageBox.information(
+                    self, "Resumed as owner",
+                    "You reconnected as the OWNER of an existing session. Its "
+                    "configuration (subproject, architecture, prediction model, crop "
+                    "size) was restored from the hub and is locked.")
+            return
+
         # Set the guard BEFORE the (blocking) dialog so the re-welcome that follows
         # registration cannot re-open it.
         self._project_registered = True
@@ -1146,6 +1172,11 @@ class TrainingWizard(QMainWindow):
         print(f"[Wizard] Adopting session subproject: {subproject_name}")
         self.training_page.adopt_session_subproject(subproject_name)
         self._lock_subproject(subproject_name)
+        if self._is_session_owner:
+            # Resumed owner is told their own subproject — keep the OWNER label.
+            self.session_status_label.setText(
+                f"● Multi-user OWNER — subproject: {subproject_name}")
+            return
         self.session_status_label.setText(
             f"● Multi-user collaborator — subproject: {subproject_name} (locked)")
         if not self._session_notified:

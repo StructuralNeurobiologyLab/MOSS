@@ -53,7 +53,6 @@ class HubWindow(QMainWindow):
         self.backend = backend
         self._tiles: dict[str, UserTile] = {}
         self._data_dir = None
-        self._join_index = 0
 
         self.setWindowTitle("MOSS Hub — Multi-User Session Controller")
         self.resize(1040, 720)
@@ -303,6 +302,8 @@ class HubWindow(QMainWindow):
         self.backend.project_registered.connect(self._on_project_registered)
         self.backend.user_connected.connect(self._on_user_connected)
         self.backend.user_disconnected.connect(self._on_user_disconnected)
+        if hasattr(self.backend, "user_restored"):
+            self.backend.user_restored.connect(self._on_user_restored)
         self.backend.crop_received.connect(self._on_crop_received)
         self.backend.training_status.connect(self._on_training_status)
         if hasattr(self.backend, "prediction_model_set"):
@@ -324,28 +325,42 @@ class HubWindow(QMainWindow):
         self.project_label.setText(name)
         self.subproj_label.setText("subprojects: " + ", ".join(subprojects))
 
-    def _on_user_connected(self, user_id: str, display_name: str, is_owner: bool):
+    def _ensure_tile(self, user_id, display_name, is_owner, join_index):
+        """Create the tile if new (stable animal/color by join_index), else reuse."""
         if self._empty_label is not None:
             self._empty_label.hide()
-        idx = self._join_index
-        self._join_index += 1
-        tile = UserTile(
-            user_id, display_name,
-            animal=animal_for_index(idx), color=color_for_index(idx),
-            is_owner=is_owner,
-        )
-        tile.clicked.connect(self._open_gallery)
-        tile.toggled.connect(self.backend.set_user_included)
-        self._tiles[user_id] = tile
-        self._relayout_tiles()
+        tile = self._tiles.get(user_id)
+        if tile is None:
+            tile = UserTile(
+                user_id, display_name,
+                animal=animal_for_index(join_index), color=color_for_index(join_index),
+                is_owner=is_owner,
+            )
+            tile.clicked.connect(self._open_gallery)
+            tile.toggled.connect(self.backend.set_user_included)
+            self._tiles[user_id] = tile
+            self._relayout_tiles()
+        return tile
+
+    def _on_user_connected(self, user_id: str, display_name: str, is_owner: bool, join_index: int):
+        tile = self._ensure_tile(user_id, display_name, is_owner, join_index)
+        tile.set_online(True)
+        self._update_count()
+
+    def _on_user_restored(self, user_id: str, display_name: str, is_owner: bool,
+                          join_index: int, crop_count: int, included: bool):
+        """Rebuild a tile for a resumed session — offline until the user reconnects."""
+        tile = self._ensure_tile(user_id, display_name, is_owner, join_index)
+        tile.set_crop_count(crop_count)
+        tile.set_included(included)
+        tile.set_online(False)
         self._update_count()
 
     def _on_user_disconnected(self, user_id: str):
-        tile = self._tiles.pop(user_id, None)
+        # Keep the tile — the user's crops persist and they may reconnect.
+        tile = self._tiles.get(user_id)
         if tile:
-            tile.setParent(None)
-            tile.deleteLater()
-        self._relayout_tiles()
+            tile.set_online(False)
         self._update_count()
 
     def _on_crop_received(self, user_id: str, png_bytes: bytes, caption: str):
@@ -366,8 +381,12 @@ class HubWindow(QMainWindow):
             self._tiles_grid.addWidget(tile, i // cols, i % cols)
 
     def _update_count(self):
-        n = len(self._tiles)
-        self.count_label.setText(f"{n} connected")
+        online = sum(1 for t in self._tiles.values() if getattr(t, "_online", True))
+        total = len(self._tiles)
+        if online == total:
+            self.count_label.setText(f"{online} connected")
+        else:
+            self.count_label.setText(f"{online} online · {total} total")
 
     def _open_gallery(self, user_id: str):
         """Open the user's crops in the same Review Crops tool used in MOSS."""

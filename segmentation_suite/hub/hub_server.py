@@ -44,14 +44,16 @@ def _log(msg: str):
 
 
 class _User:
-    __slots__ = ("user_id", "display_name", "is_owner", "included", "crop_count", "ws")
+    __slots__ = ("user_id", "display_name", "is_owner", "included", "crop_count",
+                 "join_index", "ws")
 
-    def __init__(self, user_id, display_name, is_owner, ws):
+    def __init__(self, user_id, display_name, is_owner, ws, join_index=0, included=True):
         self.user_id = user_id
         self.display_name = display_name
         self.is_owner = is_owner
-        self.included = True
+        self.included = included
         self.crop_count = 0
+        self.join_index = join_index
         self.ws = ws
 
 
@@ -59,14 +61,15 @@ class HubServer(QObject):
     # Signal surface mirrors MockHubBackend exactly.
     session_started = pyqtSignal(str, str, str)         # code, data_dir, connect_addr
     project_registered = pyqtSignal(str, list)          # project_name, subprojects
-    user_connected = pyqtSignal(str, str, bool)         # user_id, name, is_owner
+    user_connected = pyqtSignal(str, str, bool, int)    # user_id, name, is_owner, join_index
     user_disconnected = pyqtSignal(str)                 # user_id
+    user_restored = pyqtSignal(str, str, bool, int, int, bool)  # uid, name, is_owner, join_index, crop_count, included
     crop_received = pyqtSignal(str, bytes, str)         # user_id, png_bytes, caption
     training_status = pyqtSignal(int, float, int)       # round, loss, contributors
     prediction_model_set = pyqtSignal(str)              # owner's authoritative model (arch_id)
 
     def __init__(self, data_dir: str, host: str = "0.0.0.0", port: int = 8765,
-                 parent=None):
+                 resume: bool = False, parent=None):
         super().__init__(parent)
         if not WEBSOCKETS_AVAILABLE:
             raise ImportError("websockets not installed. pip install websockets")
@@ -76,6 +79,13 @@ class HubServer(QObject):
         self.port = port
         self._adv_host = host  # resolved to a routable IP in start()
         self.code = generate_session_id()
+
+        # Resume / persistence
+        self._resume = resume       # requested (or auto-detected in start())
+        self._resumed = False       # actually loaded a manifest
+        self._owner_id = ""
+        self._known_users: dict = {}   # uid -> {display_name, join_index, is_owner, included}
+        self._next_join_index = 0
 
         # Authoritative session identity (set when the owner registers).
         self.project_name: str = ""
@@ -101,10 +111,67 @@ class HubServer(QObject):
         """The bare IP:port a LAN client types to join (what the GUI shows)."""
         return f"{self._adv_host}:{self.port}"
 
+    # ============================================================ persistence
+    def _manifest_path(self) -> Path:
+        return self.data_dir / "session.json"
+
+    def _save_manifest(self):
+        import json
+        try:
+            data = {
+                "code": self.code,
+                "project_name": self.project_name,
+                "owner_subproject": self.owner_subproject,
+                "session_subproject": self.session_subproject,
+                "architecture": self.architecture,
+                "prediction_model": self.prediction_model,
+                "crop_size": self.crop_size,
+                "subprojects": self.subprojects,
+                "owner_id": self._owner_id,
+                "registered": self._registered,
+                "users": self._known_users,
+            }
+            self._manifest_path().write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            _log(f"manifest save failed: {e}")
+
+    def _load_manifest(self) -> bool:
+        import json
+        p = self._manifest_path()
+        if not p.exists():
+            return False
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:
+            _log(f"manifest load failed: {e}")
+            return False
+        self.code = data.get("code", self.code)
+        self.project_name = data.get("project_name", "")
+        self.owner_subproject = data.get("owner_subproject", "")
+        self.session_subproject = data.get("session_subproject", "")
+        self.architecture = data.get("architecture", "")
+        self.prediction_model = data.get("prediction_model", "")
+        self.crop_size = int(data.get("crop_size", 0))
+        self.subprojects = data.get("subprojects", [])
+        self._owner_id = data.get("owner_id", "")
+        self._known_users = data.get("users", {}) or {}
+        self._registered = bool(data.get("registered", False))
+        self._next_join_index = max(
+            [int(u.get("join_index", 0)) for u in self._known_users.values()],
+            default=-1) + 1
+        return True
+
+    def _disk_crop_count(self, uid: str) -> int:
+        d = self.data_dir / "incoming" / uid / "train_images"
+        return len(list(d.glob("*.png"))) if d.exists() else 0
+
     # ================================================================= startup
     def start(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "incoming").mkdir(exist_ok=True)
+        # Resume an existing session if requested (or auto-detected) and a manifest exists.
+        if self._resume:
+            self._resumed = self._load_manifest()
         # Resolve the address to advertise once. When bound to all interfaces,
         # fall back to the routable LAN IP so clients get something reachable.
         self._adv_host = self.host if self.host not in ("0.0.0.0", "::", "") else get_local_ip()
@@ -115,6 +182,19 @@ class HubServer(QObject):
         _log(f"session {self.code} · data_dir={self.data_dir} · connect at ws://{self.connect_address()}")
         if self._adv_host == "127.0.0.1":
             _log("WARNING: no LAN route detected — only localhost clients can connect")
+        if self._resumed:
+            _log(f"RESUMED session: project={self.project_name} subproject={self.session_subproject} "
+                 f"crop_size={self.crop_size} users={len(self._known_users)}")
+            # Re-populate the GUI: project header, prediction model, and OFFLINE tiles.
+            if self.project_name:
+                self.project_registered.emit(self.project_name, self.subprojects)
+            if self.prediction_model:
+                self.prediction_model_set.emit(self.prediction_model)
+            for uid, info in self._known_users.items():
+                self.user_restored.emit(
+                    uid, info.get("display_name", "User"), bool(info.get("is_owner")),
+                    int(info.get("join_index", 0)), self._disk_crop_count(uid),
+                    bool(info.get("included", True)))
 
     def stop(self):
         self._running = False
@@ -182,22 +262,45 @@ class HubServer(QObject):
         name = msg.payload.get("display_name", "User")
         if not uid:
             return
-        is_owner = len(self._users) == 0
-        user = _User(uid, name, is_owner, websocket)
+        known = self._known_users.get(uid)
+        if known is not None:
+            # Returning user (reconnect or resume): keep their role/index/inclusion.
+            is_owner = bool(known.get("is_owner"))
+            join_index = int(known.get("join_index", 0))
+            included = bool(known.get("included", True))
+            known["display_name"] = name
+        else:
+            # New user. Only a FRESH, unregistered session's first user is owner;
+            # on a registered/resumed session a newcomer is always a joinee.
+            is_owner = (not self._registered) and (len(self._known_users) == 0)
+            join_index = self._next_join_index
+            self._next_join_index += 1
+            included = True
+            self._known_users[uid] = {"display_name": name, "join_index": join_index,
+                                      "is_owner": is_owner, "included": included}
+        if is_owner and not self._owner_id:
+            self._owner_id = uid
+        user = _User(uid, name, is_owner, websocket, join_index=join_index, included=included)
         self._users[uid] = user
         self._ws_to_uid[websocket] = uid
         (self.data_dir / "incoming" / uid / "train_images").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "incoming" / uid / "train_masks").mkdir(parents=True, exist_ok=True)
-        _log(f"HELLO {name} ({uid}) owner={is_owner}")
+        _log(f"HELLO {name} ({uid}) owner={is_owner} idx={join_index}")
 
         await self._send_welcome(user)
         await self._broadcast_user_list()
-        self.user_connected.emit(uid, name, is_owner)
+        self.user_connected.emit(uid, name, is_owner, join_index)
+        self._save_manifest()
 
     async def _send_welcome(self, user: _User):
         # The owner keeps their own authoritative subproject; only joinees adopt
         # the namespaced session subproject (to avoid colliding with their own).
-        session_subproject = None if user.is_owner else (self.session_subproject or None)
+        # Owner keeps their own subproject on a FRESH session (they pick it in the
+        # setup dialog). On a RESUMED session the owner is told their subproject too.
+        if user.is_owner:
+            session_subproject = self.owner_subproject if self._resumed else None
+        else:
+            session_subproject = self.session_subproject or None
         welcome = create_welcome_message(
             session_id=self.code,
             user_list=self._user_list(),
@@ -205,6 +308,7 @@ class HubServer(QObject):
             session_subproject=session_subproject,
             prediction_model=self.prediction_model or None,
             crop_size=self.crop_size or None,   # global — sent to owner too
+            session_configured=self._registered,  # owner skips setup popup if already configured
             is_owner=user.is_owner,
         )
         await self._safe_send(user.ws, welcome.to_json())
@@ -218,6 +322,7 @@ class HubServer(QObject):
         if self._registered:
             return  # identity already set — ignore duplicate registers (loop guard)
         self._registered = True
+        self._owner_id = uid
         self.project_name = msg.payload.get("project_name", "")
         self.owner_subproject = msg.payload.get("subproject", "") or "default"
         self.architecture = msg.payload.get("architecture", "") or self.architecture
@@ -233,6 +338,7 @@ class HubServer(QObject):
         self.project_registered.emit(self.project_name, self.subprojects)
         if self.prediction_model:
             self.prediction_model_set.emit(self.prediction_model)
+        self._save_manifest()
         # Re-welcome everyone so late-arriving identity reaches earlier joiners.
         for u in list(self._users.values()):
             await self._send_welcome(u)
@@ -281,8 +387,9 @@ class HubServer(QObject):
         if user:
             _log(f"disconnect {user.display_name} ({uid})")
             self.user_disconnected.emit(uid)
-        if not self._users:
-            self._registered = False  # session emptied — allow a fresh owner to register
+        # NB: we intentionally do NOT clear self._registered when the session
+        # empties — the config is persisted (session.json) so the session can be
+        # resumed. A returning owner keeps their role via _known_users.
         await self._broadcast_user_list()
 
     # ================================================================ helpers
@@ -303,10 +410,13 @@ class HubServer(QObject):
 
     # =================================================== GUI -> backend API
     def set_user_included(self, user_id: str, included: bool):
+        if user_id in self._known_users:
+            self._known_users[user_id]["included"] = included
         user = self._users.get(user_id)
         if user:
             user.included = included
         _log(f"user {user_id} included={included}")
+        self._save_manifest()
 
     def reset_model(self):
         _log("reset_model requested (trainer not yet wired)")
@@ -314,6 +424,7 @@ class HubServer(QObject):
     def set_prediction_model(self, arch: str):
         self.prediction_model = arch
         _log(f"prediction model -> {arch} (broadcasting to all clients)")
+        self._save_manifest()
         if self._loop and self._running:
             asyncio.run_coroutine_threadsafe(self._broadcast_prediction(arch), self._loop)
 

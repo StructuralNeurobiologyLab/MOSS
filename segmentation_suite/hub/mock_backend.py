@@ -61,8 +61,9 @@ def _make_fake_crop(seed: int, size: int = 96) -> QImage:
 class MockHubBackend(QObject):
     session_started = pyqtSignal(str, str, str)
     project_registered = pyqtSignal(str, list)
-    user_connected = pyqtSignal(str, str, bool)
+    user_connected = pyqtSignal(str, str, bool, int)   # uid, name, is_owner, join_index
     user_disconnected = pyqtSignal(str)
+    user_restored = pyqtSignal(str, str, bool, int, int, bool)
     crop_received = pyqtSignal(str, bytes, str)
     training_status = pyqtSignal(int, float, int)
     prediction_model_set = pyqtSignal(str)
@@ -101,7 +102,7 @@ class MockHubBackend(QObject):
         name = self._name_pool.pop() if self._name_pool else "Owner"
         self._users[uid] = name
         self._included[uid] = True
-        self.user_connected.emit(uid, name, True)
+        self.user_connected.emit(uid, name, True, 0)
         self.project_registered.emit(
             "songbird_em_v3", ["mitochondria", "synapses", "nuclei"]
         )
@@ -113,9 +114,10 @@ class MockHubBackend(QObject):
         if random.random() < 0.7:
             uid = f"user{len(self._users)}"
             name = self._name_pool.pop()
+            idx = int(uid.replace("user", ""))
             self._users[uid] = name
             self._included[uid] = True
-            self.user_connected.emit(uid, name, False)
+            self.user_connected.emit(uid, name, False, idx)
 
     # ------------------------------------------------------------------ crops
     def _maybe_emit_crop(self):

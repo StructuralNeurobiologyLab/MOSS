@@ -10,7 +10,7 @@ gallery.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QSizePolicy
 )
@@ -50,6 +50,16 @@ class UserTile(QFrame):
         self.owner_label.setStyleSheet("color: #f4c542; font-size: 10px; font-weight: bold;")
         header.addWidget(self.owner_label)
         header.addStretch()
+        # Presence dot (top-right): blinks green when online, grey when offline.
+        self.online_dot = QLabel("●")
+        self.online_dot.setStyleSheet("color: #3ddc5f; font-size: 13px;")
+        self.online_dot.setToolTip("online")
+        header.addWidget(self.online_dot)
+        self._online = True
+        self._blink_timer = QTimer(self)
+        self._blink_timer.timeout.connect(self._blink)
+        self._blink_on = True
+        self._blink_timer.start(700)
         self.include_check = QCheckBox()
         self.include_check.setChecked(True)
         self.include_check.setToolTip("Include this user's crops in cluster training")
@@ -87,6 +97,28 @@ class UserTile(QFrame):
 
     def increment_crops(self, by: int = 1):
         self.set_crop_count(self._crop_count + by)
+
+    def set_online(self, online: bool):
+        """Green blinking dot + full-color tile when online; grey/static when offline."""
+        self._online = online
+        if online:
+            self.online_dot.setToolTip("online")
+            if not self._blink_timer.isActive():
+                self._blink_timer.start(700)
+        else:
+            self._blink_timer.stop()
+            self.online_dot.setStyleSheet("color: #555555; font-size: 13px;")
+            self.online_dot.setToolTip("offline")
+        self.avatar.setEnabled(online and self._included)
+        color = "#f0f0f0" if (online and self._included) else "#888888"
+        self.name_label.setStyleSheet(f"color: {color}; font-size: 13px; font-weight: 600;")
+
+    def _blink(self):
+        if not self._online:
+            return
+        self._blink_on = not self._blink_on
+        self.online_dot.setStyleSheet(
+            f"color: {'#3ddc5f' if self._blink_on else '#1c6e33'}; font-size: 13px;")
 
     @property
     def included(self) -> bool:

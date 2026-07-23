@@ -114,6 +114,22 @@ def load_project_config(project_dir: str) -> dict | None:
         return None
 
 
+def get_or_create_multi_user_id(project_dir: str) -> str:
+    """Return a stable per-project user id for multi-user sessions.
+
+    Persisted in project.json so reconnecting from the same project resumes the
+    same role and crops on the hub (crops live under incoming/<user_id>/).
+    """
+    import uuid
+    config = load_project_config(project_dir) or get_default_config()
+    uid = config.get("multi_user_id")
+    if not uid:
+        uid = uuid.uuid4().hex[:12]
+        config["multi_user_id"] = uid
+        save_project_config(project_dir, config)
+    return uid
+
+
 def resolve_path(project_dir: str, path: str) -> str:
     """Resolve a path that may be relative to project_dir.
 

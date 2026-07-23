@@ -116,6 +116,7 @@ class SyncClient(QObject):
         self.user_id = generate_user_id()
         self.display_name = "User"
         self.session_id: Optional[str] = None
+        self.session_configured = False  # True if the hub session is already set up (resume/post-register)
 
         # Connection info
         self._host_ip: Optional[str] = None
@@ -579,6 +580,7 @@ class SyncClient(QObject):
                     _log(f"Session architecture: {architecture}")
                     self.architecture_received.emit(architecture)
                 # Hub extensions: ownership, session subproject, prediction lock.
+                self.session_configured = bool(msg.payload.get("session_configured", False))
                 self.owner_assigned.emit(bool(msg.payload.get("is_owner", False)))
                 session_subproject = msg.payload.get("session_subproject", "")
                 if session_subproject:

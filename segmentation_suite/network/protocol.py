@@ -194,6 +194,7 @@ def create_welcome_message(session_id: str, user_list: list,
                            session_subproject: str = None,
                            prediction_model: str = None,
                            crop_size: int = None,
+                           session_configured: bool = False,
                            is_owner: bool = False) -> Message:
     """Create a WELCOME message with session info.
 
@@ -205,6 +206,7 @@ def create_welcome_message(session_id: str, user_list: list,
         "session_id": session_id,
         "user_list": user_list,
         "is_owner": is_owner,
+        "session_configured": session_configured,
     }
     if architecture:
         payload["architecture"] = architecture
