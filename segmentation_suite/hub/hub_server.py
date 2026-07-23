@@ -655,3 +655,69 @@ class HubServer(QObject):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "incoming").mkdir(exist_ok=True)
         _log(f"data dir -> {self.data_dir}")
+
+    def discard_crop(self, uid: str, name: str):
+        """Move a crop pair to incoming/<uid>/discarded/ and rebuild the pool.
+
+        Called (marshaled to the main thread) from the web console's review view.
+        """
+        import shutil
+        if not uid or "/" in uid or "\\" in uid or ".." in name or "/" in name:
+            return
+        base = self.data_dir / "incoming" / uid
+        for sub in ("train_images", "train_masks"):
+            src = base / sub / name
+            if src.exists():
+                dst_dir = base / "discarded" / sub
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst_dir / name))
+        _log(f"discarded crop {uid}/{name}")
+        self._rebuild_timer.start()   # debounced destructive rebuild
+
+    # ================================================================ web view
+    def web_state(self) -> dict:
+        """Full snapshot for the web console. Defensive copies — safe to read
+        from the HTTP thread while the main thread mutates state."""
+        from .animals import animal_for_index, color_for_index, animal_svg
+        users = []
+        online = set(self._users.keys())
+        for uid, info in list(self._known_users.items()):
+            idx = int(info.get("join_index", 0))
+            users.append({
+                "uid": uid,
+                "name": info.get("display_name", "User"),
+                "is_owner": bool(info.get("is_owner")),
+                "online": uid in online,
+                "included": bool(info.get("included", True)),
+                "crops": self._disk_crop_count(uid),
+                "color": color_for_index(idx),
+                "animal_svg": animal_svg(animal_for_index(idx)),
+            })
+        models = []
+        try:
+            from ..models.unet import get_available_architectures
+            from ..models.architectures import (
+                get_available_architectures as _reg, is_pretrained_architecture)
+            archm = get_available_architectures()
+            for aid, nm in _reg(include_hidden=True).items():
+                if aid not in archm and is_pretrained_architecture(aid):
+                    archm[aid] = nm
+            for aid, disp in archm.items():
+                short = disp.replace("UNet ", "").replace("(", "").replace(")", "")
+                models.append({"id": aid, "name": short})
+        except Exception as e:
+            _log(f"model list error: {e}")
+        return {
+            "code": self.code,
+            "connect_address": self.connect_address(),
+            "data_dir": str(self.data_dir),
+            "project_name": self.project_name,
+            "session_subproject": self.session_subproject,
+            "crop_size": self.crop_size,
+            "model": self.prediction_model or self.architecture,
+            "models": models,
+            "users": users,
+            "online_count": len(online),
+            "total_count": len(self._known_users),
+            "training": self.training_state(),
+        }

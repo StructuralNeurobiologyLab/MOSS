@@ -2,9 +2,14 @@
 """
 CLI entry point for the MOSS Hub.
 
-    python -m segmentation_suite.hub --data-dir PATH  # start / auto-resume
-    python -m segmentation_suite.hub --data-dir PATH --fresh   # ignore any saved session
-    python -m segmentation_suite.hub --mock           # simulated backend (visual dev)
+    python -m segmentation_suite.hub --data-dir PATH   # web console + Qt window
+    python -m segmentation_suite.hub --data-dir PATH --no-gui   # headless (web only, cluster)
+    python -m segmentation_suite.hub --data-dir PATH --fresh    # ignore any saved session
+    python -m segmentation_suite.hub --mock            # simulated backend (Qt visual dev)
+
+The primary interface is the WEB CONSOLE (open http://<host>:<web-port>/ in a
+browser) — ideal on the cluster where X11 GUIs are painful. The Qt window also
+opens by default for laptop use; disable it with --no-gui (headless).
 
 If --data-dir already contains a session.json, the hub RESUMES that session
 (config + users + crops restored; users rejoin their roles). Pass --fresh to
@@ -31,7 +36,14 @@ def main():
     parser.add_argument("--fresh", action="store_true",
                         help="Start a new session even if --data-dir has a saved session.json")
     parser.add_argument("--mock", action="store_true",
-                        help="Use the simulated mock backend (visual dev only, no network)")
+                        help="Use the simulated mock backend (Qt visual dev only, no network)")
+    # Interface
+    parser.add_argument("--web-port", type=int, default=8080,
+                        help="Port for the browser console (0 to disable)")
+    parser.add_argument("--no-gui", action="store_true",
+                        help="Headless: no Qt window, web console only (cluster)")
+    parser.add_argument("--no-web", action="store_true",
+                        help="Disable the web console (Qt window only)")
     # Trainer knobs
     parser.add_argument("--cpu", action="store_true", help="Force CPU training (laptop dev)")
     parser.add_argument("--epochs", type=int, default=50000, help="Max training epochs")
@@ -40,13 +52,22 @@ def main():
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
+    gui = not args.no_gui
+    web = not args.no_web and args.web_port > 0
 
-    from PyQt6.QtWidgets import QApplication
-    app = QApplication(sys.argv)
+    # Qt needs an event loop either way (backend uses QTimer/signals). Use a
+    # widget app when showing the window, else a headless core app.
+    if gui:
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication(sys.argv)
+    else:
+        from PyQt6.QtCore import QCoreApplication
+        app = QCoreApplication(sys.argv)
 
     if args.mock:
         from .mock_backend import MockHubBackend
         backend = MockHubBackend(data_dir=args.data_dir)
+        web = False  # the mock has no web_state()/controls
     else:
         # Auto-resume when a manifest is present, unless --fresh is given.
         manifest = Path(args.data_dir).expanduser() / "session.json"
@@ -62,9 +83,18 @@ def main():
         backend.train_batch_size = args.batch_size
         backend.train_lr = args.lr
 
-    from .hub_window import HubWindow
-    window = HubWindow(backend)
-    window.show()
+    window = None
+    if gui:
+        from .hub_window import HubWindow
+        window = HubWindow(backend)
+        window.show()
+
+    web_srv = None
+    if web:
+        from .hub_web import HubWeb
+        web_srv = HubWeb(backend, host=args.host, port=args.web_port)
+        web_srv.start()
+
     backend.start()
     return app.exec()
 
