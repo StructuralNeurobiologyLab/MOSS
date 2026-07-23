@@ -182,11 +182,14 @@ class HubServer(QObject):
         self.user_connected.emit(uid, name, is_owner)
 
     async def _send_welcome(self, user: _User):
+        # The owner keeps their own authoritative subproject; only joinees adopt
+        # the namespaced session subproject (to avoid colliding with their own).
+        session_subproject = None if user.is_owner else (self.session_subproject or None)
         welcome = create_welcome_message(
             session_id=self.code,
             user_list=self._user_list(),
             architecture=self.architecture or None,
-            session_subproject=self.session_subproject or None,
+            session_subproject=session_subproject,
             prediction_model=self.prediction_model or None,
             is_owner=user.is_owner,
         )

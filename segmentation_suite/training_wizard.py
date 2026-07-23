@@ -853,6 +853,10 @@ class TrainingWizard(QMainWindow):
         self._session_client.user_list_updated.connect(self._on_user_list_updated)
         self._session_client.sync_status.connect(self._on_sync_status)
         self._session_client.architecture_received.connect(self._on_architecture_received)
+        # Hub redesign: ownership, session subproject, authoritative prediction lock.
+        self._session_client.owner_assigned.connect(self._on_owner_assigned)
+        self._session_client.session_subproject_received.connect(self._on_session_subproject_received)
+        self._session_client.prediction_model_received.connect(self._on_prediction_model_received)
 
         self._session_client.connect_direct(host_ip, port, name)
         self.session_btn.setEnabled(False)
@@ -908,8 +912,9 @@ class TrainingWizard(QMainWindow):
         self._update_session_ui(connected=False)
         # Disable multi-user on training page
         self.training_page.disable_multi_user()
-        # Unlock architecture, subproject, and training
+        # Unlock architecture, prediction, subproject, and training
         self.training_page.unlock_architecture()
+        self.training_page.unlock_prediction_architecture()
         self.training_page.unlock_training()
         self._unlock_subproject()
 
@@ -951,6 +956,40 @@ class TrainingWizard(QMainWindow):
         """Handle architecture received from host - lock to that architecture."""
         print(f"[Wizard] Received session architecture: {architecture}")
         self.training_page.lock_architecture(architecture)
+
+    def _on_owner_assigned(self, is_owner: bool):
+        """Hub told us whether we own this session. Owner registers the project."""
+        print(f"[Wizard] Owner assigned: {is_owner}")
+        if not is_owner or not self._session_client:
+            return
+        # Send the authoritative project identity to the hub.
+        config = getattr(self, 'config', {}) or {}
+        project_name = config.get('project_name') or ''
+        if not project_name and self.training_page.project_dir:
+            from pathlib import Path
+            project_name = Path(self.training_page.project_dir).name
+        subproject = self.training_page._active_subproject or 'default'
+        architecture = getattr(self.training_page, 'current_architecture', '') or ''
+        prediction_model = getattr(self.training_page, 'prediction_architecture', '') or ''
+        try:
+            from .project_config import list_subprojects
+            subprojects = list_subprojects(str(self.training_page.project_dir))
+        except Exception:
+            subprojects = []
+        self._session_client.send_project_register(
+            project_name, subproject, architecture, prediction_model, subprojects)
+        print(f"[Wizard] Registered project '{project_name}' subproject '{subproject}' with hub")
+
+    def _on_session_subproject_received(self, subproject_name: str):
+        """Hub dictated the session subproject — adopt it locally, then lock the panel."""
+        print(f"[Wizard] Adopting session subproject: {subproject_name}")
+        self.training_page.adopt_session_subproject(subproject_name)
+        self._lock_subproject(subproject_name)
+
+    def _on_prediction_model_received(self, architecture: str):
+        """Hub dictated the authoritative prediction model — lock the dropdown (red)."""
+        print(f"[Wizard] Received authoritative prediction model: {architecture}")
+        self.training_page.lock_prediction_architecture(architecture)
 
     def _on_session_disconnected(self):
         """Handle disconnection."""

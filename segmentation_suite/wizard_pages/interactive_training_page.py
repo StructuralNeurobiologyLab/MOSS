@@ -25,6 +25,7 @@ from ..project_config import (
     save_project_config, load_project_config, make_relative_path,
     has_subprojects, get_active_subproject, get_subproject_paths,
     save_subproject_config, load_subproject_config, get_subproject_dir,
+    create_subproject, list_subprojects,
 )
 from ..dpi_scaling import scaled, scaled_font
 
@@ -138,6 +139,7 @@ class InteractiveTrainingPage(QWidget):
         self._arch_id_to_name = {}  # Maps architecture id -> display name
         self._architecture_locked = False  # True when in multi-user session
         self._training_locked = False  # True when joinee in multi-user session
+        self._prediction_locked = False  # True when hub dictates the prediction model
 
         # Prediction state
         self.predict_worker = None
@@ -590,6 +592,60 @@ class InteractiveTrainingPage(QWidget):
         self._training_locked = False
         self.train_btn.setEnabled(True)
         self.train_btn.setToolTip("Start Training")
+
+    def adopt_session_subproject(self, subproject_name: str):
+        """Create (if needed) and switch to the hub's session subproject.
+
+        Called on a joinee when the hub dictates the canonical session
+        subproject (e.g. 'mitochondria__songbird_em'). Quarantines this
+        session's work in its own local subproject without renaming anything
+        the user already has.
+        """
+        if not self.project_dir or not subproject_name:
+            return
+        try:
+            existing = list_subprojects(str(self.project_dir))
+            if subproject_name not in existing:
+                create_subproject(str(self.project_dir), subproject_name)
+                print(f"[Training] Created session subproject: {subproject_name}")
+            self.switch_subproject(subproject_name)
+        except Exception as e:
+            print(f"[Training] Failed to adopt session subproject '{subproject_name}': {e}")
+
+    def lock_prediction_architecture(self, architecture: str):
+        """Lock the prediction-model dropdown to a hub-dictated model (red, disabled).
+
+        Mirrors lock_architecture, but for the prediction combo — the hub is
+        authoritative over what every client predicts with.
+        """
+        print(f"[Training] Locking prediction model to: {architecture}")
+        self._prediction_locked = True
+        if architecture and architecture in getattr(self, '_pred_id_to_name', {}):
+            short_name = self._pred_id_to_name[architecture]
+            # Route through the normal change path so the predict worker updates,
+            # then keep the combo visually in sync.
+            self.on_prediction_model_changed(short_name)
+            self._sync_pred_combo()
+        self.pred_model_combo.setEnabled(False)
+        self.pred_model_combo.setStyleSheet("""
+            QComboBox {
+                color: #cc0000;
+                background-color: #ffeeee;
+            }
+            QComboBox:disabled {
+                color: #cc0000;
+                background-color: #ffeeee;
+            }
+        """)
+        self.pred_model_combo.setToolTip("Prediction model set by the hub (locked)")
+
+    def unlock_prediction_architecture(self):
+        """Unlock the prediction-model dropdown (when leaving a session)."""
+        print("[Training] Unlocking prediction model")
+        self._prediction_locked = False
+        self.pred_model_combo.setEnabled(True)
+        self.pred_model_combo.setStyleSheet("")
+        self.pred_model_combo.setToolTip("Select model for predictions")
 
     def _populate_prediction_model_combo(self):
         """Populate the prediction model dropdown with available trained models."""
