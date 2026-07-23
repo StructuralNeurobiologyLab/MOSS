@@ -25,8 +25,15 @@ from __future__ import annotations
 
 import random
 
-from PyQt6.QtCore import QObject, pyqtSignal, QTimer
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QBuffer, QIODevice
 from PyQt6.QtGui import QImage, qRgb
+
+
+def _qimage_to_png_bytes(img: QImage) -> bytes:
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "PNG")
+    return bytes(buf.data())
 
 
 _NAMES = ["Nelson", "Sofia", "Amir", "Yuki", "Priya", "Leo", "Marta", "Kwame"]
@@ -54,7 +61,7 @@ class MockHubBackend(QObject):
     project_registered = pyqtSignal(str, list)
     user_connected = pyqtSignal(str, str, bool)
     user_disconnected = pyqtSignal(str)
-    crop_received = pyqtSignal(str, QImage, str)
+    crop_received = pyqtSignal(str, bytes, str)
     training_status = pyqtSignal(int, float, int)
 
     def __init__(self, data_dir: str = "~/ceph/moss_hub_demo", parent=None):
@@ -113,7 +120,7 @@ class MockHubBackend(QObject):
         uid = random.choice(list(self._users.keys()))
         self._crop_seq += 1
         img = _make_fake_crop(self._crop_seq)
-        self.crop_received.emit(uid, img, f"#{self._crop_seq} · z=1{self._crop_seq:03d}")
+        self.crop_received.emit(uid, _qimage_to_png_bytes(img), f"#{self._crop_seq} · z=1{self._crop_seq:03d}")
 
     # --------------------------------------------------------------- training
     def _tick_training(self):

@@ -44,6 +44,10 @@ class MessageType(Enum):
     TRAINING_DATA = "training_data"        # Client -> Host: image+mask crop
     TRAINING_DATA_ACK = "training_data_ack"  # Host -> Client: received confirmation
 
+    # Hub redesign (authoritative standalone hub)
+    PROJECT_REGISTER = "project_register"        # Owner -> Hub: project/subproject/model identity
+    SET_PREDICTION_MODEL = "set_prediction_model"  # Hub -> Client: authoritative prediction model
+
 
 # Maximum chunk size for WebSocket messages (16MB to stay under Cloudflare's 32MB limit)
 MAX_CHUNK_SIZE = 16 * 1024 * 1024
@@ -186,17 +190,55 @@ def create_hello_message(user_id: str, display_name: str) -> Message:
 
 
 def create_welcome_message(session_id: str, user_list: list,
-                           architecture: str = None) -> Message:
-    """Create a WELCOME message with session info."""
+                           architecture: str = None,
+                           session_subproject: str = None,
+                           prediction_model: str = None,
+                           is_owner: bool = False) -> Message:
+    """Create a WELCOME message with session info.
+
+    The hub uses the extended fields to tell a joining client which local
+    subproject to adopt for this session, which model to predict with
+    (authoritative), and whether this client is the session owner.
+    """
     payload = {
         "session_id": session_id,
-        "user_list": user_list
+        "user_list": user_list,
+        "is_owner": is_owner,
     }
     if architecture:
         payload["architecture"] = architecture
+    if session_subproject:
+        payload["session_subproject"] = session_subproject
+    if prediction_model:
+        payload["prediction_model"] = prediction_model
     return Message(
         type=MessageType.WELCOME,
         payload=payload
+    )
+
+
+def create_project_register_message(project_name: str, subproject: str,
+                                     architecture: str = "",
+                                     prediction_model: str = "",
+                                     subprojects: list = None) -> Message:
+    """Owner -> Hub: register the authoritative project identity for the session."""
+    return Message(
+        type=MessageType.PROJECT_REGISTER,
+        payload={
+            "project_name": project_name,
+            "subproject": subproject,
+            "architecture": architecture,
+            "prediction_model": prediction_model,
+            "subprojects": subprojects or [],
+        }
+    )
+
+
+def create_set_prediction_model_message(architecture: str) -> Message:
+    """Hub -> Client: dictate the (locked) prediction model all clients must use."""
+    return Message(
+        type=MessageType.SET_PREDICTION_MODEL,
+        payload={"architecture": architecture}
     )
 
 

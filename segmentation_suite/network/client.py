@@ -25,7 +25,7 @@ from .protocol import (
     Message, MessageType, serialize_weights, deserialize_weights,
     create_hello_message, create_weights_push_message, create_goodbye_message,
     create_chunk_start_message, create_chunk_end_message,
-    create_training_data_message,
+    create_training_data_message, create_project_register_message,
     serialize_training_data,
     chunk_data, needs_chunking, MAX_CHUNK_SIZE
 )
@@ -91,6 +91,11 @@ class SyncClient(QObject):
 
     # New signals for multi-user redesign
     training_data_received = pyqtSignal(bytes, bytes, dict)  # image_bytes, mask_bytes, metadata (host only)
+
+    # Hub redesign signals (authoritative standalone hub)
+    owner_assigned = pyqtSignal(bool)              # True if this client is the session owner
+    session_subproject_received = pyqtSignal(str)  # local subproject to adopt for this session
+    prediction_model_received = pyqtSignal(str)    # authoritative prediction model (locked)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -546,7 +551,23 @@ class SyncClient(QObject):
                 if architecture:
                     _log(f"Session architecture: {architecture}")
                     self.architecture_received.emit(architecture)
+                # Hub extensions: ownership, session subproject, prediction lock.
+                self.owner_assigned.emit(bool(msg.payload.get("is_owner", False)))
+                session_subproject = msg.payload.get("session_subproject", "")
+                if session_subproject:
+                    _log(f"Session subproject: {session_subproject}")
+                    self.session_subproject_received.emit(session_subproject)
+                prediction_model = msg.payload.get("prediction_model", "")
+                if prediction_model:
+                    _log(f"Authoritative prediction model: {prediction_model}")
+                    self.prediction_model_received.emit(prediction_model)
                 self.sync_status.emit(f"Joined session {self.session_id}")
+
+            elif msg.type == MessageType.SET_PREDICTION_MODEL:
+                arch = msg.payload.get("architecture", "")
+                if arch:
+                    _log(f"Prediction model set by hub: {arch}")
+                    self.prediction_model_received.emit(arch)
 
             elif msg.type == MessageType.USER_LIST:
                 user_list = msg.payload.get("users", [])
@@ -643,6 +664,31 @@ class SyncClient(QObject):
             _log(f"Sent architecture info: {architecture}")
         except Exception as e:
             _log(f"Failed to send architecture: {e}")
+
+    def send_project_register(self, project_name: str, subproject: str,
+                              architecture: str = "", prediction_model: str = "",
+                              subprojects: list = None):
+        """Owner -> Hub: register the authoritative project identity for the session."""
+        if not self._connected or not self._loop:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_project_register_async(
+                project_name, subproject, architecture, prediction_model,
+                subprojects or []),
+            self._loop
+        )
+
+    async def _send_project_register_async(self, project_name, subproject,
+                                           architecture, prediction_model, subprojects):
+        if not self._websocket:
+            return
+        try:
+            msg = create_project_register_message(
+                project_name, subproject, architecture, prediction_model, subprojects)
+            await self._websocket.send(msg.to_json())
+            _log(f"Sent PROJECT_REGISTER: {project_name}/{subproject}")
+        except Exception as e:
+            _log(f"Failed to send project register: {e}")
 
     def send_weights(self, weights: dict, epoch: int, loss: float,
                     num_samples: int = 1):

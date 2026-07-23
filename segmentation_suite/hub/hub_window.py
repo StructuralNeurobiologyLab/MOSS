@@ -208,11 +208,12 @@ class HubWindow(QMainWindow):
         p_lay.addWidget(QLabel("All clients predict with:"))
         self.pred_combo = QComboBox()
         self.pred_combo.addItems(PREDICTION_MODELS)
+        # Authoritative: changing this broadcasts to every client immediately,
+        # and each client that joins is locked to the current choice on connect.
+        self.pred_combo.currentTextChanged.connect(self._on_prediction_changed)
         p_lay.addWidget(self.pred_combo)
-        apply_btn = QPushButton("Push to all clients")
-        apply_btn.clicked.connect(self._push_prediction_model)
-        p_lay.addWidget(apply_btn)
-        note = QLabel("Clients' prediction dropdown locks (red) to this choice.")
+        note = QLabel("Applied automatically — clients' prediction dropdown "
+                      "locks (red) to this choice on join and on change.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#888; font-size:10px; font-weight:normal;")
         p_lay.addWidget(note)
@@ -262,7 +263,10 @@ class HubWindow(QMainWindow):
         self._relayout_tiles()
         self._update_count()
 
-    def _on_crop_received(self, user_id: str, image, caption: str):
+    def _on_crop_received(self, user_id: str, png_bytes: bytes, caption: str):
+        from PyQt6.QtGui import QImage
+        image = QImage()
+        image.loadFromData(png_bytes, "PNG")
         tile = self._tiles.get(user_id)
         if tile:
             tile.increment_crops()
@@ -313,8 +317,9 @@ class HubWindow(QMainWindow):
             self.datadir_label.setText(path)
             self.backend.set_data_dir(path)
 
-    def _push_prediction_model(self):
-        self.backend.set_prediction_model(self.pred_combo.currentText())
+    def _on_prediction_changed(self, arch: str):
+        # Broadcast to all clients immediately; new joiners are synced on connect.
+        self.backend.set_prediction_model(arch)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

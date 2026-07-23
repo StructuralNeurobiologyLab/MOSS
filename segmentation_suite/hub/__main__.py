@@ -25,19 +25,19 @@ def main():
                         help="Address to bind the hub server to (real mode)")
     parser.add_argument("--port", type=int, default=8765,
                         help="Port to listen on (real mode)")
-    parser.add_argument("--live", action="store_true",
-                        help="Use the real WebSocket HubServer instead of the mock backend")
+    parser.add_argument("--mock", action="store_true",
+                        help="Use the simulated mock backend (visual dev only, no network)")
     args = parser.parse_args()
 
     from PyQt6.QtWidgets import QApplication
     app = QApplication(sys.argv)
 
-    if args.live:
-        print("Live HubServer not implemented yet — run without --live for the mock GUI.")
-        return 1
-    else:
+    if args.mock:
         from .mock_backend import MockHubBackend
         backend = MockHubBackend(data_dir=args.data_dir)
+    else:
+        from .hub_server import HubServer
+        backend = HubServer(data_dir=args.data_dir, host=args.host, port=args.port)
 
     from .hub_window import HubWindow
     window = HubWindow(backend)
