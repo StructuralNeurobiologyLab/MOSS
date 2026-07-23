@@ -83,6 +83,7 @@ class HubServer(QObject):
         self.session_subproject: str = ""
         self.architecture: str = ""
         self.prediction_model: str = ""
+        self.crop_size: int = 0   # single hub-wide crop/tile size (0 = unset)
         self.subprojects: list = []
 
         self._users: Dict[str, _User] = {}        # user_id -> _User
@@ -203,6 +204,7 @@ class HubServer(QObject):
             architecture=self.architecture or None,
             session_subproject=session_subproject,
             prediction_model=self.prediction_model or None,
+            crop_size=self.crop_size or None,   # global — sent to owner too
             is_owner=user.is_owner,
         )
         await self._safe_send(user.ws, welcome.to_json())
@@ -220,12 +222,14 @@ class HubServer(QObject):
         self.owner_subproject = msg.payload.get("subproject", "") or "default"
         self.architecture = msg.payload.get("architecture", "") or self.architecture
         self.prediction_model = msg.payload.get("prediction_model", "") or self.prediction_model
+        self.crop_size = int(msg.payload.get("crop_size", 0)) or self.crop_size
         self.subprojects = msg.payload.get("subprojects", [])
         # Stable, human-readable, quarantined session subproject name.
         safe_proj = self.project_name.replace("/", "-").replace("\\", "-")
         self.session_subproject = f"{self.owner_subproject}__{safe_proj}"
         _log(f"PROJECT_REGISTER project={self.project_name} subproject={self.owner_subproject} "
-             f"-> session_subproject={self.session_subproject} arch={self.architecture}")
+             f"-> session_subproject={self.session_subproject} arch={self.architecture} "
+             f"crop_size={self.crop_size}")
         self.project_registered.emit(self.project_name, self.subprojects)
         if self.prediction_model:
             self.prediction_model_set.emit(self.prediction_model)
@@ -249,6 +253,12 @@ class HubServer(QObject):
     def _store_crop(self, uid: str, img_bytes: bytes, mask_bytes: bytes, payload: dict):
         user = self._users.get(uid)
         if not user:
+            return
+        # Backstop: the hub accepts a single crop size. Reject a stray mismatched
+        # crop (e.g. from a client that connected mid-change) before it hits disk.
+        incoming_cs = int(payload.get("crop_size", 0))
+        if self.crop_size and incoming_cs and incoming_cs != self.crop_size:
+            _log(f"SKIP crop from {user.display_name}: {incoming_cs} != locked {self.crop_size}")
             return
         self._crop_seq += 1
         ts = payload.get("timestamp", int(time.time() * 1000))

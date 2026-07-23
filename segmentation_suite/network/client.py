@@ -97,6 +97,7 @@ class SyncClient(QObject):
     owner_assigned = pyqtSignal(bool)              # True if this client is the session owner
     session_subproject_received = pyqtSignal(str)  # local subproject to adopt for this session
     prediction_model_received = pyqtSignal(str)    # authoritative prediction model (locked)
+    crop_size_received = pyqtSignal(int)           # authoritative crop/tile size (locked)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -587,6 +588,10 @@ class SyncClient(QObject):
                 if prediction_model:
                     _log(f"Authoritative prediction model: {prediction_model}")
                     self.prediction_model_received.emit(prediction_model)
+                crop_size = msg.payload.get("crop_size", 0)
+                if crop_size:
+                    _log(f"Authoritative crop size: {crop_size}")
+                    self.crop_size_received.emit(int(crop_size))
                 self.sync_status.emit(f"Joined session {self.session_id}")
 
             elif msg.type == MessageType.SET_PREDICTION_MODEL:
@@ -693,24 +698,26 @@ class SyncClient(QObject):
 
     def send_project_register(self, project_name: str, subproject: str,
                               architecture: str = "", prediction_model: str = "",
-                              subprojects: list = None):
+                              subprojects: list = None, crop_size: int = 0):
         """Owner -> Hub: register the authoritative project identity for the session."""
         if not self._connected or not self._loop:
             return
         asyncio.run_coroutine_threadsafe(
             self._send_project_register_async(
                 project_name, subproject, architecture, prediction_model,
-                subprojects or []),
+                subprojects or [], crop_size),
             self._loop
         )
 
     async def _send_project_register_async(self, project_name, subproject,
-                                           architecture, prediction_model, subprojects):
+                                           architecture, prediction_model, subprojects,
+                                           crop_size):
         if not self._websocket:
             return
         try:
             msg = create_project_register_message(
-                project_name, subproject, architecture, prediction_model, subprojects)
+                project_name, subproject, architecture, prediction_model, subprojects,
+                crop_size)
             await self._websocket.send(msg.to_json())
             _log(f"Sent PROJECT_REGISTER: {project_name}/{subproject}")
         except Exception as e:

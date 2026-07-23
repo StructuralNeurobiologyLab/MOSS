@@ -697,31 +697,11 @@ class TrainingWizard(QMainWindow):
         join_layout.addWidget(address_label)
         join_layout.addWidget(address_input)
 
-        # Subproject to use for this session. If you are the FIRST to join you
-        # become the owner and this becomes the shared target for everyone.
-        join_sp_label = QLabel("Your subproject for this session:")
-        join_layout.addWidget(join_sp_label)
-        join_sp_combo = QComboBox()
-        join_subproject_names = []
-        if project_dir and has_subprojects(project_dir):
-            join_subproject_names = list_subprojects(project_dir)
-            for sp_name in join_subproject_names:
-                join_sp_combo.addItem(sp_name)
-            active_sp = get_active_subproject(project_dir)
-            if active_sp:
-                idx = join_sp_combo.findText(active_sp)
-                if idx >= 0:
-                    join_sp_combo.setCurrentIndex(idx)
-        else:
-            join_sp_combo.addItem("(no subprojects)")
-            join_sp_combo.setEnabled(False)
-        join_layout.addWidget(join_sp_combo)
-
         join_help = QLabel(
-            "First to join becomes the OWNER — the subproject above becomes the "
-            "shared target. Everyone else annotates into a local copy named "
-            "“<subproject>__<project>”. The hub does the training; your training "
-            "is disabled and the prediction model is chosen by the owner."
+            "The first person to join becomes the OWNER and configures the session "
+            "(subproject, architecture, prediction model, crop size) in a popup after "
+            "connecting. Everyone else annotates into a local copy and sends crops to "
+            "the hub — their training and model are set by the owner."
         )
         join_help.setWordWrap(True)
         join_help.setStyleSheet("color:#888; font-size:11px;")
@@ -798,11 +778,6 @@ class TrainingWizard(QMainWindow):
                 if not address:
                     QMessageBox.warning(self, "Missing Address", "Please enter the host address.")
                     return
-                # Switch to the chosen subproject first, so if we become the owner
-                # we register it as the shared session target.
-                join_sp = join_sp_combo.currentText() if join_subproject_names else None
-                if join_sp and join_sp != self.training_page._active_subproject:
-                    self.training_page.switch_subproject(join_sp)
                 self._join_lan_session(address, name)
             else:
                 code = address_input.text().strip().upper()
@@ -920,6 +895,7 @@ class TrainingWizard(QMainWindow):
         self._session_client.owner_assigned.connect(self._on_owner_assigned)
         self._session_client.session_subproject_received.connect(self._on_session_subproject_received)
         self._session_client.prediction_model_received.connect(self._on_prediction_model_received)
+        self._session_client.crop_size_received.connect(self._on_crop_size_received)
 
         self._session_client.connect_direct(host_ip, port, name)
         self.session_btn.setEnabled(False)
@@ -976,9 +952,10 @@ class TrainingWizard(QMainWindow):
         self._update_session_ui(connected=False)
         # Disable multi-user on training page
         self.training_page.disable_multi_user()
-        # Unlock architecture, prediction, subproject, and training
+        # Unlock architecture, prediction, crop size, subproject, and training
         self.training_page.unlock_architecture()
         self.training_page.unlock_prediction_architecture()
+        self.training_page.unlock_crop_size()
         self.training_page.unlock_training()
         self._unlock_subproject()
 
@@ -1022,44 +999,147 @@ class TrainingWizard(QMainWindow):
         self.training_page.lock_architecture(architecture)
 
     def _on_owner_assigned(self, is_owner: bool):
-        """Hub told us whether we own this session. Owner registers the project."""
+        """Hub told us we own this session — configure it via a popup, then register."""
         print(f"[Wizard] Owner assigned: {is_owner}")
         if not is_owner or not self._session_client:
             return
         if self._project_registered:
             return  # already registered this session — avoid register/re-welcome loop
+        # Set the guard BEFORE the (blocking) dialog so the re-welcome that follows
+        # registration cannot re-open it.
         self._project_registered = True
-        # Send the authoritative project identity to the hub.
+
+        cfg = self._show_owner_setup_dialog()
+        if cfg is None:
+            # Owner cancelled — tear down cleanly (also resets _project_registered).
+            self._disconnect_session()
+            return
+
+        subproject = cfg["subproject"]
+        arch = cfg["architecture"]
+        pred = cfg["prediction_model"]
+        crop = cfg["crop_size"]
+
+        # Apply the owner's choices locally and lock the controls (red).
+        if subproject and subproject != self.training_page._active_subproject:
+            self.training_page.switch_subproject(subproject)
+        if arch:
+            self.training_page.lock_architecture(arch)
+        if pred:
+            self.training_page.lock_prediction_architecture(pred)
+        if crop:
+            self.training_page.lock_crop_size(crop)
+
         config = getattr(self, 'config', {}) or {}
         project_name = config.get('project_name') or ''
         if not project_name and self.training_page.project_dir:
             from pathlib import Path
             project_name = Path(self.training_page.project_dir).name
-        subproject = self.training_page._active_subproject or 'default'
-        architecture = getattr(self.training_page, 'current_architecture', '') or ''
-        prediction_model = getattr(self.training_page, 'prediction_architecture', '') or ''
         try:
             from .project_config import list_subprojects
             subprojects = list_subprojects(str(self.training_page.project_dir))
         except Exception:
             subprojects = []
         self._session_client.send_project_register(
-            project_name, subproject, architecture, prediction_model, subprojects)
-        print(f"[Wizard] Registered project '{project_name}' subproject '{subproject}' with hub")
+            project_name, subproject, arch, pred, subprojects, crop)
+        print(f"[Wizard] Registered project '{project_name}' subproject '{subproject}' "
+              f"crop_size={crop} with hub")
 
-        # Make it clear the user is the owner and which subproject is shared/locked.
         self.session_status_label.setText(
-            f"● Multi-user OWNER — shared subproject: {subproject}")
+            f"● Multi-user OWNER — subproject: {subproject} · crop {crop}")
         if not self._session_notified:
             self._session_notified = True
             QMessageBox.information(
                 self, "You are the session owner",
-                f"You joined first, so you are the OWNER of this session.\n\n"
+                f"You are the OWNER of this multi-user session.\n\n"
                 f"Shared subproject:  {subproject}\n"
-                f"Project:  {project_name}\n\n"
-                "The hub trains on everyone's crops. Your local training is disabled, "
-                "and the prediction model you pick in the hub is locked for all "
+                f"Architecture:  {arch}\n"
+                f"Crop size:  {crop}\n\n"
+                "The hub trains on everyone's crops. Your local training is disabled; "
+                "the architecture, prediction model, and crop size are locked for all "
                 "participants.")
+
+    def _show_owner_setup_dialog(self):
+        """Modal shown to the OWNER right after connecting: choose the session's
+        subproject, architecture, prediction model, and crop size.
+
+        Returns a dict {subproject, architecture, prediction_model, crop_size} on
+        OK, or None if cancelled (caller disconnects on None).
+        """
+        from PyQt6.QtWidgets import (
+            QDialog, QVBoxLayout, QLabel, QComboBox, QDialogButtonBox
+        )
+        from .project_config import list_subprojects, get_active_subproject
+
+        page = self.training_page
+        project_dir = (getattr(self, 'config', {}) or {}).get('project_dir') or page.project_dir
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Configure session (you are the owner)")
+        dlg.setMinimumWidth(420)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("You are the first to join — you own this session.\n"
+                             "These choices are locked for every participant:"))
+
+        # Subproject
+        lay.addWidget(QLabel("Subproject (the shared target):"))
+        sp_combo = QComboBox()
+        sp_names = list_subprojects(str(project_dir)) if project_dir else []
+        for n in sp_names:
+            sp_combo.addItem(n)
+        default_sp = page._active_subproject or (get_active_subproject(str(project_dir)) if project_dir else "")
+        if default_sp:
+            i = sp_combo.findText(default_sp)
+            if i >= 0:
+                sp_combo.setCurrentIndex(i)
+        if not sp_names:
+            sp_combo.addItem(default_sp or "default")
+        lay.addWidget(sp_combo)
+
+        # Architecture (store arch_id as item data)
+        lay.addWidget(QLabel("Training architecture:"))
+        arch_combo = QComboBox()
+        for arch_id, disp in page._arch_id_to_name.items():
+            arch_combo.addItem(disp, arch_id)
+        ai = arch_combo.findData(getattr(page, 'current_architecture', ''))
+        if ai >= 0:
+            arch_combo.setCurrentIndex(ai)
+        lay.addWidget(arch_combo)
+
+        # Prediction model (store arch_id as item data)
+        lay.addWidget(QLabel("Prediction model (all clients predict with this):"))
+        pred_combo = QComboBox()
+        for arch_id, disp in getattr(page, '_pred_id_to_name', {}).items():
+            pred_combo.addItem(disp, arch_id)
+        pi = pred_combo.findData(getattr(page, 'prediction_architecture', ''))
+        if pi >= 0:
+            pred_combo.setCurrentIndex(pi)
+        lay.addWidget(pred_combo)
+
+        # Crop size
+        lay.addWidget(QLabel("Crop size (single size for the whole session):"))
+        crop_combo = QComboBox()
+        for s in sorted(page._crop_size_buttons.keys()):
+            crop_combo.addItem(f"{s} × {s}", s)
+        ci = crop_combo.findData(getattr(page, '_current_crop_size', 256))
+        if ci >= 0:
+            crop_combo.setCurrentIndex(ci)
+        lay.addWidget(crop_combo)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return {
+            "subproject": sp_combo.currentText(),
+            "architecture": arch_combo.currentData() or "",
+            "prediction_model": pred_combo.currentData() or "",
+            "crop_size": int(crop_combo.currentData() or 256),
+        }
 
     def _on_session_subproject_received(self, subproject_name: str):
         """Hub dictated the session subproject — adopt it locally, then lock the panel."""
@@ -1084,12 +1164,19 @@ class TrainingWizard(QMainWindow):
         print(f"[Wizard] Received authoritative prediction model: {architecture}")
         self.training_page.lock_prediction_architecture(architecture)
 
+    def _on_crop_size_received(self, size: int):
+        """Hub dictated the authoritative crop size — lock the S/M/L buttons (red)."""
+        print(f"[Wizard] Received authoritative crop size: {size}")
+        self.training_page.lock_crop_size(size)
+
     def _on_session_disconnected(self):
         """Handle disconnection."""
         print("[Wizard] Disconnected from session")
         self._update_session_ui(connected=False)
         self.training_page.disable_multi_user()
         self.training_page.unlock_architecture()
+        self.training_page.unlock_prediction_architecture()
+        self.training_page.unlock_crop_size()
 
     def _on_session_error(self, error: str):
         """Handle a session error (queued cross-thread signal from SyncClient).

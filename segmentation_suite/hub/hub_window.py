@@ -372,7 +372,6 @@ class HubWindow(QMainWindow):
     def _open_gallery(self, user_id: str):
         """Open the user's crops in the same Review Crops tool used in MOSS."""
         from pathlib import Path
-        from PyQt6.QtWidgets import QMessageBox
 
         tile = self._tiles.get(user_id)
         if not tile or not self._data_dir:
@@ -381,9 +380,10 @@ class HubWindow(QMainWindow):
         images = base / "train_images"
         masks = base / "train_masks"
         if not images.exists() or not any(images.glob("*.png")):
-            QMessageBox.information(
-                self, "No crops yet",
-                f"No crops received from {tile.display_name} yet.")
+            # Keep the guard (a missing dir crashes the reviewer; an empty one
+            # opens a useless window) but surface it non-modally.
+            self.statusBar().showMessage(
+                f"No crops received from {tile.display_name} yet.", 4000)
             return
 
         from ..widgets.training_data_reviewer import TrainingDataReviewer

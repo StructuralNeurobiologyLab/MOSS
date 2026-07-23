@@ -140,6 +140,7 @@ class InteractiveTrainingPage(QWidget):
         self._architecture_locked = False  # True when in multi-user session
         self._training_locked = False  # True when joinee in multi-user session
         self._prediction_locked = False  # True when hub dictates the prediction model
+        self._crop_size_locked = False  # True when the hub/owner dictates crop/tile size
 
         # Prediction state
         self.predict_worker = None
@@ -646,6 +647,51 @@ class InteractiveTrainingPage(QWidget):
         self.pred_model_combo.setEnabled(True)
         self.pred_model_combo.setStyleSheet("")
         self.pred_model_combo.setToolTip("Select model for predictions")
+
+    def lock_crop_size(self, size: int):
+        """Lock the S/M/L crop-size buttons to an owner-decided value (red, disabled).
+
+        Crop size is a single hub-wide value: mixed sizes can't be trained
+        together (each size uses its own on-disk train folder and its crops are
+        that size). So this both visually locks AND actually applies the value
+        (canvas + working dirs), mirroring lock_architecture.
+        """
+        if size not in getattr(self, '_crop_size_buttons', {}):
+            return
+        print(f"[Training] Locking crop size to: {size}")
+        self._crop_size_locked = True
+        self._current_crop_size = size
+        if hasattr(self, 'canvas'):
+            self.canvas.set_crop_size(size)
+        for s, btn in self._crop_size_buttons.items():
+            btn.setChecked(s == size)
+            btn.setEnabled(False)
+            btn.setStyleSheet("""
+                QPushButton { border: 1px solid #cc0000; background: #ffeeee; }
+                QPushButton:checked { border: 1px solid #cc0000; background: rgba(204, 0, 0, 60); }
+                QPushButton:disabled { border: 1px solid #cc0000; background: #ffeeee; }
+            """)
+            btn.setToolTip(f"Crop size {size} set by the session owner (locked)")
+        if self.project_dir:
+            self._resolve_working_dirs()
+
+    def unlock_crop_size(self):
+        """Restore the S/M/L crop-size buttons after leaving a session."""
+        print("[Training] Unlocking crop size")
+        self._crop_size_locked = False
+        for s, btn in getattr(self, '_crop_size_buttons', {}).items():
+            btn.setEnabled(True)
+            btn.setStyleSheet("""
+                QPushButton {
+                    border: 1px solid #CCCCCC;
+                    background: transparent;
+                }
+                QPushButton:checked {
+                    border: 1px solid #FFD700;
+                    background: rgba(255, 215, 0, 50);
+                }
+            """)
+            btn.setToolTip(f"Crop size: {s}x{s}")
 
     def _populate_prediction_model_combo(self):
         """Populate the prediction model dropdown with available trained models."""
@@ -1223,6 +1269,14 @@ class InteractiveTrainingPage(QWidget):
 
     def _on_crop_size_btn(self, size: int):
         """Handle crop size button click."""
+        if self._crop_size_locked:
+            QMessageBox.warning(
+                self, "Crop Size Locked",
+                "Crop size is set by the session owner and cannot be changed "
+                "during a multi-user session.")
+            for s, btn in self._crop_size_buttons.items():
+                btn.setChecked(s == self._current_crop_size)
+            return
         # Uncheck all, check the clicked one
         for s, btn in self._crop_size_buttons.items():
             btn.setChecked(s == size)

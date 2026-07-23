@@ -193,6 +193,7 @@ def create_welcome_message(session_id: str, user_list: list,
                            architecture: str = None,
                            session_subproject: str = None,
                            prediction_model: str = None,
+                           crop_size: int = None,
                            is_owner: bool = False) -> Message:
     """Create a WELCOME message with session info.
 
@@ -211,6 +212,8 @@ def create_welcome_message(session_id: str, user_list: list,
         payload["session_subproject"] = session_subproject
     if prediction_model:
         payload["prediction_model"] = prediction_model
+    if crop_size:
+        payload["crop_size"] = crop_size
     return Message(
         type=MessageType.WELCOME,
         payload=payload
@@ -220,7 +223,8 @@ def create_welcome_message(session_id: str, user_list: list,
 def create_project_register_message(project_name: str, subproject: str,
                                      architecture: str = "",
                                      prediction_model: str = "",
-                                     subprojects: list = None) -> Message:
+                                     subprojects: list = None,
+                                     crop_size: int = 0) -> Message:
     """Owner -> Hub: register the authoritative project identity for the session."""
     return Message(
         type=MessageType.PROJECT_REGISTER,
@@ -230,6 +234,7 @@ def create_project_register_message(project_name: str, subproject: str,
             "architecture": architecture,
             "prediction_model": prediction_model,
             "subprojects": subprojects or [],
+            "crop_size": crop_size,
         }
     )
 
