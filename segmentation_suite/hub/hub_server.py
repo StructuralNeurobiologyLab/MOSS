@@ -88,6 +88,7 @@ class HubServer(QObject):
         self._ws_to_uid: Dict[object, str] = {}
         self._pending_td: Dict[str, dict] = {}     # user_id -> in-flight training-data frames
         self._crop_seq = 0
+        self._registered = False                    # first PROJECT_REGISTER wins; ignore dupes
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -211,6 +212,9 @@ class HubServer(QObject):
         if not user or not user.is_owner:
             _log("ignoring PROJECT_REGISTER from non-owner")
             return
+        if self._registered:
+            return  # identity already set — ignore duplicate registers (loop guard)
+        self._registered = True
         self.project_name = msg.payload.get("project_name", "")
         self.owner_subproject = msg.payload.get("subproject", "") or "default"
         self.architecture = msg.payload.get("architecture", "") or self.architecture
@@ -264,6 +268,8 @@ class HubServer(QObject):
         if user:
             _log(f"disconnect {user.display_name} ({uid})")
             self.user_disconnected.emit(uid)
+        if not self._users:
+            self._registered = False  # session emptied — allow a fresh owner to register
         await self._broadcast_user_list()
 
     # ================================================================ helpers

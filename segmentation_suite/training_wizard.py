@@ -253,6 +253,10 @@ class TrainingWizard(QMainWindow):
         # Cap connection-error popups: show at most one modal per connect attempt.
         self._session_error_alerted = False
         self._session_error_dialog_open = False
+        # Register the project with the hub exactly once per session (the hub
+        # re-welcomes on register, which re-fires owner_assigned — without this
+        # guard that becomes an infinite register/re-welcome loop).
+        self._project_registered = False
 
         layout.addSpacing(scaled(10))
 
@@ -740,8 +744,9 @@ class TrainingWizard(QMainWindow):
         selected_arch = arch_ids[arch_combo.currentIndex()] if arch_ids else current_arch
         selected_sp = sp_combo.currentText() if subproject_names else None
 
-        # Fresh connection attempt — allow one error modal for it.
+        # Fresh connection attempt — allow one error modal + one project register.
         self._session_error_alerted = False
+        self._project_registered = False
 
         if is_host:
             # Switch to selected subproject before starting session
@@ -919,6 +924,7 @@ class TrainingWizard(QMainWindow):
 
     def _disconnect_session(self):
         """Disconnect from the current session."""
+        self._project_registered = False
         if self._session_client:
             self._session_client.disconnect()
             self._session_client = None
@@ -980,6 +986,9 @@ class TrainingWizard(QMainWindow):
         print(f"[Wizard] Owner assigned: {is_owner}")
         if not is_owner or not self._session_client:
             return
+        if self._project_registered:
+            return  # already registered this session — avoid register/re-welcome loop
+        self._project_registered = True
         # Send the authoritative project identity to the hub.
         config = getattr(self, 'config', {}) or {}
         project_name = config.get('project_name') or ''
