@@ -16,7 +16,7 @@ mock and against the real HubServer later without change.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -92,6 +92,40 @@ class HubWindow(QMainWindow):
             }
         """)
 
+    _CODE_PLACEHOLDER = "—" * 6  # em-dashes shown before a session starts
+
+    def _make_copy_button(self, source_label, empty_guard=None):
+        """A small 'copy' button with hover/pressed feedback + a transient 'copied!'.
+
+        Its pseudo-state rules live on the button's OWN stylesheet so they win
+        over the global QPushButton style (Qt cascade). Uses one reusable
+        window-parented single-shot timer, so rapid clicks don't stack.
+        """
+        btn = QPushButton("copy")
+        btn.setFixedHeight(24)
+        btn.setMinimumWidth(64)  # keep width steady across 'copy' / 'copied!'
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet("""
+            QPushButton { background:#333; color:#ddd; border:none;
+                          padding:2px 8px; font-size:11px; border-radius:4px; }
+            QPushButton:hover   { background:#454545; }
+            QPushButton:pressed { background:#f4c542; color:#161618; }
+        """)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: btn.setText("copy"))
+
+        def do_copy():
+            text = source_label.text().strip()
+            if not text or (empty_guard and empty_guard(text)):
+                return
+            QGuiApplication.clipboard().setText(text)
+            btn.setText("copied!")
+            timer.start(1200)
+
+        btn.clicked.connect(do_copy)
+        return btn
+
     def _build_topbar(self) -> QWidget:
         bar = QFrame()
         bar.setStyleSheet("QFrame { background:#0f0f10; border-bottom:1px solid #2a2a2a; }")
@@ -103,25 +137,45 @@ class HubWindow(QMainWindow):
         title.setStyleSheet("font-size:20px; font-weight:800; color:#4d90e6;")
         lay.addWidget(title)
 
-        # Session code (big, copyable)
+        # Connect address (big, copyable) — THIS is what LAN clients type to join.
+        addr_box = QVBoxLayout()
+        addr_box.setSpacing(0)
+        addr_cap = QLabel("CONNECT ADDRESS  ·  share this")
+        addr_cap.setStyleSheet("color:#777; font-size:10px; font-weight:bold;")
+        addr_row = QHBoxLayout()
+        addr_row.setSpacing(6)
+        self.address_label = QLabel("—")
+        self.address_label.setStyleSheet(
+            "font-size:20px; font-weight:800; color:#f4c542; font-family:monospace;"
+        )
+        addr_row.addWidget(self.address_label)
+        addr_row.addWidget(self._make_copy_button(self.address_label))
+        self.address_hint = QLabel("clients: Multi-User → Join → LAN → paste this")
+        self.address_hint.setStyleSheet("color:#8a8a8a; font-size:10px;")
+        addr_box.addWidget(addr_cap)
+        addr_box.addLayout(addr_row)
+        addr_box.addWidget(self.address_hint)
+        lay.addLayout(addr_box)
+
+        # Session code — a session label/identifier, NOT the LAN connect string.
         code_box = QVBoxLayout()
         code_box.setSpacing(0)
         code_cap = QLabel("SESSION CODE")
         code_cap.setStyleSheet("color:#777; font-size:10px; font-weight:bold;")
         code_row = QHBoxLayout()
         code_row.setSpacing(6)
-        self.code_label = QLabel("——————")
+        self.code_label = QLabel(self._CODE_PLACEHOLDER)
         self.code_label.setStyleSheet(
-            "font-size:22px; font-weight:800; color:#f4c542; letter-spacing:3px;"
+            "font-size:15px; font-weight:700; color:#b9a24a; letter-spacing:2px;"
         )
-        copy_btn = QPushButton("copy")
-        copy_btn.setFixedHeight(24)
-        copy_btn.setStyleSheet("background:#333; padding:2px 8px; font-size:11px;")
-        copy_btn.clicked.connect(self._copy_code)
         code_row.addWidget(self.code_label)
-        code_row.addWidget(copy_btn)
+        code_row.addWidget(self._make_copy_button(
+            self.code_label, empty_guard=lambda t: t.startswith("—")))
+        code_note = QLabel("session label — not for joining")
+        code_note.setStyleSheet("color:#6a6a6a; font-size:9px;")
         code_box.addWidget(code_cap)
         code_box.addLayout(code_row)
+        code_box.addWidget(code_note)
         lay.addLayout(code_box)
 
         # Project
@@ -231,9 +285,16 @@ class HubWindow(QMainWindow):
         self.backend.crop_received.connect(self._on_crop_received)
         self.backend.training_status.connect(self._on_training_status)
 
-    def _on_session_started(self, code: str, data_dir: str):
+    def _on_session_started(self, code: str, data_dir: str, connect_addr: str = ""):
         self.code_label.setText(code)
         self.datadir_label.setText(data_dir)
+        if connect_addr:
+            self.address_label.setText(connect_addr)
+            if connect_addr.startswith("127.0.0.1") or connect_addr.startswith("localhost"):
+                self.address_label.setStyleSheet(
+                    "font-size:20px; font-weight:800; color:#e6a33c; font-family:monospace;")
+                self.address_hint.setText("⚠ localhost only — other machines can't reach this")
+                self.address_hint.setStyleSheet("color:#e6a33c; font-size:10px;")
 
     def _on_project_registered(self, name: str, subprojects: list):
         self.project_label.setText(name)
@@ -307,9 +368,6 @@ class HubWindow(QMainWindow):
         gallery.show()
         gallery.raise_()
         gallery.activateWindow()
-
-    def _copy_code(self):
-        QGuiApplication.clipboard().setText(self.code_label.text())
 
     def _choose_data_dir(self):
         path = QFileDialog.getExistingDirectory(self, "Choose the Hub's main data folder")

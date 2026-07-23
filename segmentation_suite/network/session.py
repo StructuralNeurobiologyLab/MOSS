@@ -48,6 +48,51 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
+def parse_lan_address(text: str) -> tuple:
+    """Parse a user-entered LAN hub address into (host, port).
+
+    Robust to the common paste/typo variants: strips surrounding whitespace,
+    a scheme prefix (ws://, wss://, http://…), and any trailing path/slash;
+    defaults the port to 8765; supports bracketed IPv6 ([::1]:8765). The
+    parsed host is stripped so "192.168.1.5 :8765" recovers cleanly, but a
+    host with internal whitespace is rejected.
+
+    Raises ValueError on empty or malformed input.
+    """
+    from urllib.parse import urlsplit
+
+    raw = (text or "").strip()
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]      # drop ws:// wss:// http:// …
+    raw = raw.split("/", 1)[0].strip()    # drop any path / trailing slash
+    if not raw:
+        raise ValueError("empty address")
+
+    parts = urlsplit("ws://" + raw)       # .port raises ValueError if non-numeric/out-of-range
+    host = (parts.hostname or "").strip()
+    port = parts.port or 8765
+    if not host or any(c.isspace() for c in host):
+        raise ValueError(f"invalid host in {text!r}")
+    return host, port
+
+
+def looks_like_session_code(text: str) -> bool:
+    """True if the entered text looks like a 6-char session code, not a LAN address.
+
+    Runs on the case-preserving token (session codes are uppercase). Used to
+    catch the common mistake of pasting the session code into the IP field.
+    """
+    token = (text or "").strip()
+    if "://" in token:
+        token = token.split("://", 1)[1]
+    token = token.split("/", 1)[0].strip()
+    return (
+        ":" not in token and "." not in token
+        and token.lower() != "localhost"
+        and len(token) == 6 and token.isalnum() and token == token.upper()
+    )
+
+
 @dataclass
 class UserInfo:
     """Information about a connected user."""

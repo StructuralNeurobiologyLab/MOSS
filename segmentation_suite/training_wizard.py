@@ -250,6 +250,9 @@ class TrainingWizard(QMainWindow):
         self._session_client = None
         self._aggregation_server = None
         self._is_session_host = False
+        # Cap connection-error popups: show at most one modal per connect attempt.
+        self._session_error_alerted = False
+        self._session_error_dialog_open = False
 
         layout.addSpacing(scaled(10))
 
@@ -682,9 +685,9 @@ class TrainingWizard(QMainWindow):
         # --- Join address/code input (only visible when joining) ---
         join_group = QGroupBox("Connection Details")
         join_layout = QVBoxLayout(join_group)
-        address_label = QLabel("Host address (IP or IP:port):")
+        address_label = QLabel("Hub address (IP:port — shown in the Hub window):")
         address_input = QLineEdit()
-        address_input.setPlaceholderText("e.g. 192.168.1.5 or 192.168.1.5:8765")
+        address_input.setPlaceholderText("e.g. 192.168.1.5:8765")
         join_layout.addWidget(address_label)
         join_layout.addWidget(address_input)
         join_group.setVisible(False)
@@ -711,8 +714,8 @@ class TrainingWizard(QMainWindow):
             host_settings_group.setVisible(is_hosting)
             join_group.setVisible(is_joining)
             if is_joining and lan_radio.isChecked():
-                address_label.setText("Host address (IP or IP:port):")
-                address_input.setPlaceholderText("e.g. 192.168.1.5 or 192.168.1.5:8765")
+                address_label.setText("Hub address (IP:port — shown in the Hub window):")
+                address_input.setPlaceholderText("e.g. 192.168.1.5:8765")
             elif is_joining and relay_radio.isChecked():
                 address_label.setText("6-character session code:")
                 address_input.setPlaceholderText("e.g. ABC123")
@@ -736,6 +739,9 @@ class TrainingWizard(QMainWindow):
         # Get host settings
         selected_arch = arch_ids[arch_combo.currentIndex()] if arch_ids else current_arch
         selected_sp = sp_combo.currentText() if subproject_names else None
+
+        # Fresh connection attempt — allow one error modal for it.
+        self._session_error_alerted = False
 
         if is_host:
             # Switch to selected subproject before starting session
@@ -830,16 +836,28 @@ class TrainingWizard(QMainWindow):
         self._is_session_host = True
 
     def _join_lan_session(self, host_address: str, name: str):
-        """Join a LAN session by direct IP connection."""
+        """Join a LAN session (the hub) by direct IP:port connection."""
         from .network import SyncClient
+        from .network.session import parse_lan_address, looks_like_session_code
+
+        # Guard the most common mistake: typing the 6-char SESSION CODE into the
+        # LAN address field. The code identifies the session; it is NOT how you
+        # connect on a LAN — you connect to the hub's IP:port. Soft confirm so a
+        # legitimate short hostname can still proceed.
+        if looks_like_session_code(host_address):
+            resp = QMessageBox.question(
+                self, "That looks like a session code",
+                f"'{host_address.strip()}' looks like a 6-character session code, not a LAN "
+                "address.\n\nFor a LAN session, enter the hub's IP address (shown in the Hub "
+                "window as the CONNECT ADDRESS, e.g. 192.168.1.5:8765) — not the session "
+                "code.\n\nConnect to it anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if resp != QMessageBox.StandardButton.Yes:
+                return
 
         try:
-            if ':' in host_address:
-                host_ip, port_str = host_address.split(':')
-                port = int(port_str)
-            else:
-                host_ip = host_address
-                port = 8765
+            host_ip, port = parse_lan_address(host_address)
         except ValueError:
             QMessageBox.warning(self, "Invalid Address",
                 "Please enter a valid address (e.g., 192.168.1.5 or 192.168.1.5:8765)")
@@ -999,10 +1017,33 @@ class TrainingWizard(QMainWindow):
         self.training_page.unlock_architecture()
 
     def _on_session_error(self, error: str):
-        """Handle session error."""
+        """Handle a session error (queued cross-thread signal from SyncClient).
+
+        A bad/refused address emits repeatedly (reconnect loop), and
+        QMessageBox.warning runs a nested event loop that dispatches queued
+        duplicates and re-enters this slot. Show at most ONE modal per connect
+        attempt; route the rest to the status label so it doesn't "keep
+        popping up".
+        """
         print(f"[Wizard] Session error: {error}")
-        QMessageBox.warning(self, "Session Error", error)
         self._update_session_ui(connected=False)
+        if self._session_error_alerted or self._session_error_dialog_open:
+            self._show_session_error_in_label(error)
+            return
+        self._session_error_alerted = True
+        self._session_error_dialog_open = True
+        try:
+            QMessageBox.warning(self, "Session Error", error)
+        finally:
+            self._session_error_dialog_open = False
+
+    def _show_session_error_in_label(self, error: str):
+        """Surface a repeated connection error non-modally in the status label."""
+        try:
+            self.session_status_label.setText(f"Connection error: {error}")
+            self.session_status_label.setVisible(True)
+        except Exception:
+            pass
 
     def _on_user_list_updated(self, users: list):
         """Handle user list update."""
@@ -1023,6 +1064,10 @@ class TrainingWizard(QMainWindow):
         self.session_disconnect_btn.setVisible(connected)
         if not connected:
             self.session_btn.setEnabled(True)
+        else:
+            # A successful connect resets the popup budget, so a genuinely new
+            # error afterwards (e.g. a mid-session drop) still gets one modal.
+            self._session_error_alerted = False
 
     def _close_wizard(self):
         """Close the wizard and return to welcome page."""

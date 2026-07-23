@@ -28,6 +28,8 @@ import random
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QBuffer, QIODevice
 from PyQt6.QtGui import QImage, qRgb
 
+from ..network.session import get_local_ip
+
 
 def _qimage_to_png_bytes(img: QImage) -> bytes:
     buf = QBuffer()
@@ -57,7 +59,7 @@ def _make_fake_crop(seed: int, size: int = 96) -> QImage:
 
 
 class MockHubBackend(QObject):
-    session_started = pyqtSignal(str, str)
+    session_started = pyqtSignal(str, str, str)
     project_registered = pyqtSignal(str, list)
     user_connected = pyqtSignal(str, str, bool)
     user_disconnected = pyqtSignal(str)
@@ -85,7 +87,7 @@ class MockHubBackend(QObject):
 
     # ------------------------------------------------------------------ start
     def start(self):
-        self.session_started.emit(self._code, self._data_dir)
+        self.session_started.emit(self._code, self._data_dir, f"{get_local_ip()}:8765")
         # First user joins shortly and becomes owner, registering the project.
         QTimer.singleShot(600, self._add_owner)
         self._join_timer.start(3500)

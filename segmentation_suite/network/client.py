@@ -7,6 +7,7 @@ Connects to a host (direct) or relay server to sync model weights.
 
 import asyncio
 import json
+import socket
 import threading
 from typing import Optional, Callable
 from datetime import datetime
@@ -281,6 +282,24 @@ class SyncClient(QObject):
             _log("Client thread ending")
             self._loop.close()
 
+    @staticmethod
+    def _is_permanent_connection_error(exc) -> bool:
+        """True if the error can't be fixed by retrying (e.g. name resolution).
+
+        A bad/mistyped host (the classic "typed the session code into the
+        IP field" mistake) raises socket.gaierror — retrying 10x just spams
+        the UI, so we fail fast instead. Walk the exception chain since
+        websockets may wrap it.
+        """
+        seen = set()
+        cur = exc
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            if isinstance(cur, socket.gaierror):
+                return True
+            cur = cur.__cause__ or cur.__context__
+        return False
+
     async def _connect_loop(self):
         """Connection loop with reconnection support."""
         _log("Starting connect loop")
@@ -294,18 +313,25 @@ class SyncClient(QObject):
                 self._connected = False
                 self.disconnected.emit()
 
+                permanent = self._is_permanent_connection_error(e)
+
                 # Only show error if this wasn't a deliberate disconnect
                 if self._running:
                     self.error.emit(f"Connection failed: {e}")
 
-                if not self._running or not self.auto_reconnect:
-                    _log(f"Not reconnecting (running={self._running}, auto_reconnect={self.auto_reconnect})")
+                if not self._running or not self.auto_reconnect or permanent:
+                    if permanent:
+                        _log("Permanent connection error (name resolution) — not reconnecting")
+                    else:
+                        _log(f"Not reconnecting (running={self._running}, auto_reconnect={self.auto_reconnect})")
+                    self._running = False  # mark dead so this client can't silently no-op a reuse
                     break
 
                 self._reconnect_attempts += 1
                 if self._reconnect_attempts > self._max_reconnect_attempts:
                     _log("Max reconnection attempts reached")
                     self.error.emit("Max reconnection attempts reached")
+                    self._running = False
                     break
 
                 _log(f"Reconnecting in {self.reconnect_delay}s (attempt {self._reconnect_attempts})...")

@@ -57,7 +57,7 @@ class _User:
 
 class HubServer(QObject):
     # Signal surface mirrors MockHubBackend exactly.
-    session_started = pyqtSignal(str, str)              # code, data_dir
+    session_started = pyqtSignal(str, str, str)         # code, data_dir, connect_addr
     project_registered = pyqtSignal(str, list)          # project_name, subprojects
     user_connected = pyqtSignal(str, str, bool)         # user_id, name, is_owner
     user_disconnected = pyqtSignal(str)                 # user_id
@@ -73,6 +73,7 @@ class HubServer(QObject):
         self.data_dir = Path(data_dir).expanduser()
         self.host = host
         self.port = port
+        self._adv_host = host  # resolved to a routable IP in start()
         self.code = generate_session_id()
 
         # Authoritative session identity (set when the owner registers).
@@ -93,15 +94,24 @@ class HubServer(QObject):
         self._server = None
         self._running = False
 
+    def connect_address(self) -> str:
+        """The bare IP:port a LAN client types to join (what the GUI shows)."""
+        return f"{self._adv_host}:{self.port}"
+
     # ================================================================= startup
     def start(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "incoming").mkdir(exist_ok=True)
+        # Resolve the address to advertise once. When bound to all interfaces,
+        # fall back to the routable LAN IP so clients get something reachable.
+        self._adv_host = self.host if self.host not in ("0.0.0.0", "::", "") else get_local_ip()
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        self.session_started.emit(self.code, str(self.data_dir))
-        _log(f"session {self.code} · data_dir={self.data_dir} · ws://{get_local_ip()}:{self.port}")
+        self.session_started.emit(self.code, str(self.data_dir), self.connect_address())
+        _log(f"session {self.code} · data_dir={self.data_dir} · connect at ws://{self.connect_address()}")
+        if self._adv_host == "127.0.0.1":
+            _log("WARNING: no LAN route detected — only localhost clients can connect")
 
     def stop(self):
         self._running = False
