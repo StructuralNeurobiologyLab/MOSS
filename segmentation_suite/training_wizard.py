@@ -257,6 +257,8 @@ class TrainingWizard(QMainWindow):
         # re-welcomes on register, which re-fires owner_assigned — without this
         # guard that becomes an infinite register/re-welcome loop).
         self._project_registered = False
+        # Show the "you are owner / you joined" notice at most once per session.
+        self._session_notified = False
 
         layout.addSpacing(scaled(10))
 
@@ -609,9 +611,9 @@ class TrainingWizard(QMainWindow):
         role_group = QGroupBox("Role")
         role_layout = QVBoxLayout(role_group)
         role_btn_group = QButtonGroup(dialog)
-        host_radio = QRadioButton("Host a session (others connect to you)")
-        join_radio = QRadioButton("Join an existing session")
-        host_radio.setChecked(True)
+        host_radio = QRadioButton("Host a session (legacy — others connect to you)")
+        join_radio = QRadioButton("Join a hub / session")
+        join_radio.setChecked(True)  # joining a hub is the normal workflow
         role_btn_group.addButton(host_radio)
         role_btn_group.addButton(join_radio)
         role_layout.addWidget(host_radio)
@@ -686,14 +688,45 @@ class TrainingWizard(QMainWindow):
         ))
         dlayout.addWidget(host_settings_group)
 
-        # --- Join address/code input (only visible when joining) ---
-        join_group = QGroupBox("Connection Details")
+        # --- Join a hub (only visible when joining) ---
+        join_group = QGroupBox("Join a Hub")
         join_layout = QVBoxLayout(join_group)
         address_label = QLabel("Hub address (IP:port — shown in the Hub window):")
         address_input = QLineEdit()
         address_input.setPlaceholderText("e.g. 192.168.1.5:8765")
         join_layout.addWidget(address_label)
         join_layout.addWidget(address_input)
+
+        # Subproject to use for this session. If you are the FIRST to join you
+        # become the owner and this becomes the shared target for everyone.
+        join_sp_label = QLabel("Your subproject for this session:")
+        join_layout.addWidget(join_sp_label)
+        join_sp_combo = QComboBox()
+        join_subproject_names = []
+        if project_dir and has_subprojects(project_dir):
+            join_subproject_names = list_subprojects(project_dir)
+            for sp_name in join_subproject_names:
+                join_sp_combo.addItem(sp_name)
+            active_sp = get_active_subproject(project_dir)
+            if active_sp:
+                idx = join_sp_combo.findText(active_sp)
+                if idx >= 0:
+                    join_sp_combo.setCurrentIndex(idx)
+        else:
+            join_sp_combo.addItem("(no subprojects)")
+            join_sp_combo.setEnabled(False)
+        join_layout.addWidget(join_sp_combo)
+
+        join_help = QLabel(
+            "First to join becomes the OWNER — the subproject above becomes the "
+            "shared target. Everyone else annotates into a local copy named "
+            "“<subproject>__<project>”. The hub does the training; your training "
+            "is disabled and the prediction model is chosen by the owner."
+        )
+        join_help.setWordWrap(True)
+        join_help.setStyleSheet("color:#888; font-size:11px;")
+        join_layout.addWidget(join_help)
+
         join_group.setVisible(False)
         dlayout.addWidget(join_group)
 
@@ -729,6 +762,7 @@ class TrainingWizard(QMainWindow):
         join_radio.toggled.connect(update_ui)
         lan_radio.toggled.connect(update_ui)
         relay_radio.toggled.connect(update_ui)
+        update_ui()  # reflect the default (Join) selection immediately
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -747,6 +781,7 @@ class TrainingWizard(QMainWindow):
         # Fresh connection attempt — allow one error modal + one project register.
         self._session_error_alerted = False
         self._project_registered = False
+        self._session_notified = False
 
         if is_host:
             # Switch to selected subproject before starting session
@@ -763,6 +798,11 @@ class TrainingWizard(QMainWindow):
                 if not address:
                     QMessageBox.warning(self, "Missing Address", "Please enter the host address.")
                     return
+                # Switch to the chosen subproject first, so if we become the owner
+                # we register it as the shared session target.
+                join_sp = join_sp_combo.currentText() if join_subproject_names else None
+                if join_sp and join_sp != self.training_page._active_subproject:
+                    self.training_page.switch_subproject(join_sp)
                 self._join_lan_session(address, name)
             else:
                 code = address_input.text().strip().upper()
@@ -1007,11 +1047,37 @@ class TrainingWizard(QMainWindow):
             project_name, subproject, architecture, prediction_model, subprojects)
         print(f"[Wizard] Registered project '{project_name}' subproject '{subproject}' with hub")
 
+        # Make it clear the user is the owner and which subproject is shared/locked.
+        self.session_status_label.setText(
+            f"● Multi-user OWNER — shared subproject: {subproject}")
+        if not self._session_notified:
+            self._session_notified = True
+            QMessageBox.information(
+                self, "You are the session owner",
+                f"You joined first, so you are the OWNER of this session.\n\n"
+                f"Shared subproject:  {subproject}\n"
+                f"Project:  {project_name}\n\n"
+                "The hub trains on everyone's crops. Your local training is disabled, "
+                "and the prediction model you pick in the hub is locked for all "
+                "participants.")
+
     def _on_session_subproject_received(self, subproject_name: str):
         """Hub dictated the session subproject — adopt it locally, then lock the panel."""
         print(f"[Wizard] Adopting session subproject: {subproject_name}")
         self.training_page.adopt_session_subproject(subproject_name)
         self._lock_subproject(subproject_name)
+        self.session_status_label.setText(
+            f"● Multi-user collaborator — subproject: {subproject_name} (locked)")
+        if not self._session_notified:
+            self._session_notified = True
+            QMessageBox.information(
+                self, "Joined multi-user session",
+                f"You joined as a collaborator.\n\n"
+                f"Your crops go into the subproject:\n    {subproject_name}\n"
+                "(a local copy of the owner's target — your own subprojects are "
+                "untouched).\n\n"
+                "Your local training is disabled, and the prediction model is set by "
+                "the owner and locked (shown in red).")
 
     def _on_prediction_model_received(self, architecture: str):
         """Hub dictated the authoritative prediction model — lock the dropdown (red)."""

@@ -25,16 +25,26 @@ from PyQt6.QtWidgets import (
 
 from .animals import animal_for_index, color_for_index
 from .user_tile import UserTile
-from .crop_gallery import CropGallery
 
 
-# Prediction models the hub can dictate to clients (mirrors MOSS arch names).
-PREDICTION_MODELS = [
-    "unet_deep_dice_25d",
-    "unet_deep_dice",
-    "unet_increased_rf",
-    "mtlsd_25d",
-]
+def build_prediction_arch_map() -> dict:
+    """Return {arch_id: display_name} identical to MOSS's prediction dropdown set.
+
+    Mirrors interactive_training_page._populate_prediction_model_combo: the
+    non-hidden file architectures plus any hidden ones that ship a pretrained
+    checkpoint (e.g. the LSD model). Keeps the hub's model list in lock-step
+    with what users actually see.
+    """
+    from ..models.unet import get_available_architectures
+    from ..models.architectures import (
+        get_available_architectures as _registry_architectures,
+        is_pretrained_architecture,
+    )
+    architectures = get_available_architectures()
+    for arch_id, name in _registry_architectures(include_hidden=True).items():
+        if arch_id not in architectures and is_pretrained_architecture(arch_id):
+            architectures[arch_id] = name
+    return architectures
 
 
 class HubWindow(QMainWindow):
@@ -42,9 +52,7 @@ class HubWindow(QMainWindow):
         super().__init__(parent)
         self.backend = backend
         self._tiles: dict[str, UserTile] = {}
-        self._galleries: dict[str, CropGallery] = {}
-        self._crop_buffer: dict[str, list] = {}   # user_id -> [(QImage, caption)]
-        self._crop_buffer_cap = 200
+        self._data_dir = None
         self._join_index = 0
 
         self.setWindowTitle("MOSS Hub — Multi-User Session Controller")
@@ -89,6 +97,11 @@ class HubWindow(QMainWindow):
             QComboBox {
                 background:#2a2a2e; color:#eee; border:1px solid #444;
                 padding:6px; border-radius:5px;
+            }
+            QComboBox QAbstractItemView {
+                background:#2a2a2e; color:#eee;
+                selection-background-color:#2f6fd0; selection-color:#ffffff;
+                border:1px solid #444; outline:none;
             }
         """)
 
@@ -261,10 +274,18 @@ class HubWindow(QMainWindow):
         p_lay = QVBoxLayout(pred)
         p_lay.addWidget(QLabel("All clients predict with:"))
         self.pred_combo = QComboBox()
-        self.pred_combo.addItems(PREDICTION_MODELS)
+        # Same model set the user sees in MOSS; arch_id stored as item data.
+        try:
+            arch_map = build_prediction_arch_map()
+        except Exception as e:
+            print(f"[Hub] could not load architectures: {e}")
+            arch_map = {}
+        for arch_id, display_name in arch_map.items():
+            short = display_name.replace('UNet ', '').replace('(', '').replace(')', '')
+            self.pred_combo.addItem(short, arch_id)
         # Authoritative: changing this broadcasts to every client immediately,
         # and each client that joins is locked to the current choice on connect.
-        self.pred_combo.currentTextChanged.connect(self._on_prediction_changed)
+        self.pred_combo.currentIndexChanged.connect(self._on_prediction_changed)
         p_lay.addWidget(self.pred_combo)
         note = QLabel("Applied automatically — clients' prediction dropdown "
                       "locks (red) to this choice on join and on change.")
@@ -284,10 +305,13 @@ class HubWindow(QMainWindow):
         self.backend.user_disconnected.connect(self._on_user_disconnected)
         self.backend.crop_received.connect(self._on_crop_received)
         self.backend.training_status.connect(self._on_training_status)
+        if hasattr(self.backend, "prediction_model_set"):
+            self.backend.prediction_model_set.connect(self._select_prediction_model)
 
     def _on_session_started(self, code: str, data_dir: str, connect_addr: str = ""):
         self.code_label.setText(code)
         self.datadir_label.setText(data_dir)
+        self._data_dir = data_dir
         if connect_addr:
             self.address_label.setText(connect_addr)
             if connect_addr.startswith("127.0.0.1") or connect_addr.startswith("localhost"):
@@ -325,19 +349,10 @@ class HubWindow(QMainWindow):
         self._update_count()
 
     def _on_crop_received(self, user_id: str, png_bytes: bytes, caption: str):
-        from PyQt6.QtGui import QImage
-        image = QImage()
-        image.loadFromData(png_bytes, "PNG")
+        # Crops are persisted to disk by the hub; the tile just tracks the count.
         tile = self._tiles.get(user_id)
         if tile:
             tile.increment_crops()
-        buf = self._crop_buffer.setdefault(user_id, [])
-        buf.append((image, caption))
-        if len(buf) > self._crop_buffer_cap:
-            del buf[0]
-        gallery = self._galleries.get(user_id)
-        if gallery and gallery.isVisible():
-            gallery.add_crop(image, caption)
 
     def _on_training_status(self, rnd: int, loss: float, contributors: int):
         self.round_label.setText(f"Round: {rnd}")
@@ -355,19 +370,28 @@ class HubWindow(QMainWindow):
         self.count_label.setText(f"{n} connected")
 
     def _open_gallery(self, user_id: str):
+        """Open the user's crops in the same Review Crops tool used in MOSS."""
+        from pathlib import Path
+        from PyQt6.QtWidgets import QMessageBox
+
         tile = self._tiles.get(user_id)
-        if not tile:
+        if not tile or not self._data_dir:
             return
-        gallery = self._galleries.get(user_id)
-        if gallery is None:
-            gallery = CropGallery(user_id, tile.display_name, tile.color, self)
-            # Backfill crops already received before the gallery was opened.
-            for image, caption in self._crop_buffer.get(user_id, []):
-                gallery.add_crop(image, caption)
-            self._galleries[user_id] = gallery
-        gallery.show()
-        gallery.raise_()
-        gallery.activateWindow()
+        base = Path(self._data_dir) / "incoming" / user_id
+        images = base / "train_images"
+        masks = base / "train_masks"
+        if not images.exists() or not any(images.glob("*.png")):
+            QMessageBox.information(
+                self, "No crops yet",
+                f"No crops received from {tile.display_name} yet.")
+            return
+
+        from ..widgets.training_data_reviewer import TrainingDataReviewer
+        reviewer = TrainingDataReviewer(images, masks, base, parent=self)
+        reviewer.setWindowTitle(f"Review crops — {tile.display_name}")
+        reviewer.exec()
+        # Discards may have removed crops — refresh the tile count from disk.
+        tile.set_crop_count(len(list(images.glob("*.png"))))
 
     def _choose_data_dir(self):
         path = QFileDialog.getExistingDirectory(self, "Choose the Hub's main data folder")
@@ -375,9 +399,21 @@ class HubWindow(QMainWindow):
             self.datadir_label.setText(path)
             self.backend.set_data_dir(path)
 
-    def _on_prediction_changed(self, arch: str):
-        # Broadcast to all clients immediately; new joiners are synced on connect.
-        self.backend.set_prediction_model(arch)
+    def _on_prediction_changed(self, index: int):
+        # Broadcast the arch_id to all clients immediately; joiners synced on connect.
+        arch_id = self.pred_combo.itemData(index)
+        if arch_id:
+            self.backend.set_prediction_model(arch_id)
+
+    def _select_prediction_model(self, arch_id: str):
+        """Reflect the owner's registered/authoritative model without re-broadcasting."""
+        if not arch_id:
+            return
+        idx = self.pred_combo.findData(arch_id)
+        if idx >= 0:
+            self.pred_combo.blockSignals(True)
+            self.pred_combo.setCurrentIndex(idx)
+            self.pred_combo.blockSignals(False)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

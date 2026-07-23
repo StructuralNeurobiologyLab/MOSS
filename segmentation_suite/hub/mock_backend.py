@@ -65,6 +65,7 @@ class MockHubBackend(QObject):
     user_disconnected = pyqtSignal(str)
     crop_received = pyqtSignal(str, bytes, str)
     training_status = pyqtSignal(int, float, int)
+    prediction_model_set = pyqtSignal(str)
 
     def __init__(self, data_dir: str = "~/ceph/moss_hub_demo", parent=None):
         super().__init__(parent)
@@ -104,6 +105,7 @@ class MockHubBackend(QObject):
         self.project_registered.emit(
             "songbird_em_v3", ["mitochondria", "synapses", "nuclei"]
         )
+        self.prediction_model_set.emit("unet_deep_dice_dwarf25d_v2")
 
     def _maybe_add_user(self):
         if len(self._users) >= 6 or not self._name_pool:

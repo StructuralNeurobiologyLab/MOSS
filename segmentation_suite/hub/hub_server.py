@@ -63,6 +63,7 @@ class HubServer(QObject):
     user_disconnected = pyqtSignal(str)                 # user_id
     crop_received = pyqtSignal(str, bytes, str)         # user_id, png_bytes, caption
     training_status = pyqtSignal(int, float, int)       # round, loss, contributors
+    prediction_model_set = pyqtSignal(str)              # owner's authoritative model (arch_id)
 
     def __init__(self, data_dir: str, host: str = "0.0.0.0", port: int = 8765,
                  parent=None):
@@ -226,6 +227,8 @@ class HubServer(QObject):
         _log(f"PROJECT_REGISTER project={self.project_name} subproject={self.owner_subproject} "
              f"-> session_subproject={self.session_subproject} arch={self.architecture}")
         self.project_registered.emit(self.project_name, self.subprojects)
+        if self.prediction_model:
+            self.prediction_model_set.emit(self.prediction_model)
         # Re-welcome everyone so late-arriving identity reaches earlier joiners.
         for u in list(self._users.values()):
             await self._send_welcome(u)
