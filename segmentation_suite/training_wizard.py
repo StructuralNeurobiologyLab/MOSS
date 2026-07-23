@@ -1122,8 +1122,9 @@ class TrainingWizard(QMainWindow):
             sp_combo.addItem(default_sp or "default")
         lay.addWidget(sp_combo)
 
-        # Architecture (store arch_id as item data)
-        lay.addWidget(QLabel("Training architecture:"))
+        # Model — ONE choice used for both training and prediction. The hub trains
+        # this model and every client predicts with it, so they must be identical.
+        lay.addWidget(QLabel("Model (used for both training and prediction):"))
         arch_combo = QComboBox()
         for arch_id, disp in page._arch_id_to_name.items():
             arch_combo.addItem(disp, arch_id)
@@ -1131,16 +1132,6 @@ class TrainingWizard(QMainWindow):
         if ai >= 0:
             arch_combo.setCurrentIndex(ai)
         lay.addWidget(arch_combo)
-
-        # Prediction model (store arch_id as item data)
-        lay.addWidget(QLabel("Prediction model (all clients predict with this):"))
-        pred_combo = QComboBox()
-        for arch_id, disp in getattr(page, '_pred_id_to_name', {}).items():
-            pred_combo.addItem(disp, arch_id)
-        pi = pred_combo.findData(getattr(page, 'prediction_architecture', ''))
-        if pi >= 0:
-            pred_combo.setCurrentIndex(pi)
-        lay.addWidget(pred_combo)
 
         # Crop size
         lay.addWidget(QLabel("Crop size (single size for the whole session):"))
@@ -1160,10 +1151,11 @@ class TrainingWizard(QMainWindow):
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
+        model = arch_combo.currentData() or ""
         return {
             "subproject": sp_combo.currentText(),
-            "architecture": arch_combo.currentData() or "",
-            "prediction_model": pred_combo.currentData() or "",
+            "architecture": model,
+            "prediction_model": model,   # training and prediction are the same model
             "crop_size": int(crop_combo.currentData() or 256),
         }
 
@@ -1191,9 +1183,12 @@ class TrainingWizard(QMainWindow):
                 "the owner and locked (shown in red).")
 
     def _on_prediction_model_received(self, architecture: str):
-        """Hub dictated the authoritative prediction model — lock the dropdown (red)."""
-        print(f"[Wizard] Received authoritative prediction model: {architecture}")
+        """Hub dictated the authoritative model. Training and prediction are the
+        same model in hub mode, so lock BOTH the prediction dropdown and the
+        training architecture to it (red)."""
+        print(f"[Wizard] Received authoritative model: {architecture}")
         self.training_page.lock_prediction_architecture(architecture)
+        self.training_page.lock_architecture(architecture)
 
     def _on_crop_size_received(self, size: int):
         """Hub dictated the authoritative crop size — lock the S/M/L buttons (red)."""

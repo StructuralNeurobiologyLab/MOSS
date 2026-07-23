@@ -268,10 +268,10 @@ class HubWindow(QMainWindow):
         t_lay.addWidget(reset_btn)
         lay.addWidget(train)
 
-        # Prediction authority
-        pred = QGroupBox("Prediction model (authoritative)")
+        # Session model (single model — hub trains it AND all clients predict with it)
+        pred = QGroupBox("Session model (training + prediction)")
         p_lay = QVBoxLayout(pred)
-        p_lay.addWidget(QLabel("All clients predict with:"))
+        p_lay.addWidget(QLabel("The hub trains this model; all clients predict with it:"))
         self.pred_combo = QComboBox()
         # Same model set the user sees in MOSS; arch_id stored as item data.
         try:
@@ -286,8 +286,8 @@ class HubWindow(QMainWindow):
         # and each client that joins is locked to the current choice on connect.
         self.pred_combo.currentIndexChanged.connect(self._on_prediction_changed)
         p_lay.addWidget(self.pred_combo)
-        note = QLabel("Applied automatically — clients' prediction dropdown "
-                      "locks (red) to this choice on join and on change.")
+        note = QLabel("Applied automatically — clients' training + prediction lock "
+                      "(red) to this one model on join and on change.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#888; font-size:10px; font-weight:normal;")
         p_lay.addWidget(note)

@@ -114,19 +114,34 @@ def load_project_config(project_dir: str) -> dict | None:
         return None
 
 
+MULTI_USER_ID_FILENAME = ".moss_multiuser_id"
+
+
 def get_or_create_multi_user_id(project_dir: str) -> str:
     """Return a stable per-project user id for multi-user sessions.
 
-    Persisted in project.json so reconnecting from the same project resumes the
-    same role and crops on the hub (crops live under incoming/<user_id>/).
+    Stored in a DEDICATED file (.moss_multiuser_id), NOT project.json: the root
+    config is rewritten from scratch during a session (auto-save timer,
+    _build_project_config) which would clobber a key stored there and hand the
+    user a fresh id on reconnect — duplicating them on the hub. A dedicated
+    dotfile no other writer touches keeps the id rock-stable so reconnecting
+    resumes the same role and crops (incoming/<user_id>/).
     """
     import uuid
-    config = load_project_config(project_dir) or get_default_config()
-    uid = config.get("multi_user_id")
-    if not uid:
-        uid = uuid.uuid4().hex[:12]
-        config["multi_user_id"] = uid
-        save_project_config(project_dir, config)
+    id_file = Path(project_dir) / MULTI_USER_ID_FILENAME
+    try:
+        if id_file.exists():
+            existing = id_file.read_text().strip()
+            if existing:
+                return existing
+    except Exception:
+        pass
+    uid = uuid.uuid4().hex[:12]
+    try:
+        id_file.parent.mkdir(parents=True, exist_ok=True)
+        id_file.write_text(uid)
+    except Exception as e:
+        print(f"[project_config] could not persist multi-user id: {e}")
     return uid
 
 
