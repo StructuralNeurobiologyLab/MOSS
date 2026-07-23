@@ -67,6 +67,7 @@ class MockHubBackend(QObject):
     crop_received = pyqtSignal(str, bytes, str)
     training_status = pyqtSignal(int, float, int)
     prediction_model_set = pyqtSignal(str)
+    training_loss = pyqtSignal(float, int)   # per-batch loss, global_batch (loss plot)
 
     def __init__(self, data_dir: str = "~/ceph/moss_hub_demo", parent=None):
         super().__init__(parent)
@@ -76,6 +77,7 @@ class MockHubBackend(QObject):
         self._included: dict[str, bool] = {}
         self._crop_seq = 0
         self._round = 0
+        self._batch = 0
         self._loss = 1.4
         self._name_pool = list(_NAMES)
         random.shuffle(self._name_pool)
@@ -134,6 +136,10 @@ class MockHubBackend(QObject):
         self._loss = max(0.02, self._loss * random.uniform(0.9, 0.99))
         included_users = sum(1 for v in self._included.values() if v)
         self.training_status.emit(self._round, self._loss, included_users)
+        # Fake per-batch loss so the plot animates.
+        for _ in range(8):
+            self._batch += 1
+            self.training_loss.emit(max(0.02, self._loss * random.uniform(0.6, 1.4)), self._batch)
 
     # ----------------------------------------------------- GUI -> backend API
     def set_user_included(self, user_id: str, included: bool):
@@ -142,6 +148,7 @@ class MockHubBackend(QObject):
 
     def reset_model(self):
         self._round = 0
+        self._batch = 0
         self._loss = 1.4
         print("[MockBackend] model reset")
 

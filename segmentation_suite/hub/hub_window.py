@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 
 from .animals import animal_for_index, color_for_index
 from .user_tile import UserTile
+from ..widgets.loss_plot_widget import LossPlotWidget
 
 
 def build_prediction_arch_map() -> dict:
@@ -72,7 +73,7 @@ class HubWindow(QMainWindow):
         body = QHBoxLayout()
         body.setContentsMargins(14, 14, 14, 14)
         body.setSpacing(14)
-        body.addWidget(self._build_user_area(), stretch=3)
+        body.addWidget(self._build_left_column(), stretch=3)
         body.addWidget(self._build_control_panel(), stretch=1)
         body_w = QWidget()
         body_w.setLayout(body)
@@ -212,6 +213,23 @@ class HubWindow(QMainWindow):
         lay.addWidget(self.count_label)
         return bar
 
+    def _build_left_column(self) -> QWidget:
+        """Left column: the user grid on top, the training-loss plot below."""
+        col = QWidget()
+        v = QVBoxLayout(col)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(14)
+        v.addWidget(self._build_user_area(), stretch=3)
+
+        loss_group = QGroupBox("Training loss (hub)")
+        lg = QVBoxLayout(loss_group)
+        self.loss_plot = LossPlotWidget(max_points=2000)
+        self.loss_plot.setMaximumHeight(16777215)  # lift the widget's 200px cap
+        self.loss_plot.setMinimumHeight(170)
+        lg.addWidget(self.loss_plot)
+        v.addWidget(loss_group, stretch=1)
+        return col
+
     def _build_user_area(self) -> QWidget:
         wrap = QGroupBox("Connected users — click a tile to view their crops")
         outer = QVBoxLayout(wrap)
@@ -264,7 +282,7 @@ class HubWindow(QMainWindow):
             t_lay.addWidget(w)
         reset_btn = QPushButton("Reset model")
         reset_btn.setObjectName("danger")
-        reset_btn.clicked.connect(self.backend.reset_model)
+        reset_btn.clicked.connect(self._on_reset_clicked)
         t_lay.addWidget(reset_btn)
         lay.addWidget(train)
 
@@ -308,6 +326,8 @@ class HubWindow(QMainWindow):
         self.backend.training_status.connect(self._on_training_status)
         if hasattr(self.backend, "prediction_model_set"):
             self.backend.prediction_model_set.connect(self._select_prediction_model)
+        if hasattr(self.backend, "training_loss"):
+            self.backend.training_loss.connect(self.loss_plot.add_point)
 
     def _on_session_started(self, code: str, data_dir: str, connect_addr: str = ""):
         self.code_label.setText(code)
@@ -417,6 +437,10 @@ class HubWindow(QMainWindow):
         if path:
             self.datadir_label.setText(path)
             self.backend.set_data_dir(path)
+
+    def _on_reset_clicked(self):
+        self.backend.reset_model()
+        self.loss_plot.clear()
 
     def _on_prediction_changed(self, index: int):
         # Broadcast the arch_id to all clients immediately; joiners synced on connect.

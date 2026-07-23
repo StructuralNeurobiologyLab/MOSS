@@ -17,12 +17,14 @@ GUI is unchanged whether driven by the mock or by this real server.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Dict, Optional
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 
 try:
     import websockets
@@ -34,6 +36,8 @@ from ..network.protocol import (
     Message, MessageType,
     create_welcome_message, create_user_list_message,
     create_set_prediction_model_message, create_training_data_ack_message,
+    serialize_weights, create_global_model_message,
+    needs_chunking, chunk_data, create_chunk_start_message, create_chunk_end_message,
 )
 from ..network.session import generate_session_id, get_local_ip
 
@@ -67,6 +71,7 @@ class HubServer(QObject):
     crop_received = pyqtSignal(str, bytes, str)         # user_id, png_bytes, caption
     training_status = pyqtSignal(int, float, int)       # round, loss, contributors
     prediction_model_set = pyqtSignal(str)              # owner's authoritative model (arch_id)
+    training_loss = pyqtSignal(float, int)              # per-batch loss, global_batch (loss plot)
 
     def __init__(self, data_dir: str, host: str = "0.0.0.0", port: int = 8765,
                  resume: bool = False, parent=None):
@@ -106,6 +111,26 @@ class HubServer(QObject):
         self._thread: Optional[threading.Thread] = None
         self._server = None
         self._running = False
+
+        # --- trainer state (also exposed via training_state() for a web/HTTP view) ---
+        self._trainer = None                # HubTrainer
+        self._round = 0                     # last epoch reported
+        self._last_loss = 0.0
+        self._contrib_count = 0             # enabled users with >=1 crop
+        self._agg_round = 0                 # GLOBAL_MODEL broadcast counter
+        self._last_weights = None           # last exported state_dict (for late joiners)
+        self._loss_history = deque(maxlen=5000)   # (batch, loss) for the loss plot / HTTP
+        # configurable knobs (set from __main__)
+        self.train_epochs = 50000
+        self.broadcast_interval = 5
+        self.train_batch_size = 2
+        self.train_lr = 1e-4
+        self.force_cpu = False
+        # debounce destructive pool rebuilds (rapid include/exclude toggles)
+        self._rebuild_timer = QTimer(self)
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.setInterval(600)
+        self._rebuild_timer.timeout.connect(self._destructive_rebuild)
 
     def connect_address(self) -> str:
         """The bare IP:port a LAN client types to join (what the GUI shows)."""
@@ -165,6 +190,151 @@ class HubServer(QObject):
         d = self.data_dir / "incoming" / uid / "train_images"
         return len(list(d.glob("*.png"))) if d.exists() else 0
 
+    # ============================================================ crop pool
+    # The trainer trains on the UNION of ENABLED users' crops. We present that
+    # union as a single merged directory of symlinks (train_pool/), files named
+    # "<uid>__<stem>.png" so cross-user stems can't collide. Additive changes are
+    # linked into the live pool (worker re-scans at epoch end); destructive
+    # changes do a full atomic-swap rebuild + trainer restart.
+    def _pool_root(self):
+        return self.data_dir / "train_pool"
+
+    def _pool_images(self):
+        return self._pool_root() / "train_images"
+
+    def _pool_masks(self):
+        return self._pool_root() / "train_masks"
+
+    def _enabled_uids(self):
+        return [uid for uid, info in self._known_users.items() if info.get("included", True)]
+
+    def _link(self, src: Path, dst: Path):
+        try:
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            dst.symlink_to(src)
+        except OSError:
+            import shutil
+            shutil.copy2(src, dst)   # fallback where symlinks aren't permitted
+
+    def _pool_append(self, uid: str, stem: str):
+        """Race-free additive: link ONE crop pair into the live pool."""
+        self._pool_images().mkdir(parents=True, exist_ok=True)
+        self._pool_masks().mkdir(parents=True, exist_ok=True)
+        img = self.data_dir / "incoming" / uid / "train_images" / f"{stem}.png"
+        msk = self.data_dir / "incoming" / uid / "train_masks" / f"{stem}.png"
+        if img.exists() and msk.exists():
+            name = f"{uid}__{stem}.png"
+            self._link(img, self._pool_images() / name)
+            self._link(msk, self._pool_masks() / name)
+
+    def _pool_rebuild_full(self):
+        """Full rebuild into a temp dir + atomic swap; recomputes _contrib_count."""
+        import shutil
+        tmp = self.data_dir / "train_pool.tmp"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        (tmp / "train_images").mkdir(parents=True)
+        (tmp / "train_masks").mkdir(parents=True)
+        contrib = 0
+        for uid in self._enabled_uids():
+            imgs = self.data_dir / "incoming" / uid / "train_images"
+            msks = self.data_dir / "incoming" / uid / "train_masks"
+            if not imgs.exists():
+                continue
+            n = 0
+            for f in imgs.glob("*.png"):
+                m = msks / f.name
+                if not m.exists():
+                    continue
+                name = f"{uid}__{f.name}"
+                self._link(f, tmp / "train_images" / name)
+                self._link(m, tmp / "train_masks" / name)
+                n += 1
+            if n:
+                contrib += 1
+        self._contrib_count = contrib
+        root = self._pool_root()
+        if root.exists():
+            shutil.rmtree(root)
+        os.replace(tmp, root)
+
+    # ============================================================ trainer wiring
+    def _maybe_start_training(self, force_fresh: bool = False):
+        if not (self.crop_size and (self.prediction_model or self.architecture)):
+            return
+        if self._contrib_count == 0:
+            return
+        if self._trainer is None:
+            from .hub_trainer import HubTrainer
+            self._trainer = HubTrainer(self)
+        self._trainer.start(resume=not force_fresh)
+
+    def _on_loss(self, loss: float, batch: int):
+        self._loss_history.append((batch, loss))
+        self.training_loss.emit(loss, batch)
+
+    def _on_train_progress(self, epoch: int, total: int, train_loss: float, val_loss: float):
+        self._round = epoch
+        self._last_loss = float(train_loss)
+        self.training_status.emit(epoch, float(train_loss), self._contrib_count)
+
+    def _on_train_finished(self, ok: bool, msg: str):
+        _log(f"trainer finished ok={ok} msg={msg}")
+
+    def _on_weights_exported(self, weights: dict, epoch: int, loss: float):
+        self.broadcast_global_model(weights)
+
+    def _destructive_rebuild(self):
+        self._pool_rebuild_full()
+        if self._trainer and self._trainer.is_running():
+            self._trainer.restart_resume()   # new worker lists a fresh, consistent pool
+        else:
+            self._maybe_start_training()
+        self.training_status.emit(self._round, self._last_loss, self._contrib_count)
+
+    def training_state(self) -> dict:
+        """Plain-data snapshot the GUI shows — also the contract for a web/HTTP view."""
+        return {
+            "round": self._round,
+            "loss": self._last_loss,
+            "contributors": self._contrib_count,
+            "agg_round": self._agg_round,
+            "running": bool(self._trainer and self._trainer.is_running()),
+            "loss_history": list(self._loss_history),
+        }
+
+    # ============================================================ weight broadcast
+    def broadcast_global_model(self, weights: dict):
+        self._last_weights = weights
+        self._agg_round += 1
+        if self._loop and self._running:
+            asyncio.run_coroutine_threadsafe(
+                self._broadcast_global_model(weights, self._agg_round), self._loop)
+
+    async def _broadcast_global_model(self, weights: dict, agg_round: int):
+        header = create_global_model_message(
+            aggregation_round=agg_round, contributor_count=self._contrib_count).to_json()
+        data = serialize_weights(weights)
+        for u in list(self._users.values()):
+            await self._send_model_frames(u.ws, header, data)
+        _log(f"broadcast global model round={agg_round} to {len(self._users)} clients "
+             f"({len(data)/1024/1024:.1f}MB)")
+
+    async def _send_model_frames(self, ws, header: str, data: bytes):
+        if needs_chunking(data):
+            import uuid
+            tid = uuid.uuid4().hex
+            chunks = chunk_data(data)
+            await self._safe_send(ws, create_chunk_start_message(
+                tid, len(chunks), len(data), original_type="global_model").to_json())
+            for c in chunks:
+                await self._safe_send(ws, c)
+            await self._safe_send(ws, create_chunk_end_message(tid).to_json())
+        else:
+            await self._safe_send(ws, header)
+            await self._safe_send(ws, data)
+
     # ================================================================= startup
     def start(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -195,8 +365,13 @@ class HubServer(QObject):
                     uid, info.get("display_name", "User"), bool(info.get("is_owner")),
                     int(info.get("join_index", 0)), self._disk_crop_count(uid),
                     bool(info.get("included", True)))
+            # Rebuild the training pool from restored crops and resume training.
+            self._pool_rebuild_full()
+            self._maybe_start_training()
 
     def stop(self):
+        if self._trainer:
+            self._trainer.stop()
         self._running = False
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -288,6 +463,12 @@ class HubServer(QObject):
         _log(f"HELLO {name} ({uid}) owner={is_owner} idx={join_index}")
 
         await self._send_welcome(user)
+        # Late joiner: hand them the current trained weights so they predict with them.
+        if self._last_weights is not None:
+            header = create_global_model_message(
+                aggregation_round=self._agg_round,
+                contributor_count=self._contrib_count).to_json()
+            await self._send_model_frames(user.ws, header, serialize_weights(self._last_weights))
         await self._broadcast_user_list()
         self.user_connected.emit(uid, name, is_owner, join_index)
         self._save_manifest()
@@ -373,6 +554,15 @@ class HubServer(QObject):
         (base / "train_images" / f"{stem}.png").write_bytes(img_bytes)
         (base / "train_masks" / f"{stem}.png").write_bytes(mask_bytes)
         user.crop_count += 1
+        # Feed the training pool. Additive: link into the live pool (worker
+        # re-scans at epoch end); if this is the first enabled crop, build + start.
+        self._pool_append(uid, stem)
+        if self._known_users.get(uid, {}).get("included", True):
+            if self._trainer and self._trainer.is_running():
+                self._trainer.request_reload()
+            else:
+                self._pool_rebuild_full()
+                self._maybe_start_training()
         slice_idx = payload.get("slice_index", 0)
         caption = f"#{self._crop_seq} · z={slice_idx}"
         self.crop_received.emit(uid, img_bytes, caption)
@@ -417,16 +607,43 @@ class HubServer(QObject):
             user.included = included
         _log(f"user {user_id} included={included}")
         self._save_manifest()
+        self._rebuild_timer.start()   # debounce rapid toggles -> _destructive_rebuild
 
     def reset_model(self):
-        _log("reset_model requested (trainer not yet wired)")
+        """Archive the checkpoint, clear loss history, and restart training fresh."""
+        from datetime import datetime
+        from ..models.unet import get_checkpoint_filename
+        if self._trainer:
+            self._trainer.stop()
+        arch = self.prediction_model or self.architecture or "unet"
+        model_dir = self.data_dir / "model"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for fname in (get_checkpoint_filename(arch), "checkpoint_final.pth"):
+            p = model_dir / fname
+            if p.exists():
+                try:
+                    p.rename(model_dir / f"{p.stem}_old_{ts}.pth")
+                except OSError as e:
+                    _log(f"reset archive failed for {p}: {e}")
+        self._last_weights = None
+        self._round = 0
+        self._last_loss = 0.0
+        self._loss_history.clear()
+        self.training_status.emit(0, 0.0, self._contrib_count)
+        _log("model reset — restarting training fresh")
+        self._pool_rebuild_full()
+        self._maybe_start_training(force_fresh=True)
 
     def set_prediction_model(self, arch: str):
+        changed = arch != self.prediction_model
         self.prediction_model = arch
-        _log(f"prediction model -> {arch} (broadcasting to all clients)")
+        _log(f"session model -> {arch} (broadcasting to all clients)")
         self._save_manifest()
         if self._loop and self._running:
             asyncio.run_coroutine_threadsafe(self._broadcast_prediction(arch), self._loop)
+        # New architecture => different checkpoint shape; reset + restart fresh.
+        if changed and self._trainer and self._trainer.is_running():
+            self.reset_model()
 
     async def _broadcast_prediction(self, arch: str):
         msg = create_set_prediction_model_message(arch).to_json()

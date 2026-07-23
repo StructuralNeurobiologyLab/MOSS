@@ -32,6 +32,13 @@ def main():
                         help="Start a new session even if --data-dir has a saved session.json")
     parser.add_argument("--mock", action="store_true",
                         help="Use the simulated mock backend (visual dev only, no network)")
+    # Trainer knobs
+    parser.add_argument("--cpu", action="store_true", help="Force CPU training (laptop dev)")
+    parser.add_argument("--epochs", type=int, default=50000, help="Max training epochs")
+    parser.add_argument("--broadcast-interval", type=int, default=5,
+                        help="Broadcast trained weights every N epochs")
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
 
     from PyQt6.QtWidgets import QApplication
@@ -49,6 +56,11 @@ def main():
         from .hub_server import HubServer
         backend = HubServer(data_dir=args.data_dir, host=args.host, port=args.port,
                             resume=resume)
+        backend.force_cpu = args.cpu
+        backend.train_epochs = args.epochs
+        backend.broadcast_interval = args.broadcast_interval
+        backend.train_batch_size = args.batch_size
+        backend.train_lr = args.lr
 
     from .hub_window import HubWindow
     window = HubWindow(backend)
