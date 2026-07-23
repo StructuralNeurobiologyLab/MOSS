@@ -260,15 +260,34 @@ class HubServer(QObject):
         os.replace(tmp, root)
 
     # ============================================================ trainer wiring
-    def _maybe_start_training(self, force_fresh: bool = False):
+    def _recount_contrib(self):
+        """Cheap: count enabled users that have at least one crop on disk."""
+        self._contrib_count = sum(
+            1 for uid in self._enabled_uids() if self._disk_crop_count(uid) > 0)
+
+    def start_training(self, fresh: bool = False):
+        """Operator-controlled start (from the web console / Qt). Training does NOT
+        auto-start on crops — the operator decides when to begin."""
+        self._pool_rebuild_full()   # fresh pool; also sets _contrib_count
         if not (self.crop_size and (self.prediction_model or self.architecture)):
+            _log("cannot start training: session not configured yet")
             return
         if self._contrib_count == 0:
+            _log("cannot start training: no enabled users with crops")
             return
         if self._trainer is None:
             from .hub_trainer import HubTrainer
             self._trainer = HubTrainer(self)
-        self._trainer.start(resume=not force_fresh)
+        if not self._trainer.is_running():
+            _log("start training")
+            self._trainer.start(resume=not fresh)
+        self.training_status.emit(self._round, self._last_loss, self._contrib_count)
+
+    def stop_training(self):
+        _log("stop training")
+        if self._trainer:
+            self._trainer.stop()
+        self.training_status.emit(self._round, self._last_loss, self._contrib_count)
 
     def _on_loss(self, loss: float, batch: int):
         self._loss_history.append((batch, loss))
@@ -289,8 +308,7 @@ class HubServer(QObject):
         self._pool_rebuild_full()
         if self._trainer and self._trainer.is_running():
             self._trainer.restart_resume()   # new worker lists a fresh, consistent pool
-        else:
-            self._maybe_start_training()
+        # if not running, leave it stopped (operator-controlled)
         self.training_status.emit(self._round, self._last_loss, self._contrib_count)
 
     def training_state(self) -> dict:
@@ -365,9 +383,9 @@ class HubServer(QObject):
                     uid, info.get("display_name", "User"), bool(info.get("is_owner")),
                     int(info.get("join_index", 0)), self._disk_crop_count(uid),
                     bool(info.get("included", True)))
-            # Rebuild the training pool from restored crops and resume training.
+            # Rebuild the training pool from restored crops (training is
+            # operator-controlled, so it does not auto-start on resume).
             self._pool_rebuild_full()
-            self._maybe_start_training()
 
     def stop(self):
         if self._trainer:
@@ -554,15 +572,16 @@ class HubServer(QObject):
         (base / "train_images" / f"{stem}.png").write_bytes(img_bytes)
         (base / "train_masks" / f"{stem}.png").write_bytes(mask_bytes)
         user.crop_count += 1
-        # Feed the training pool. Additive: link into the live pool (worker
-        # re-scans at epoch end); if this is the first enabled crop, build + start.
-        self._pool_append(uid, stem)
+        # Feed the training pool only while training is running (additive link,
+        # worker re-scans at epoch end). When stopped, just keep the contributor
+        # count fresh — the operator starts training explicitly.
         if self._known_users.get(uid, {}).get("included", True):
             if self._trainer and self._trainer.is_running():
+                self._pool_append(uid, stem)
                 self._trainer.request_reload()
             else:
-                self._pool_rebuild_full()
-                self._maybe_start_training()
+                self._recount_contrib()
+            self.training_status.emit(self._round, self._last_loss, self._contrib_count)
         slice_idx = payload.get("slice_index", 0)
         caption = f"#{self._crop_seq} · z={slice_idx}"
         self.crop_received.emit(uid, img_bytes, caption)
@@ -610,9 +629,11 @@ class HubServer(QObject):
         self._rebuild_timer.start()   # debounce rapid toggles -> _destructive_rebuild
 
     def reset_model(self):
-        """Archive the checkpoint, clear loss history, and restart training fresh."""
+        """Archive the checkpoint and clear loss history. If training was running,
+        restart it fresh; if it was stopped, stay stopped (operator restarts)."""
         from datetime import datetime
         from ..models.unet import get_checkpoint_filename
+        was_running = bool(self._trainer and self._trainer.is_running())
         if self._trainer:
             self._trainer.stop()
         arch = self.prediction_model or self.architecture or "unet"
@@ -629,10 +650,11 @@ class HubServer(QObject):
         self._round = 0
         self._last_loss = 0.0
         self._loss_history.clear()
-        self.training_status.emit(0, 0.0, self._contrib_count)
-        _log("model reset — restarting training fresh")
+        _log("model reset")
         self._pool_rebuild_full()
-        self._maybe_start_training(force_fresh=True)
+        self.training_status.emit(0, 0.0, self._contrib_count)
+        if was_running:
+            self.start_training(fresh=True)
 
     def set_prediction_model(self, arch: str):
         changed = arch != self.prediction_model

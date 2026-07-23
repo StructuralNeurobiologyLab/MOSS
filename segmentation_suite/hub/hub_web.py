@@ -77,6 +77,10 @@ class HubWeb(QObject):
                 self.hub.reset_model()
             elif kind == "discard":
                 self.hub.discard_crop(d["uid"], d["name"])
+            elif kind == "start":
+                self.hub.start_training()
+            elif kind == "stop":
+                self.hub.stop_training()
         except Exception as e:
             print(f"[HubWeb] action {kind} failed: {e}")
 
@@ -115,10 +119,11 @@ class HubWeb(QObject):
                         if d.exists():
                             names = sorted((f.name for f in d.glob("*.png")), reverse=True)[:500]
                     self._send(200, "application/json", json.dumps(names).encode("utf-8"))
-                elif path.startswith("/crop/"):
-                    parts = unquote(path[len("/crop/"):]).split("/", 1)
+                elif path.startswith("/crop/") or path.startswith("/mask/"):
+                    sub = "train_images" if path.startswith("/crop/") else "train_masks"
+                    parts = unquote(path[6:]).split("/", 1)   # len('/crop/')==len('/mask/')==6
                     if len(parts) == 2 and _UID_RE.match(parts[0]) and _NAME_RE.match(parts[1]):
-                        f = hub.data_dir / "incoming" / parts[0] / "train_images" / parts[1]
+                        f = hub.data_dir / "incoming" / parts[0] / sub / parts[1]
                         if f.exists():
                             self._send(200, "image/png", f.read_bytes())
                             return
@@ -131,7 +136,8 @@ class HubWeb(QObject):
                 ln = int(self.headers.get("Content-Length", "0") or 0)
                 body = self.rfile.read(ln).decode("utf-8") if ln else ""
                 kind = {"/toggle": "toggle", "/model": "model",
-                        "/reset": "reset", "/discard": "discard"}.get(path)
+                        "/reset": "reset", "/discard": "discard",
+                        "/train/start": "start", "/train/stop": "stop"}.get(path)
                 if kind:
                     web._action.emit(kind, body)
                     self._send(200, "application/json", b'{"ok":true}')
@@ -186,10 +192,9 @@ PAGE = r"""<!doctype html>
   /* review modal */
   #modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:10;}
   #modalinner{background:#1a1a1d;border-radius:10px;width:min(90vw,760px);max-height:86vh;display:flex;flex-direction:column;padding:14px;}
-  #grid{display:flex;flex-wrap:wrap;gap:8px;overflow:auto;}
-  .thumb{width:120px;border:2px solid #444;border-radius:8px;padding:5px;background:#242427;}
-  .thumb img{width:106px;height:106px;object-fit:cover;border-radius:4px;display:block;}
-  .thumb button{width:100%;margin-top:4px;background:#7a2f2a;font-size:10px;padding:3px;}
+  #mview{display:flex;gap:16px;justify-content:center;align-items:flex-start;min-height:300px;}
+  .review{max-width:320px;max-height:320px;border:1px solid #444;border-radius:6px;background:#000;display:block;image-rendering:pixelated;}
+  .revlbl{text-align:center;color:#9a9a9a;font-size:11px;margin-bottom:4px;}
 </style></head>
 <body>
 <div id="top">
@@ -216,6 +221,7 @@ PAGE = r"""<!doctype html>
     <div class="box"><h3>Cluster training</h3>
       <div class="kv" id="tround">Round: 0</div><div class="kv" id="tloss">Loss: —</div>
       <div class="kv" id="tcontrib">Contributing users: 0</div><div class="kv" id="trun">Idle</div>
+      <button id="trainbtn" style="width:100%;margin-top:8px" onclick="toggleTrain()">Start training</button>
       <button class="danger" style="width:100%;margin-top:8px" onclick="doReset()">Reset model</button></div>
     <div class="box"><h3>Session model (training + prediction)</h3>
       <div class="muted">The hub trains this model; all clients predict with it:</div>
@@ -224,30 +230,52 @@ PAGE = r"""<!doctype html>
   </div>
 </div>
 <div id="modal" onclick="if(event.target.id==='modal')closeModal()"><div id="modalinner">
-  <div style="display:flex;align-items:center;margin-bottom:8px"><h3 id="mtitle" style="margin:0;flex:1"></h3>
-    <button class="mini" onclick="closeModal()">close</button></div>
-  <div id="grid"></div></div></div>
+  <div style="display:flex;align-items:center;margin-bottom:8px">
+    <h3 id="mtitle" style="margin:0;flex:1"></h3>
+    <span id="mcount" class="muted" style="margin-right:12px"></span>
+    <button class="mini" onclick="closeModal()">close ✕</button></div>
+  <div id="mview">
+    <div><div class="revlbl">image</div><img id="mimg" class="review"></div>
+    <div><div class="revlbl">mask</div><img id="mmask" class="review"></div></div>
+  <div style="display:flex;gap:8px;justify-content:center;margin-top:12px">
+    <button onclick="revPrev()">◀ Prev (A)</button>
+    <button class="danger" onclick="revDiscard()">Discard (Del)</button>
+    <button onclick="revNext()">Next (D) ▶</button></div>
+  <div class="muted" style="text-align:center;margin-top:6px">A/← prev · D/→ next · Del/X discard · Esc close</div>
+  </div></div>
 
 <script>
-let MODAL_UID=null, MODEL_BUILT=false;
+let MODEL_BUILT=false, TRAINING=false, REVIEW=null, CUR_NAMES={};
 function copyAddr(){navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('addr').textContent);}
 function post(path,obj){fetch(path,{method:'POST',body:obj?JSON.stringify(obj):''});}
-function doReset(){if(confirm('Reset the model and restart training fresh?'))post('/reset');}
+function doReset(){if(confirm('Reset the model? (archives the checkpoint and clears the loss plot)'))post('/reset');}
 function setModel(){post('/model',{arch:document.getElementById('model').value});}
 function toggle(uid,inc){post('/toggle',{uid:uid,included:inc});}
-function discard(uid,name){post('/discard',{uid:uid,name:name});setTimeout(()=>openModal(uid),300);}
+function toggleTrain(){post(TRAINING?'/train/stop':'/train/start');}
 
-function openModal(uid){MODAL_UID=uid;document.getElementById('modal').style.display='flex';
-  fetch('/crops/'+uid).then(r=>r.json()).then(names=>{
-    const g=document.getElementById('grid');g.innerHTML='';
-    document.getElementById('mtitle').textContent=(CUR_NAMES[uid]||uid)+' — '+names.length+' crops';
-    if(!names.length)g.innerHTML='<div class="muted">No crops yet.</div>';
-    names.forEach(n=>{const d=document.createElement('div');d.className='thumb';
-      d.innerHTML='<img src="/crop/'+uid+'/'+n+'"><button>discard</button>';
-      d.querySelector('button').onclick=()=>discard(uid,n);g.appendChild(d);});});}
-function closeModal(){MODAL_UID=null;document.getElementById('modal').style.display='none';}
-
-let CUR_NAMES={};
+// One-at-a-time crop reviewer (image + mask), like MOSS's Review Crops.
+function openModal(uid){fetch('/crops/'+uid).then(r=>r.json()).then(names=>{
+  REVIEW={uid:uid,names:names,idx:0};
+  document.getElementById('mtitle').textContent=(CUR_NAMES[uid]||uid);
+  document.getElementById('modal').style.display='flex';showCrop();});}
+function showCrop(){if(!REVIEW)return;const uid=REVIEW.uid,names=REVIEW.names;
+  const cnt=document.getElementById('mcount'),im=document.getElementById('mimg'),mk=document.getElementById('mmask');
+  if(!names.length){cnt.textContent='0 crops';im.removeAttribute('src');mk.removeAttribute('src');return;}
+  const i=Math.max(0,Math.min(REVIEW.idx,names.length-1));REVIEW.idx=i;
+  cnt.textContent=(i+1)+' / '+names.length+'  ·  '+names[i];
+  im.src='/crop/'+uid+'/'+names[i];mk.src='/mask/'+uid+'/'+names[i];}
+function revPrev(){if(REVIEW&&REVIEW.idx>0){REVIEW.idx--;showCrop();}}
+function revNext(){if(REVIEW&&REVIEW.idx<REVIEW.names.length-1){REVIEW.idx++;showCrop();}}
+function revDiscard(){if(!REVIEW||!REVIEW.names.length)return;
+  post('/discard',{uid:REVIEW.uid,name:REVIEW.names[REVIEW.idx]});
+  REVIEW.names.splice(REVIEW.idx,1);showCrop();}
+function closeModal(){REVIEW=null;document.getElementById('modal').style.display='none';}
+document.addEventListener('keydown',e=>{
+  if(!REVIEW||document.getElementById('modal').style.display!=='flex')return;
+  if(e.key==='ArrowLeft'||e.key==='a')revPrev();
+  else if(e.key==='ArrowRight'||e.key==='d')revNext();
+  else if(e.key==='Backspace'||e.key==='Delete'||e.key==='x')revDiscard();
+  else if(e.key==='Escape')closeModal();});
 function render(s){
   document.getElementById('addr').textContent=s.connect_address;
   document.getElementById('code').textContent=s.code;
@@ -261,6 +289,10 @@ function render(s){
   document.getElementById('tcontrib').textContent='Contributing users: '+(t.contributors||0);
   document.getElementById('trun').textContent=t.running?'● training':'Idle';
   document.getElementById('trun').style.color=t.running?'#5fbf6a':'#888';
+  TRAINING=!!t.running;
+  const tb=document.getElementById('trainbtn');
+  tb.textContent=TRAINING?'Stop training':'Start training';
+  tb.className=TRAINING?'danger':'';
   // model select (build once)
   const sel=document.getElementById('model');
   if(!MODEL_BUILT&&s.models&&s.models.length){sel.innerHTML='';
@@ -279,7 +311,6 @@ function render(s){
     d.querySelector('.inc').onclick=(e)=>{e.stopPropagation();toggle(u.uid,e.target.checked);};
     d.onclick=()=>openModal(u.uid);
     tiles.appendChild(d);});
-  if(MODAL_UID&&document.getElementById('modal').style.display==='flex'){/* keep open; refreshed on discard */}
   drawLoss(t.loss_history||[]);
 }
 function drawLoss(h){const c=document.getElementById('loss'),x=c.getContext('2d');

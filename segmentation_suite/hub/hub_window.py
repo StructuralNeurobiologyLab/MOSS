@@ -59,6 +59,10 @@ class HubWindow(QMainWindow):
         self.resize(1040, 720)
         self._build_ui()
         self._connect_backend()
+        self._train_btn_timer = QTimer(self)
+        self._train_btn_timer.timeout.connect(self._refresh_train_btn)
+        self._train_btn_timer.start(1000)
+        self._refresh_train_btn()
 
     # --------------------------------------------------------------- build UI
     def _build_ui(self):
@@ -280,6 +284,9 @@ class HubWindow(QMainWindow):
         for w in (self.round_label, self.loss_label, self.contrib_label):
             w.setStyleSheet("color:#ccc; font-size:12px; font-weight:normal;")
             t_lay.addWidget(w)
+        self.train_btn = QPushButton("Start training")
+        self.train_btn.clicked.connect(self._on_train_clicked)
+        t_lay.addWidget(self.train_btn)
         reset_btn = QPushButton("Reset model")
         reset_btn.setObjectName("danger")
         reset_btn.clicked.connect(self._on_reset_clicked)
@@ -437,6 +444,23 @@ class HubWindow(QMainWindow):
         if path:
             self.datadir_label.setText(path)
             self.backend.set_data_dir(path)
+
+    def _on_train_clicked(self):
+        if not hasattr(self.backend, "start_training"):
+            return
+        if self.backend.training_state().get("running"):
+            self.backend.stop_training()
+        else:
+            self.backend.start_training()
+        self._refresh_train_btn()
+
+    def _refresh_train_btn(self):
+        if not hasattr(self.backend, "training_state"):
+            self.train_btn.setEnabled(False)
+            return
+        running = bool(self.backend.training_state().get("running"))
+        self.train_btn.setText("Stop training" if running else "Start training")
+        self.train_btn.setStyleSheet("background:#b8433a;" if running else "")
 
     def _on_reset_clicked(self):
         self.backend.reset_model()
