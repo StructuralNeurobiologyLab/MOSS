@@ -246,6 +246,13 @@ class HubWindow(QMainWindow):
             ax.setPen(None)                        # no axis line
             ax.setTextPen("#7a7a82")               # muted tick labels
             ax.setStyle(tickLength=2)
+            # Room so the top/bottom tick LABELS aren't clipped (no bottom axis
+            # means the plot ran flush to the widget's top/bottom edges).
+            pi.setContentsMargins(4, 12, 10, 12)
+            try:
+                pi.getViewBox().setDefaultPadding(0.06)
+            except Exception:
+                pass
         lg.addWidget(self.loss_plot)
         v.addWidget(loss_group, stretch=1)
         return col
