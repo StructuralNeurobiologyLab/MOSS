@@ -230,6 +230,11 @@ class HubWindow(QMainWindow):
         self.loss_plot = LossPlotWidget(max_points=2000)
         self.loss_plot.setMaximumHeight(16777215)  # lift the widget's 200px cap
         self.loss_plot.setMinimumHeight(170)
+        # The widget uses a transparent pyqtgraph background (clean in MOSS's dark
+        # sidebar, but showed through as light here). Give our instance an explicit
+        # dark background — hub-only, MOSS's widget is untouched.
+        if getattr(self.loss_plot, "plot_widget", None) is not None:
+            self.loss_plot.plot_widget.setBackground("#101012")
         lg.addWidget(self.loss_plot)
         v.addWidget(loss_group, stretch=1)
         return col
