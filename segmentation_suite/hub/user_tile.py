@@ -69,7 +69,7 @@ class UserTile(QFrame):
 
         # Avatar
         self.avatar = QLabel()
-        self.avatar.setPixmap(animal_pixmap(animal, size=80))
+        self.avatar.setPixmap(animal_pixmap(animal, size=80, color=color))
         self.avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.avatar.setFixedHeight(84)
         layout.addWidget(self.avatar)

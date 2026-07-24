@@ -713,7 +713,7 @@ class HubServer(QObject):
                 "included": bool(info.get("included", True)),
                 "crops": self._disk_crop_count(uid),
                 "color": color_for_index(idx),
-                "animal_svg": animal_svg(animal_for_index(idx)),
+                "animal_svg": animal_svg(animal_for_index(idx), color_for_index(idx)),
             })
         models = []
         try:

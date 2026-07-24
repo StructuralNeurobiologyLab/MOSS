@@ -225,7 +225,7 @@ class HubWindow(QMainWindow):
         v.setSpacing(14)
         v.addWidget(self._build_user_area(), stretch=3)
 
-        loss_group = QGroupBox("Training loss (hub)")
+        loss_group = QGroupBox("Training loss")
         lg = QVBoxLayout(loss_group)
         self.loss_plot = LossPlotWidget(max_points=2000)
         self.loss_plot.setMaximumHeight(16777215)  # lift the widget's 200px cap
