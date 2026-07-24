@@ -230,11 +230,22 @@ class HubWindow(QMainWindow):
         self.loss_plot = LossPlotWidget(max_points=2000)
         self.loss_plot.setMaximumHeight(16777215)  # lift the widget's 200px cap
         self.loss_plot.setMinimumHeight(170)
-        # The widget uses a transparent pyqtgraph background (clean in MOSS's dark
-        # sidebar, but showed through as light here). Give our instance an explicit
-        # dark background — hub-only, MOSS's widget is untouched.
-        if getattr(self.loss_plot, "plot_widget", None) is not None:
-            self.loss_plot.plot_widget.setBackground("#101012")
+        # Make the plot blend into the window (no visible rectangle/border) and
+        # strip it to just the curve + a minimal loss scale. Hub-only config —
+        # MOSS's shared LossPlotWidget is untouched.
+        lp = getattr(self.loss_plot, "plot_widget", None)
+        if lp is not None:
+            lp.setBackground("#161618")            # match QMainWindow bg -> no edges
+            lp.setStyleSheet("border:none;")       # kill the QGraphicsView frame
+            pi = lp.getPlotItem()
+            pi.showGrid(x=False, y=False)
+            pi.getViewBox().setBorder(None)
+            pi.hideAxis("bottom")                  # batch axis is noise
+            pi.setLabel("left", "")                # drop the "Loss" word
+            ax = pi.getAxis("left")
+            ax.setPen(None)                        # no axis line
+            ax.setTextPen("#7a7a82")               # muted tick labels
+            ax.setStyle(tickLength=2)
         lg.addWidget(self.loss_plot)
         v.addWidget(loss_group, stretch=1)
         return col
