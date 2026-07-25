@@ -86,7 +86,7 @@ class HubWeb(QObject):
             elif kind == "select":
                 self.hub.select_project(d.get("name", ""), fresh=False)
             elif kind == "new":
-                self.hub.select_project(d.get("name", ""), fresh=True)
+                self.hub.new_project()
         except Exception as e:
             print(f"[HubWeb] action {kind} failed: {e}")
 
@@ -260,8 +260,7 @@ PAGE = r"""<!doctype html>
   .prow button,.pnew button{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:600;cursor:pointer;}
   .prow button:hover,.pnew button:hover{filter:brightness(1.1);}
   .pnew{display:flex;gap:8px;margin-top:16px;}
-  .pnew input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--ink);padding:8px 10px;font-size:13px;}
-  .pnew input:focus{outline:none;border-color:var(--accent);}
+  .pnew button{flex:1;padding:11px;font-size:13px;}
 </style></head>
 <body>
 <div id="top">
@@ -316,10 +315,9 @@ PAGE = r"""<!doctype html>
     <div class="muted" id="pdir" style="font-size:11px;margin-bottom:14px"></div>
     <div id="plist"></div>
     <div class="pnew">
-      <input id="pname" placeholder="new project name" maxlength="48">
-      <button onclick="newProj()">Create empty</button>
+      <button onclick="newProj()">+ New session</button>
     </div>
-    <div class="muted" style="font-size:11px;margin-top:10px">A new project starts empty and waits for the first person to join — the owner — to define its name, model and crop size.</div>
+    <div class="muted" style="font-size:11px;margin-top:10px">A new session starts empty and unnamed — the first person to join becomes the owner and defines its name, model and crop size.</div>
   </div>
 </div>
 
@@ -457,7 +455,7 @@ function renderPicker(s){
   });
 }
 function selectProj(n){post('/select',{name:n});setTimeout(poll,400);}
-function newProj(){const n=document.getElementById('pname').value.trim();if(!n)return;post('/new',{name:n});setTimeout(poll,400);}
+function newProj(){post('/new');setTimeout(poll,400);}
 
 function drawLoss(h){
   window._ls=h;

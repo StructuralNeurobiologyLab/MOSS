@@ -383,6 +383,10 @@ class HubServer(QObject):
             if not d.is_dir():
                 continue
             sess = d / "session.json"
+            # Hide abandoned placeholders: an unnamed "New session" the owner
+            # never joined (no manifest was ever written).
+            if d.name.startswith("untitled-") and not sess.exists():
+                continue
             info = {"name": d.name, "has_session": sess.exists(),
                     "project": "", "users": 0, "crop_size": 0}
             if sess.exists():
@@ -397,8 +401,7 @@ class HubServer(QObject):
         return out
 
     def select_project(self, name: str, fresh: bool = False):
-        """Web-console action: point the hub at projects_dir/<name> and start it.
-        Resumes an existing session unless `fresh` (a brand-new empty project)."""
+        """Web-console action: resume an existing project folder by name."""
         if self._active:
             _log("project already selected; ignoring re-select")
             return
@@ -410,6 +413,19 @@ class HubServer(QObject):
         self.data_dir = self.projects_dir / safe
         self._active = True
         self._activate_session(resume=not fresh)
+
+    def new_project(self):
+        """Web-console action: start a brand-new EMPTY project with no name.
+        The first person to join (the owner) defines its name/model/crop size.
+        Until then it lives in a placeholder folder keyed by the session code."""
+        if self._active:
+            _log("project already selected; ignoring new-project")
+            return
+        if not self.projects_dir:
+            return
+        self.data_dir = self.projects_dir / f"untitled-{self.code}"
+        self._active = True
+        self._activate_session(resume=False)
 
     def _activate_session(self, resume: bool):
         """Bring the chosen project online (shared by CLI --data-dir and the
