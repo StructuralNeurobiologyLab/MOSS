@@ -83,6 +83,10 @@ class HubWeb(QObject):
                 self.hub.start_training()
             elif kind == "stop":
                 self.hub.stop_training()
+            elif kind == "select":
+                self.hub.select_project(d.get("name", ""), fresh=False)
+            elif kind == "new":
+                self.hub.select_project(d.get("name", ""), fresh=True)
         except Exception as e:
             print(f"[HubWeb] action {kind} failed: {e}")
 
@@ -139,7 +143,8 @@ class HubWeb(QObject):
                 body = self.rfile.read(ln).decode("utf-8") if ln else ""
                 kind = {"/toggle": "toggle", "/model": "model",
                         "/reset": "reset", "/discard": "discard",
-                        "/train/start": "start", "/train/stop": "stop"}.get(path)
+                        "/train/start": "start", "/train/stop": "stop",
+                        "/select": "select", "/new": "new"}.get(path)
                 if kind:
                     web._action.emit(kind, body)
                     self._send(200, "application/json", b'{"ok":true}')
@@ -244,6 +249,19 @@ PAGE = r"""<!doctype html>
   .review{width:100%;aspect-ratio:1;object-fit:contain;background:#000;border:1px solid var(--border);border-radius:8px;image-rendering:pixelated;}
   #mctrl{display:flex;gap:8px;justify-content:center;margin-top:14px;}
   #mhint{text-align:center;color:var(--faint);font-size:11px;margin-top:8px;}
+  #picker{display:none;position:fixed;inset:0;background:var(--bg);z-index:50;align-items:flex-start;justify-content:center;padding:64px 16px;overflow:auto;}
+  .pcard{width:100%;max-width:460px;background:var(--card);border:1px solid var(--border);border-radius:16px;padding:26px 28px;}
+  .pcard h2{margin:0 0 2px;font-size:17px;font-weight:600;}
+  .prow{display:flex;align-items:center;gap:12px;padding:12px 14px;border:1px solid var(--border);border-radius:10px;margin-bottom:8px;transition:border-color .12s;}
+  .prow:hover{border-color:var(--accent);}
+  .pinfo{display:flex;flex-direction:column;gap:2px;flex:1;min-width:0;}
+  .pinfo b{font-size:14px;}
+  .pinfo .muted{font-size:11px;}
+  .prow button,.pnew button{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:600;cursor:pointer;}
+  .prow button:hover,.pnew button:hover{filter:brightness(1.1);}
+  .pnew{display:flex;gap:8px;margin-top:16px;}
+  .pnew input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--ink);padding:8px 10px;font-size:13px;}
+  .pnew input:focus{outline:none;border-color:var(--accent);}
 </style></head>
 <body>
 <div id="top">
@@ -289,6 +307,19 @@ PAGE = r"""<!doctype html>
       <div class="muted" style="font-size:11px">Main folder (crops · models)</div>
       <div class="mono" id="datadir" style="font-size:11px;color:var(--ink);word-break:break-all;margin-top:3px">—</div>
     </div>
+  </div>
+</div>
+
+<div id="picker">
+  <div class="pcard">
+    <h2>Select a project</h2>
+    <div class="muted" id="pdir" style="font-size:11px;margin-bottom:14px"></div>
+    <div id="plist"></div>
+    <div class="pnew">
+      <input id="pname" placeholder="new project name" maxlength="48">
+      <button onclick="newProj()">Create empty</button>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:10px">A new project starts empty and waits for the first person to join — the owner — to define its name, model and crop size.</div>
   </div>
 </div>
 
@@ -361,6 +392,16 @@ document.addEventListener('keydown',e=>{
   else if(e.key==='Escape')closeModal();});
 
 function render(s){
+  const idle=(s.active===false);
+  document.getElementById('picker').style.display=idle?'flex':'none';
+  document.getElementById('body').style.display=idle?'none':'';
+  if(idle){renderPicker(s);
+    document.getElementById('addr').textContent='—';
+    document.getElementById('code').textContent='—';
+    document.getElementById('proj').textContent='— select a project —';
+    document.getElementById('subproj').textContent='';
+    document.getElementById('count').textContent='idle';
+    return;}
   document.getElementById('addr').textContent=s.connect_address;
   document.getElementById('code').textContent=s.code;
   document.getElementById('proj').textContent=s.project_name||'— waiting for owner —';
@@ -398,6 +439,25 @@ function render(s){
     tiles.appendChild(d);});
   drawLoss(t.loss_history||[]);
 }
+
+function renderPicker(s){
+  document.getElementById('pdir').textContent='in '+(s.projects_dir||'?');
+  const list=document.getElementById('plist');list.innerHTML='';
+  const ps=s.projects||[];
+  if(!ps.length){list.innerHTML='<div class="muted" style="padding:12px 0">No projects here yet — create one below.</div>';return;}
+  ps.forEach(p=>{
+    const meta=p.has_session
+      ?((p.project||p.name)+' · '+p.users+' user'+(p.users===1?'':'s')+(p.crop_size?(' · crop '+p.crop_size):''))
+      :'empty · no session yet';
+    const d=document.createElement('div');d.className='prow';
+    d.innerHTML='<div class="pinfo"><b>'+p.name+'</b><span class="muted">'+meta+'</span></div>'+
+      '<button>'+(p.has_session?'Resume':'Open')+'</button>';
+    d.querySelector('button').onclick=()=>selectProj(p.name);
+    list.appendChild(d);
+  });
+}
+function selectProj(n){post('/select',{name:n});setTimeout(poll,400);}
+function newProj(){const n=document.getElementById('pname').value.trim();if(!n)return;post('/new',{name:n});setTimeout(poll,400);}
 
 function drawLoss(h){
   window._ls=h;

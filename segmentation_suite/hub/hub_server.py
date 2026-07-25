@@ -36,6 +36,7 @@ from ..network.protocol import (
     Message, MessageType,
     create_welcome_message, create_user_list_message,
     create_set_prediction_model_message, create_training_data_ack_message,
+    create_error_message,
     serialize_weights, create_global_model_message,
     needs_chunking, chunk_data, create_chunk_start_message, create_chunk_end_message,
 )
@@ -73,13 +74,17 @@ class HubServer(QObject):
     prediction_model_set = pyqtSignal(str)              # owner's authoritative model (arch_id)
     training_loss = pyqtSignal(float, int)              # per-batch loss, global_batch (loss plot)
 
-    def __init__(self, data_dir: str, host: str = "0.0.0.0", port: int = 8765,
-                 resume: bool = False, parent=None):
+    def __init__(self, data_dir: str = None, host: str = "0.0.0.0", port: int = 8765,
+                 resume: bool = False, projects_dir: str = None, parent=None):
         super().__init__(parent)
         if not WEBSOCKETS_AVAILABLE:
             raise ImportError("websockets not installed. pip install websockets")
 
-        self.data_dir = Path(data_dir).expanduser()
+        # A project may be chosen up front (data_dir) or later via the web console
+        # picker (projects_dir holds the sibling projects to choose among).
+        self.data_dir = Path(data_dir).expanduser() if data_dir else None
+        self.projects_dir = Path(projects_dir).expanduser() if projects_dir else None
+        self._active = data_dir is not None   # False = idle, showing the picker
         self.host = host
         self.port = port
         self._adv_host = host  # resolved to a routable IP in start()
@@ -355,17 +360,64 @@ class HubServer(QObject):
 
     # ================================================================= startup
     def start(self):
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        (self.data_dir / "incoming").mkdir(exist_ok=True)
-        # Resume an existing session if requested (or auto-detected) and a manifest exists.
-        if self._resume:
-            self._resumed = self._load_manifest()
         # Resolve the address to advertise once. When bound to all interfaces,
         # fall back to the routable LAN IP so clients get something reachable.
         self._adv_host = self.host if self.host not in ("0.0.0.0", "::", "") else get_local_ip()
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        if self._active:
+            self._activate_session(self._resume)
+        else:
+            _log(f"no project selected — waiting for web console selection "
+                 f"(projects_dir={self.projects_dir})")
+
+    def list_projects(self) -> list:
+        """Sibling projects under projects_dir, for the web console picker."""
+        import json
+        out = []
+        root = self.projects_dir
+        if not root or not root.exists():
+            return out
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            sess = d / "session.json"
+            info = {"name": d.name, "has_session": sess.exists(),
+                    "project": "", "users": 0, "crop_size": 0}
+            if sess.exists():
+                try:
+                    data = json.loads(sess.read_text())
+                    info["project"] = data.get("project_name", "")
+                    info["users"] = len(data.get("users", {}) or {})
+                    info["crop_size"] = int(data.get("crop_size", 0))
+                except Exception:
+                    pass
+            out.append(info)
+        return out
+
+    def select_project(self, name: str, fresh: bool = False):
+        """Web-console action: point the hub at projects_dir/<name> and start it.
+        Resumes an existing session unless `fresh` (a brand-new empty project)."""
+        if self._active:
+            _log("project already selected; ignoring re-select")
+            return
+        if not self.projects_dir or not name:
+            return
+        safe = "".join(c for c in name if c.isalnum() or c in "-_ .").strip()
+        if not safe:
+            return
+        self.data_dir = self.projects_dir / safe
+        self._active = True
+        self._activate_session(resume=not fresh)
+
+    def _activate_session(self, resume: bool):
+        """Bring the chosen project online (shared by CLI --data-dir and the
+        web picker): make dirs, optionally resume the manifest, announce it."""
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "incoming").mkdir(exist_ok=True)
+        if resume:
+            self._resumed = self._load_manifest()
         self.session_started.emit(self.code, str(self.data_dir), self.connect_address())
         _log(f"session {self.code} · data_dir={self.data_dir} · connect at ws://{self.connect_address()}")
         if self._adv_host == "127.0.0.1":
@@ -451,6 +503,16 @@ class HubServer(QObject):
             await self._drop(websocket)
 
     async def _on_hello(self, websocket, msg: Message):
+        if not self._active:
+            # No project selected yet — the operator must pick one in the web
+            # console before anyone can join.
+            try:
+                await websocket.send(create_error_message(
+                    "Hub has no active project yet — ask the operator to select "
+                    "one in the console.").to_json())
+            except Exception:
+                pass
+            return
         uid = msg.payload.get("user_id")
         name = msg.payload.get("display_name", "User")
         if not uid:
@@ -701,6 +763,13 @@ class HubServer(QObject):
         """Full snapshot for the web console. Defensive copies — safe to read
         from the HTTP thread while the main thread mutates state."""
         from .animals import animal_for_index, color_for_index, animal_svg
+        if not self._active:
+            # Idle: no project chosen yet — the console shows a project picker.
+            return {
+                "active": False,
+                "projects_dir": str(self.projects_dir) if self.projects_dir else "",
+                "projects": self.list_projects(),
+            }
         users = []
         online = set(self._users.keys())
         for uid, info in list(self._known_users.items()):
@@ -730,6 +799,7 @@ class HubServer(QObject):
         except Exception as e:
             _log(f"model list error: {e}")
         return {
+            "active": True,
             "code": self.code,
             "connect_address": self.connect_address(),
             "data_dir": str(self.data_dir),
