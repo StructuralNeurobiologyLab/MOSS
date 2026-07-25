@@ -296,8 +296,11 @@ PAGE = r"""<!doctype html>
   <div id="mhead"><h3 id="mtitle"></h3><span class="muted mono" id="mcount"></span>
     <button class="mini" onclick="closeModal()">close ✕</button></div>
   <div id="mview">
-    <div class="revcol"><div class="revlbl">image</div><img id="mimg" class="review"></div>
-    <div class="revcol"><div class="revlbl">mask</div><img id="mmask" class="review"></div></div>
+    <div style="max-width:380px;margin:0 auto;text-align:center">
+      <canvas id="mcanvas" class="review" style="width:100%"></canvas>
+      <label style="display:block;margin-top:8px;color:var(--muted);font-size:12px;cursor:pointer">
+        <input type="checkbox" id="movl" checked onchange="showCrop()"> mask overlay</label>
+    </div></div>
   <div id="mctrl">
     <button class="ghost" onclick="revPrev()">◀ Prev</button>
     <button class="danger" onclick="revDiscard()">Discard</button>
@@ -320,11 +323,30 @@ function openModal(uid){fetch('/crops/'+uid).then(r=>r.json()).then(names=>{
   document.getElementById('mtitle').textContent=(CUR_NAMES[uid]||uid);
   document.getElementById('modal').style.display='flex';showCrop();});}
 function showCrop(){if(!REVIEW)return;const uid=REVIEW.uid,names=REVIEW.names;
-  const cnt=document.getElementById('mcount'),im=document.getElementById('mimg'),mk=document.getElementById('mmask');
-  if(!names.length){cnt.textContent='0 crops';im.removeAttribute('src');mk.removeAttribute('src');return;}
+  const cnt=document.getElementById('mcount'),cv=document.getElementById('mcanvas');
+  if(!names.length){cnt.textContent='0 crops';cv.getContext('2d').clearRect(0,0,cv.width,cv.height);return;}
   const i=Math.max(0,Math.min(REVIEW.idx,names.length-1));REVIEW.idx=i;
   cnt.textContent=(i+1)+' / '+names.length;
-  im.src='/crop/'+uid+'/'+names[i];mk.src='/mask/'+uid+'/'+names[i];}
+  const raw=new Image(),mask=new Image();let n=0;
+  const done=()=>{if(++n>=2)composite(raw,mask);};
+  raw.onload=done;raw.onerror=done;mask.onload=done;mask.onerror=done;
+  raw.src='/crop/'+uid+'/'+names[i];mask.src='/mask/'+uid+'/'+names[i];}
+function composite(raw,mask){
+  const cv=document.getElementById('mcanvas');
+  const W=raw.naturalWidth||mask.naturalWidth||256,H=raw.naturalHeight||mask.naturalHeight||256;
+  cv.width=W;cv.height=H;const x=cv.getContext('2d');x.clearRect(0,0,W,H);
+  if(raw.naturalWidth)x.drawImage(raw,0,0,W,H);
+  if(!document.getElementById('movl').checked||!mask.naturalWidth)return;
+  const off=document.createElement('canvas');off.width=W;off.height=H;
+  const ox=off.getContext('2d');ox.drawImage(mask,0,0,W,H);
+  try{
+    const md=ox.getImageData(0,0,W,H).data;
+    const ri=x.getImageData(0,0,W,H),rd=ri.data;
+    for(let p=0;p<md.length;p+=4){if(md[p]>127){
+      rd[p]=(rd[p]*0.5+255*0.5)|0; rd[p+1]=(rd[p+1]*0.5+45*0.5)|0; rd[p+2]=(rd[p+2]*0.5+45*0.5)|0;}}
+    x.putImageData(ri,0,0);
+  }catch(e){}
+}
 function revPrev(){if(REVIEW&&REVIEW.idx>0){REVIEW.idx--;showCrop();}}
 function revNext(){if(REVIEW&&REVIEW.idx<REVIEW.names.length-1){REVIEW.idx++;showCrop();}}
 function revDiscard(){if(!REVIEW||!REVIEW.names.length)return;
