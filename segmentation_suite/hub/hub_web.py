@@ -343,7 +343,7 @@ function composite(raw,mask){
     const md=ox.getImageData(0,0,W,H).data;
     const ri=x.getImageData(0,0,W,H),rd=ri.data;
     for(let p=0;p<md.length;p+=4){if(md[p]>127){
-      rd[p]=(rd[p]*0.5+255*0.5)|0; rd[p+1]=(rd[p+1]*0.5+45*0.5)|0; rd[p+2]=(rd[p+2]*0.5+45*0.5)|0;}}
+      rd[p]=(rd[p]*0.75)|0; rd[p+1]=(rd[p+1]*0.75+255*0.25)|0; rd[p+2]=(rd[p+2]*0.75)|0;}}
     x.putImageData(ri,0,0);
   }catch(e){}
 }
