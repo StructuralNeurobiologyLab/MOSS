@@ -364,11 +364,15 @@ def needs_chunking(data: bytes) -> bool:
 
 def create_training_data_message(user_id: str, display_name: str,
                                   crop_size: int, slice_index: int,
-                                  chunk_index: int = 0, total_chunks: int = 1) -> Message:
+                                  chunk_index: int = 0, total_chunks: int = 1,
+                                  n_channels: int = 1) -> Message:
     """
     Create a TRAINING_DATA message header.
 
     Note: The actual image and mask data are sent as binary following the JSON message.
+    `n_channels` tells the host which crop variant this is: 1 = plain 2D (PNG frame);
+    3 = 2.5D stack, 11 = dwarf-2.5D stack (multi-channel LZW-TIFF frame). The host
+    routes it to the matching training folder (train_images / _25d / _dwarf25d).
     """
     import time
     return Message(
@@ -378,6 +382,7 @@ def create_training_data_message(user_id: str, display_name: str,
             "display_name": display_name,
             "crop_size": crop_size,
             "slice_index": slice_index,
+            "n_channels": int(n_channels),
             "chunk_index": chunk_index,
             "total_chunks": total_chunks,
             "timestamp": int(time.time() * 1000)
@@ -403,25 +408,43 @@ def serialize_training_data(image_array, mask_array) -> tuple:
     Serialize image and mask arrays to compressed bytes.
 
     Args:
-        image_array: numpy array of the image crop (uint8)
-        mask_array: numpy array of the mask crop (uint8)
+        image_array: numpy array of the image crop (uint8). 2D (H,W) for a plain
+            crop, or a multi-channel (C,H,W) 2.5D/dwarf stack.
+        mask_array: numpy array of the mask crop (uint8), always 2D (H,W).
 
     Returns:
-        Tuple of (image_bytes, mask_bytes)
+        Tuple of (image_bytes, mask_bytes). A 2D image is PNG; a multi-channel
+        (C,H,W) stack is an LZW TIFF written by tifffile — byte-for-byte the same
+        format MOSS writes locally in _save_25d_crop, so the host can drop it
+        straight into the training folder.
     """
     import io
+    import numpy as np
     from PIL import Image
     # Disable PIL decompression bomb warning for large EM images
     Image.MAX_IMAGE_PIXELS = None
 
-    # Convert to PIL and save as PNG (lossless compression)
-    img_buffer = io.BytesIO()
-    Image.fromarray(image_array).save(img_buffer, format='PNG', compress_level=6)
-    img_bytes = img_buffer.getvalue()
-
-    mask_buffer = io.BytesIO()
-    Image.fromarray(mask_array).save(mask_buffer, format='PNG', compress_level=6)
-    mask_bytes = mask_buffer.getvalue()
+    image_array = np.asarray(image_array)
+    mask_array = np.asarray(mask_array)
+    if image_array.ndim == 3:
+        # Multi-channel (C,H,W) stack — PNG can't hold >4 channels. Match MOSS's
+        # on-disk format exactly: (C,H,W)/(H,W) uint8 LZW TIFFs via tifffile. The
+        # mask is a TIFF too so image+mask share the .tif extension the dataset
+        # requires for pairing.
+        import tifffile
+        img_buffer = io.BytesIO()
+        tifffile.imwrite(img_buffer, image_array.astype(np.uint8), compression='lzw')
+        img_bytes = img_buffer.getvalue()
+        mask_buffer = io.BytesIO()
+        tifffile.imwrite(mask_buffer, mask_array.astype(np.uint8), compression='lzw')
+        mask_bytes = mask_buffer.getvalue()
+    else:
+        img_buffer = io.BytesIO()
+        Image.fromarray(image_array).save(img_buffer, format='PNG', compress_level=6)
+        img_bytes = img_buffer.getvalue()
+        mask_buffer = io.BytesIO()
+        Image.fromarray(mask_array).save(mask_buffer, format='PNG', compress_level=6)
+        mask_bytes = mask_buffer.getvalue()
 
     return img_bytes, mask_bytes
 
@@ -443,7 +466,13 @@ def deserialize_training_data(image_bytes: bytes, mask_bytes: bytes) -> tuple:
     # Disable PIL decompression bomb warning for large EM images
     Image.MAX_IMAGE_PIXELS = None
 
-    img = Image.open(io.BytesIO(image_bytes))
-    mask = Image.open(io.BytesIO(mask_bytes))
+    # Image may be a PNG (2D) or a multi-channel LZW TIFF (2.5D/dwarf stack).
+    # Detect by magic bytes: TIFF starts with 'II'/'MM', PNG with \x89PNG.
+    if image_bytes[:2] in (b"II", b"MM"):
+        import tifffile
+        img = tifffile.imread(io.BytesIO(image_bytes))   # (C,H,W) uint8
+    else:
+        img = np.array(Image.open(io.BytesIO(image_bytes)))
+    mask = np.array(Image.open(io.BytesIO(mask_bytes)))
 
-    return np.array(img), np.array(mask)
+    return img, mask

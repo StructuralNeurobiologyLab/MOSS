@@ -191,24 +191,47 @@ class HubServer(QObject):
             default=-1) + 1
         return True
 
+    # --- architecture-driven crop variant (matches MOSS's per-arch folders) ------
+    # A crop's channel count decides its folder + on-disk format, EXACTLY like MOSS
+    # locally: 1ch -> train_images/*.png (2D), 3ch -> train_images_25d/*.tif,
+    # 11ch -> train_images_dwarf25d/*.tif (C,H,W LZW TIFF). The dataset derives
+    # n_channels from the architecture and reads the matching folder.
+    _VARIANT_BY_NC = {1: ("", "png"), 3: ("_25d", "tif"), 11: ("_dwarf25d", "tif")}
+
+    def _variant_for_nc(self, n_channels: int):
+        return self._VARIANT_BY_NC.get(int(n_channels), ("", "png"))
+
+    def _session_variant(self):
+        """(dir-suffix, ext) for the session's locked architecture — the variant all
+        crops in this session use for pooling/counting/training."""
+        a = (self.architecture or self.prediction_model or "").lower()
+        if "dwarf25d" in a:
+            return ("_dwarf25d", "tif")
+        if "25d" in a:
+            return ("_25d", "tif")
+        return ("", "png")
+
     def _disk_crop_count(self, uid: str) -> int:
-        d = self.data_dir / "incoming" / uid / "train_images"
-        return len(list(d.glob("*.png"))) if d.exists() else 0
+        suf, ext = self._session_variant()
+        d = self.data_dir / "incoming" / uid / f"train_images{suf}"
+        return len(list(d.glob(f"*.{ext}"))) if d.exists() else 0
 
     # ============================================================ crop pool
-    # The trainer trains on the UNION of ENABLED users' crops. We present that
-    # union as a single merged directory of symlinks (train_pool/), files named
-    # "<uid>__<stem>.png" so cross-user stems can't collide. Additive changes are
-    # linked into the live pool (worker re-scans at epoch end); destructive
-    # changes do a full atomic-swap rebuild + trainer restart.
+    # The trainer trains on the UNION of ENABLED users' crops, presented as a merged
+    # symlink dir (train_pool/train_images<suf>/), files named "<uid>__<stem>.<ext>"
+    # so cross-user stems can't collide. Additive changes link into the live pool
+    # (worker re-scans at epoch end); destructive changes do a full atomic-swap
+    # rebuild + trainer restart. <suf> follows the session architecture's variant.
     def _pool_root(self):
         return self.data_dir / "train_pool"
 
     def _pool_images(self):
-        return self._pool_root() / "train_images"
+        suf, _ = self._session_variant()
+        return self._pool_root() / f"train_images{suf}"
 
     def _pool_masks(self):
-        return self._pool_root() / "train_masks"
+        suf, _ = self._session_variant()
+        return self._pool_root() / f"train_masks{suf}"
 
     def _enabled_uids(self):
         return [uid for uid, info in self._known_users.items() if info.get("included", True)]
@@ -223,38 +246,40 @@ class HubServer(QObject):
             shutil.copy2(src, dst)   # fallback where symlinks aren't permitted
 
     def _pool_append(self, uid: str, stem: str):
-        """Race-free additive: link ONE crop pair into the live pool."""
+        """Race-free additive: link ONE crop pair into the live pool (session variant)."""
+        suf, ext = self._session_variant()
         self._pool_images().mkdir(parents=True, exist_ok=True)
         self._pool_masks().mkdir(parents=True, exist_ok=True)
-        img = self.data_dir / "incoming" / uid / "train_images" / f"{stem}.png"
-        msk = self.data_dir / "incoming" / uid / "train_masks" / f"{stem}.png"
+        img = self.data_dir / "incoming" / uid / f"train_images{suf}" / f"{stem}.{ext}"
+        msk = self.data_dir / "incoming" / uid / f"train_masks{suf}" / f"{stem}.{ext}"
         if img.exists() and msk.exists():
-            name = f"{uid}__{stem}.png"
+            name = f"{uid}__{stem}.{ext}"
             self._link(img, self._pool_images() / name)
             self._link(msk, self._pool_masks() / name)
 
     def _pool_rebuild_full(self):
         """Full rebuild into a temp dir + atomic swap; recomputes _contrib_count."""
         import shutil
+        suf, ext = self._session_variant()
         tmp = self.data_dir / "train_pool.tmp"
         if tmp.exists():
             shutil.rmtree(tmp)
-        (tmp / "train_images").mkdir(parents=True)
-        (tmp / "train_masks").mkdir(parents=True)
+        (tmp / f"train_images{suf}").mkdir(parents=True)
+        (tmp / f"train_masks{suf}").mkdir(parents=True)
         contrib = 0
         for uid in self._enabled_uids():
-            imgs = self.data_dir / "incoming" / uid / "train_images"
-            msks = self.data_dir / "incoming" / uid / "train_masks"
+            imgs = self.data_dir / "incoming" / uid / f"train_images{suf}"
+            msks = self.data_dir / "incoming" / uid / f"train_masks{suf}"
             if not imgs.exists():
                 continue
             n = 0
-            for f in imgs.glob("*.png"):
+            for f in imgs.glob(f"*.{ext}"):
                 m = msks / f.name
                 if not m.exists():
                     continue
                 name = f"{uid}__{f.name}"
-                self._link(f, tmp / "train_images" / name)
-                self._link(m, tmp / "train_masks" / name)
+                self._link(f, tmp / f"train_images{suf}" / name)
+                self._link(m, tmp / f"train_masks{suf}" / name)
                 n += 1
             if n:
                 contrib += 1
@@ -562,6 +587,7 @@ class HubServer(QObject):
 
         await self._send_welcome(user)
         # Late joiner: hand them the current trained weights so they predict with them.
+        self._ensure_last_weights()
         if self._last_weights is not None:
             header = create_global_model_message(
                 aggregation_round=self._agg_round,
@@ -577,7 +603,10 @@ class HubServer(QObject):
         has trained yet, stay quiet — the client keeps polling until the first
         broadcast pushes a model to everyone."""
         uid = self._ws_to_uid.get(websocket)
-        if not uid or uid not in self._users or self._last_weights is None:
+        if not uid or uid not in self._users:
+            return
+        self._ensure_last_weights()
+        if self._last_weights is None:
             return
         user = self._users[uid]
         header = create_global_model_message(
@@ -585,6 +614,28 @@ class HubServer(QObject):
             contributor_count=self._contrib_count).to_json()
         await self._send_model_frames(user.ws, header, serialize_weights(self._last_weights))
         _log(f"sent model on request to {user.display_name} ({uid})")
+
+    def _ensure_last_weights(self):
+        """After a resume, weights aren't in memory yet, but a trained checkpoint may
+        already sit on disk (ceph). Lazily load it so late-joiners and on-demand
+        REQUEST_MODEL get the model WITHOUT waiting for training to run again."""
+        if self._last_weights is not None:
+            return
+        arch = self.architecture or self.prediction_model
+        if not self.data_dir or not arch:
+            return
+        try:
+            from ..models.unet import get_checkpoint_filename
+            import torch
+            ckpt = self.data_dir / "model" / get_checkpoint_filename(arch)
+            if not ckpt.exists():
+                return
+            data = torch.load(ckpt, map_location="cpu", weights_only=False)
+            sd = data.get("model_state_dict", data) if isinstance(data, dict) else data
+            self._last_weights = sd
+            _log(f"loaded trained checkpoint from disk for serving: {ckpt.name}")
+        except Exception as e:
+            _log(f"could not load checkpoint for serving: {e}")
 
     async def _send_welcome(self, user: _User):
         # The owner keeps their own authoritative subproject; only joinees adopt
@@ -661,11 +712,21 @@ class HubServer(QObject):
             _log(f"SKIP crop from {user.display_name}: {incoming_cs} != locked {self.crop_size}")
             return
         self._crop_seq += 1
-        ts = payload.get("timestamp", int(time.time() * 1000))
-        stem = f"{ts}_{self._crop_seq}"
+        n_channels = int(payload.get("n_channels", 1))
+        suf, ext = self._variant_for_nc(n_channels)
+        slice_idx = int(payload.get("slice_index", 0))
+        # Faithful MOSS filename: z-index baked in (train_worker parses 'slice(\d+)'
+        # for z-coord archs), unique seq avoids per-user collisions.
+        stem = f"slice{slice_idx:04d}_cap{self._crop_seq}"
         base = self.data_dir / "incoming" / uid
-        (base / "train_images" / f"{stem}.png").write_bytes(img_bytes)
-        (base / "train_masks" / f"{stem}.png").write_bytes(mask_bytes)
+        img_dir = base / f"train_images{suf}"
+        msk_dir = base / f"train_masks{suf}"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        msk_dir.mkdir(parents=True, exist_ok=True)
+        # img_bytes/mask_bytes are already the exact on-disk encoding (PNG for 2D,
+        # LZW-TIFF stack for 2.5D/dwarf) — write raw, byte-for-byte MOSS's format.
+        (img_dir / f"{stem}.{ext}").write_bytes(img_bytes)
+        (msk_dir / f"{stem}.{ext}").write_bytes(mask_bytes)
         user.crop_count += 1
         # Feed the training pool only while training is running (additive link,
         # worker re-scans at epoch end). When stopped, just keep the contributor
@@ -752,15 +813,47 @@ class HubServer(QObject):
             self.start_training(fresh=True)
 
     def set_prediction_model(self, arch: str):
-        changed = arch != self.prediction_model
+        changed = arch != (self.prediction_model or self.architecture)
         self.prediction_model = arch
+        self.architecture = arch          # training + prediction stay the SAME model
         _log(f"session model -> {arch} (broadcasting to all clients)")
         self._save_manifest()
         if self._loop and self._running:
             asyncio.run_coroutine_threadsafe(self._broadcast_prediction(arch), self._loop)
-        # New architecture => different checkpoint shape; reset + restart fresh.
-        if changed and self._trainer and self._trainer.is_running():
-            self.reset_model()
+        if changed:
+            self._switch_model_state()
+
+    def _switch_model_state(self):
+        """Switching the session model shows THAT model's OWN state: stop the current
+        trainer, set the epoch from the new model's checkpoint (0 if it's untrained on
+        this hub), clear the loss plot, drop cached weights, and rebuild the pool for
+        the new architecture's crop variant. Does NOT archive anything — switching is
+        not Reset; each model keeps its own checkpoint and its own crops."""
+        was_running = bool(self._trainer and self._trainer.is_running())
+        if self._trainer:
+            self._trainer.stop()
+        self._last_weights = None
+        self._round = self._checkpoint_epoch(self.architecture)
+        self._last_loss = 0.0
+        self._loss_history.clear()
+        self._pool_rebuild_full()     # new variant => different crop folder
+        self.training_status.emit(self._round, self._last_loss, self._contrib_count)
+        if was_running:
+            self.start_training()
+
+    def _checkpoint_epoch(self, arch: str) -> int:
+        """Epoch stored in a model's checkpoint, or 0 if it has none on this hub."""
+        try:
+            import torch
+            from ..models.unet import get_checkpoint_filename
+            ckpt = self.data_dir / "model" / get_checkpoint_filename(arch)
+            if ckpt.exists():
+                data = torch.load(ckpt, map_location="cpu", weights_only=False)
+                if isinstance(data, dict):
+                    return int(data.get("epoch", 0))
+        except Exception:
+            pass
+        return 0
 
     async def _broadcast_prediction(self, arch: str):
         msg = create_set_prediction_model_message(arch).to_json()

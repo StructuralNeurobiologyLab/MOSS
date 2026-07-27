@@ -2793,11 +2793,16 @@ class InteractiveTrainingPage(QWidget):
                 status_msg += f", {count_dwarf} dwarf"
             status_msg += " training samples"
 
-            # Multi-user mode: send crop to host
+            # Multi-user mode: send crop to host. Send the crop version that matches
+            # the SESSION architecture — the 2D slice for a 2D arch, or the multi-
+            # channel 2.5D/dwarf stack (built exactly like local training) so the hub
+            # trains identically to MOSS.
             if self._multi_user_enabled and self._sync_client and self._sync_client.is_connected:
                 if not self._is_host:
-                    # Client sends crop to host
-                    self._sync_client.send_training_data(img_crop_uint8, mask_after_crop, idx)
+                    send_arr = self._build_send_crop(
+                        self.current_architecture or 'unet', idx, img_crop_uint8,
+                        crop_y, crop_x, crop_h, crop_w)
+                    self._sync_client.send_training_data(send_arr, mask_after_crop, idx)
                     status_msg += " (sent to host)"
                 # Host doesn't need to send - crop is already saved locally
 
@@ -3149,6 +3154,52 @@ class InteractiveTrainingPage(QWidget):
             import traceback
             print(f"Failed to save 2.5D crop to {images_dir}: {e}")
             traceback.print_exc()
+
+    def _build_25d_stack(self, slices: list, py: int, px: int,
+                         crop_h: int, crop_w: int):
+        """Return the (C,H,W) uint8 stack for adjacent slices — cropped and
+        per-channel normalized exactly as _save_25d_crop writes to disk. None if a
+        slice is too small for the crop box. (Shared by local save + multi-user send.)"""
+        crops = []
+        for slice_img in slices:
+            h, w = slice_img.shape
+            if py + crop_h > h or px + crop_w > w:
+                return None
+            crop = slice_img[py:py + crop_h, px:px + crop_w].copy()
+            cmin, cmax = crop.min(), crop.max()
+            if cmax > cmin:
+                crop = ((crop - cmin) / (cmax - cmin) * 255).astype(np.uint8)
+            else:
+                crop = crop.astype(np.uint8)
+            crops.append(crop)
+        return np.stack(crops, axis=0)
+
+    def _build_send_crop(self, arch: str, idx: int, img_crop_2d: np.ndarray,
+                         crop_y: int, crop_x: int, crop_h: int, crop_w: int):
+        """Build the crop array to transmit for the SESSION architecture: the plain
+        2D crop for a 2D arch, or the multi-channel (C,H,W) 2.5D/dwarf stack (same
+        adjacent-slice selection + per-channel normalization as local training).
+        Falls back to the 2D crop if the context can't be built."""
+        try:
+            from ..models.architectures import (
+                get_n_context_slices, get_slice_spacing, is_3d_architecture)
+            a = (arch or '').lower()
+            if is_3d_architecture(arch) or '25d' not in a:
+                return img_crop_2d   # 2D (or 3D, not wired over the wire) -> single slice
+            if 'dwarf25d' in a:
+                slices = self._load_adjacent_slices(idx, n_flanking=5, spacing=2)  # 11
+            else:
+                n = get_n_context_slices(arch)
+                slices = self._load_adjacent_slices(
+                    idx, n_flanking=(n - 1) // 2, spacing=get_slice_spacing(arch))
+            if not slices:
+                print(f"[MultiUser] no adjacent slices for {arch}; sending 2D crop")
+                return img_crop_2d
+            stack = self._build_25d_stack(slices, crop_y, crop_x, crop_h, crop_w)
+            return stack if stack is not None else img_crop_2d
+        except Exception as e:
+            print(f"[MultiUser] could not build {arch} stack ({e}); sending 2D crop")
+            return img_crop_2d
 
     def reset_model(self):
         """Reset the model - archive old checkpoint and start fresh."""

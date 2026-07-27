@@ -53,9 +53,18 @@ class HubTrainer(QObject):
         if self.hub.force_cpu:
             os.environ["FORCE_CPU"] = "1"    # honored by models.unet.get_device()
         ckpt = self.checkpoint_path()
+        pool = self.hub._pool_root()
         cfg = {
-            "train_images": str(self.hub._pool_images()),
-            "train_masks": str(self.hub._pool_masks()),
+            # Pass ALL SIX training-dir keys, exactly like local MOSS. TrainWorker
+            # derives n_channels from the architecture string and reads the matching
+            # folder (train_images / _25d / _dwarf25d). NO n_channels key — the worker
+            # owns that. Only the session's variant folder actually holds crops.
+            "train_images": str(pool / "train_images"),
+            "train_masks": str(pool / "train_masks"),
+            "train_images_25d": str(pool / "train_images_25d"),
+            "train_masks_25d": str(pool / "train_masks_25d"),
+            "train_images_dwarf25d": str(pool / "train_images_dwarf25d"),
+            "train_masks_dwarf25d": str(pool / "train_masks_dwarf25d"),
             "checkpoint_path": ckpt,
             "architecture": self._arch(),
             "tile_size": self.hub.crop_size or 256,

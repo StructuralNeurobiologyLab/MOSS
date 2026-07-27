@@ -869,18 +869,26 @@ class SyncClient(QObject):
             return
 
         try:
-            # Serialize the training data
+            import numpy as np
+            image_array = np.asarray(image_array)
+            # A 2.5D/dwarf crop is a multi-channel (C,H,W) stack; a plain crop is 2D (H,W).
+            if image_array.ndim == 3:
+                n_channels = int(image_array.shape[0])
+                crop_size = int(image_array.shape[-1])
+            else:
+                n_channels = 1
+                crop_size = int(image_array.shape[0]) if image_array.ndim >= 2 else 256
+
+            # Serialize the training data (PNG for 2D, LZW-TIFF stack for multi-channel)
             img_bytes, mask_bytes = serialize_training_data(image_array, mask_array)
 
-            # Get crop size
-            crop_size = image_array.shape[0] if len(image_array.shape) >= 2 else 256
-
-            # Create message header
+            # Create message header (n_channels tells the host which variant folder to use)
             header = create_training_data_message(
                 user_id=self.user_id,
                 display_name=self.display_name,
                 crop_size=crop_size,
-                slice_index=slice_index
+                slice_index=slice_index,
+                n_channels=n_channels,
             )
 
             # Send header
@@ -892,7 +900,7 @@ class SyncClient(QObject):
 
             total_kb = (len(img_bytes) + len(mask_bytes)) / 1024
             self.sync_status.emit(f"Sent training crop ({total_kb:.1f}KB)")
-            _log(f"Sent training data: {crop_size}x{crop_size}, {total_kb:.1f}KB")
+            _log(f"Sent training data: {n_channels}ch {crop_size}x{crop_size}, {total_kb:.1f}KB")
 
         except Exception as e:
             self.error.emit(f"Failed to send training data: {e}")
