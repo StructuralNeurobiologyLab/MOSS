@@ -3782,19 +3782,13 @@ class InteractiveTrainingPage(QWidget):
             self._apply_global_model(global_weights)
 
     def _apply_global_model(self, global_weights: dict):
-        """
-        Apply global model weights with blending.
+        """Adopt the session's authoritative model (from the owner/hub).
 
-        Blends global weights with local weights:
-        new_weights = (1 - blend_ratio) * local + blend_ratio * global
-
-        With blend_ratio=0.5 (default):
-        Each user keeps 50% their own learning + 50% collective learning
-
-        If no local checkpoint exists, uses global weights directly (100%).
+        The hub is the single source of truth: it trains and pushes the model, and
+        every client REPLACES its prediction model with it — NO blending. (The old
+        peer-to-peer 50/50 averaging is removed.)
         """
         try:
-            from ..network import blend_weights
             import torch
 
             # Debug: show received weights info
@@ -3838,37 +3832,20 @@ class InteractiveTrainingPage(QWidget):
                 self._show_temp_status("Received model from session")
                 return
 
-            # Load local weights for blending
-            local_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-            if isinstance(local_checkpoint, dict) and 'model_state_dict' in local_checkpoint:
-                local_weights = local_checkpoint['model_state_dict']
-            elif isinstance(local_checkpoint, dict) and 'model_state' in local_checkpoint:
-                local_weights = local_checkpoint['model_state']
-            else:
-                local_weights = local_checkpoint  # Assume it's just the state dict
-
-            # Blend weights
-            blended = blend_weights(local_weights, global_weights, self._blend_ratio)
-
-            # Save blended weights back to checkpoint
-            if isinstance(local_checkpoint, dict):
-                if 'model_state_dict' in local_checkpoint:
-                    local_checkpoint['model_state_dict'] = blended
-                elif 'model_state' in local_checkpoint:
-                    local_checkpoint['model_state'] = blended
-                else:
-                    local_checkpoint = blended
-            else:
-                local_checkpoint = blended
-
-            torch.save(local_checkpoint, checkpoint_path)
+            # Authoritative model from the owner/hub — REPLACE our checkpoint with it.
+            # NO blending: the hub is the single source of truth. (The old peer-to-peer
+            # 50/50 averaging is removed — it corrupted local models and blanked
+            # predictions by mixing in an undertrained global.)
+            torch.save({'epoch': 0, 'model_state_dict': global_weights, 'loss': 0.0},
+                       checkpoint_path)
+            print(f"[MultiUser] Adopted session model (full replace) -> {checkpoint_path}")
 
             # Notify prediction worker to reload
             if self.predict_worker:
+                self.predict_worker.set_architecture(self.current_architecture)
                 self.predict_worker.set_checkpoint(str(checkpoint_path))
 
-            self._show_temp_status(f"Applied global model (blend: {self._blend_ratio:.0%})")
-            print(f"[MultiUser] Applied global model with blend ratio {self._blend_ratio}")
+            self._show_temp_status("Applied session model")
 
         except Exception as e:
             print(f"[MultiUser] Error applying global model: {e}")

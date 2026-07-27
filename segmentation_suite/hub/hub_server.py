@@ -515,6 +515,8 @@ class HubServer(QObject):
             uid = self._ws_to_uid.get(websocket)
             if uid:
                 self._pending_td[uid] = {"payload": msg.payload, "frames": []}
+        elif msg.type == MessageType.REQUEST_MODEL:
+            await self._on_request_model(websocket)
         elif msg.type == MessageType.GOODBYE:
             await self._drop(websocket)
 
@@ -568,6 +570,21 @@ class HubServer(QObject):
         await self._broadcast_user_list()
         self.user_connected.emit(uid, name, is_owner, join_index)
         self._save_manifest()
+
+    async def _on_request_model(self, websocket):
+        """A client asked for the current authoritative model on-demand (e.g. after a
+        local Reset). Send the last broadcast weights so it stops retrying. If nothing
+        has trained yet, stay quiet — the client keeps polling until the first
+        broadcast pushes a model to everyone."""
+        uid = self._ws_to_uid.get(websocket)
+        if not uid or uid not in self._users or self._last_weights is None:
+            return
+        user = self._users[uid]
+        header = create_global_model_message(
+            aggregation_round=self._agg_round,
+            contributor_count=self._contrib_count).to_json()
+        await self._send_model_frames(user.ws, header, serialize_weights(self._last_weights))
+        _log(f"sent model on request to {user.display_name} ({uid})")
 
     async def _send_welcome(self, user: _User):
         # The owner keeps their own authoritative subproject; only joinees adopt
