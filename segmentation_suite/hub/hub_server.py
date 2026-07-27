@@ -203,8 +203,10 @@ class HubServer(QObject):
 
     def _session_variant(self):
         """(dir-suffix, ext) for the session's locked architecture — the variant all
-        crops in this session use for pooling/counting/training."""
-        a = (self.architecture or self.prediction_model or "").lower()
+        crops in this session use for pooling/counting/training. Uses the SAME source
+        the trainer does (prediction_model first) so counting/pooling/training never
+        disagree — e.g. after a resume where architecture lags the switched model."""
+        a = (self.prediction_model or self.architecture or "").lower()
         if "dwarf25d" in a:
             return ("_dwarf25d", "tif")
         if "25d" in a:
