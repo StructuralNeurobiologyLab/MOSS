@@ -13,23 +13,32 @@ anchor CAT (thin 1.1 stroke, fill none, minimal internal detail).
 
 from __future__ import annotations
 
-import colorsys
-
 from PyQt6.QtCore import QByteArray, Qt
 from PyQt6.QtGui import QPixmap, QPainter
 from PyQt6.QtSvg import QSvgRenderer
 
-# Border/tint colors are GENERATED (not a fixed palette) so that mark and color
-# COMBINE into far more identities than either alone. With 13 marks and 12 color
-# steps (coprime), consecutive joins differ in BOTH mark and color, and any one
-# mark cycles through all 12 colors before a (mark, color) pair repeats — i.e.
-# 13 x 12 = 156 distinct user identities instead of 13.
-N_COLOR_STEPS = 12  # keep coprime with the 13 marks
-
-
-def _hsl_hex(h: float, s: float, l: float) -> str:
-    r, g, b = colorsys.hls_to_rgb(h, l, s)
-    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+# Border/tint colors: a curated GENTLE BOTANICAL palette (clay/rose, sage/fern,
+# teal + soft blues, plum/berry) tuned to harmonize with the light "Botanical"
+# console theme and to read on BOTH the light ivory background and the dark Qt
+# cards. Mark and color COMBINE into the user identity: 12 colors is coprime with
+# the 13 marks, so consecutive joins differ in BOTH mark and color, any one mark
+# cycles all 12 colors, and no (mark, color) pair repeats until join 157
+# (13 x 12 = 156 distinct identities). Order interleaves warm/green/blue so
+# consecutive joiners look distinct.
+USER_COLORS = [
+    "#b4583c",  # clay
+    "#388a8a",  # teal
+    "#a77f35",  # goldenrod
+    "#4676b4",  # dusty blue
+    "#579348",  # sage
+    "#b74e87",  # berry
+    "#3f85ab",  # sky blue
+    "#768f3d",  # olive
+    "#975bae",  # plum
+    "#3c8b63",  # fern
+    "#5c67bc",  # periwinkle
+    "#b84756",  # rose
+]
 
 # name -> minimalist thin SVG logo-mark (viewBox 0 0 24 24, currentColor).
 _MARKS = {
@@ -56,14 +65,10 @@ def animal_for_index(index: int) -> str:
 
 
 def color_for_index(index: int) -> str:
-    """Procedural border/tint color. Combined with animal_for_index (13 marks)
-    so consecutive joins differ in BOTH mark and color, and a given mark cycles
-    through all colors before any (mark, color) pair repeats."""
-    return _hsl_hex((index % N_COLOR_STEPS) / N_COLOR_STEPS, 0.62, 0.60)
-
-
-# Materialized first cycle, for any code that wants the raw palette.
-USER_COLORS = [color_for_index(i) for i in range(N_COLOR_STEPS)]
+    """Curated gentle-botanical tint. Combined with animal_for_index (13 marks)
+    so consecutive joins differ in BOTH mark and color; a mark cycles all 12
+    colors before any (mark, color) pair repeats (13 x 12 = 156 identities)."""
+    return USER_COLORS[index % len(USER_COLORS)]
 
 
 def animal_svg(name: str, color: str = "currentColor") -> str:
