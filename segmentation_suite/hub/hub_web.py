@@ -160,84 +160,109 @@ PAGE = r"""<!doctype html>
 <title>MOSS Hub</title>
 <style>
 :root{
-    --bg:#f4f1e7; --panel:#fbfaf4; --inset:#ebe8db; --border:#ddd8c6;
-    --ink:#2a2c22; --muted:#6d6e5c; --faint:#9a9a83;
-    --accent:#2c6a45; --amber:#a07d1f; --green:#2f8a54; --danger:#b0374a;
-    --r:12px; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
-    color-scheme:light;
-  }
-  *{box-sizing:border-box;}
-  html,body{margin:0;}
-  body{background:var(--bg);color:var(--ink);
-    font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
-  .cap{color:var(--faint);font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;}
-  .muted{color:var(--muted);} .mono{font-family:var(--mono);}
-  button{font:inherit;border:none;border-radius:8px;cursor:pointer;color:#fff;
-    background:var(--accent);padding:9px 14px;font-weight:600;transition:.12s;}
-  button:hover{filter:brightness(1.08);}
+  --bg:#f4f1e7; --panel:#fbfaf4; --inset:#ebe8db; --border:#ddd8c6;
+  --ink:#2a2c22; --muted:#6d6e5c; --faint:#9a9a83;
+  --accent:#2c6a45; --amber:#a07d1f; --green:#2f8a54; --danger:#b0374a;
+  --r:12px; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  color-scheme:light;
+}
+*{box-sizing:border-box;}
+html,body{margin:0;}
+body{background:var(--bg);color:var(--ink);
+  font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased;}
+.muted{color:var(--muted);} .mono{font-family:var(--mono);}
+.cap{color:var(--faint);font-size:10px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;}
+
+button{font:inherit;border:none;border-radius:8px;cursor:pointer;color:#fff;
+  background:var(--accent);padding:9px 14px;font-weight:600;transition:.12s;}
+button:hover{filter:brightness(1.08);}
+button.danger{background:transparent;border:1px solid #e0b9bd;color:#9d2f3d;font-weight:600;}
+button.danger:hover{background:#f6e6e7;filter:none;}
+button.mini{padding:3px 9px;font-size:11px;font-weight:600;background:var(--inset);color:var(--muted);border:1px solid var(--border);}
+button.mini:hover{color:var(--ink);filter:none;}
+
+/* ---- top bar : identity only, calmer ---- */
+#top{position:sticky;top:0;z-index:6;display:flex;align-items:center;flex-wrap:wrap;
+  padding:11px 20px;background:rgba(251,250,244,.9);backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--border);}
+.brand{font-size:15px;font-weight:800;letter-spacing:.5px;color:var(--accent);padding-right:22px;white-space:nowrap;}
+.brand span{color:var(--faint);font-weight:600;}
+.tg{display:flex;flex-direction:column;gap:3px;padding:2px 22px;border-left:1px solid var(--border);min-width:0;}
+.addr-row{display:flex;align-items:center;gap:8px;}
+.addr{font-family:var(--mono);font-size:17px;font-weight:800;color:var(--amber);letter-spacing:.3px;}
+.code{font-family:var(--mono);font-size:14px;font-weight:700;color:#8f7326;letter-spacing:2px;}
+.proj{font-size:14px;font-weight:700;line-height:1.2;}
+.subproj{color:var(--muted);font-size:11px;}
+
+/* ---- stats strip : lifted training numbers ---- */
+#strip{display:flex;align-items:stretch;flex-wrap:wrap;
+  background:var(--panel);border-bottom:1px solid var(--border);
+  padding:0 20px;box-shadow:0 1px 2px rgba(60,58,40,.03);}
+.metric{display:flex;flex-direction:column;justify-content:center;gap:5px;
+  padding:11px 24px;border-right:1px solid var(--border);}
+.metric:first-of-type{padding-left:0;}
+.mlab{font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:var(--faint);}
+.mval{font-family:var(--mono);font-size:18px;font-weight:700;color:var(--ink);line-height:1;}
+.runchip{display:inline-flex;align-items:center;gap:7px;font-size:15px;font-weight:700;color:var(--ink);line-height:1;}
+.runchip .d{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none;}
+.runchip.on .d{background:var(--green);animation:blink 1.6s ease-in-out infinite;}
+.ctrls{margin-left:auto;display:flex;align-items:center;gap:8px;padding:9px 0;}
+.ctrls button{padding:8px 14px;font-size:13px;}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.28}}
+
+/* ---- body : big users grid + loss chart ---- */
+#body{display:grid;grid-template-columns:1fr 340px;gap:16px;padding:16px 20px 26px;align-items:start;}
+@media(max-width:900px){#body{grid-template-columns:1fr;}}
+#right{display:flex;flex-direction:column;gap:16px;}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);
+  padding:16px 18px;box-shadow:0 1px 2px rgba(60,58,40,.04);}
+.card>h3,.cardhead h3{margin:0;font-size:12px;font-weight:700;letter-spacing:.4px;
+  color:var(--muted);text-transform:uppercase;}
+.cardhead{display:flex;align-items:baseline;justify-content:space-between;gap:12px;
+  margin-bottom:14px;flex-wrap:wrap;}
+.hint{color:var(--faint);font-size:11px;}
+
+/* ---- user tiles : cleaner, lighter ---- */
+#tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;}
+.tile{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+  padding:11px 12px 13px;cursor:pointer;transition:.14s;position:relative;text-align:center;}
+.tile:hover{border-color:color-mix(in srgb,var(--u,var(--faint)) 45%,var(--border));
+  box-shadow:0 3px 10px rgba(60,58,40,.06);transform:translateY(-1px);}
+.tile .thead{display:flex;align-items:center;gap:6px;height:14px;margin-bottom:8px;padding-right:16px;}
+.tile .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none;}
+.tile .dot.on{background:var(--green);animation:blink 1.6s ease-in-out infinite;}
+.tile .crown{color:var(--amber);font-size:10px;font-weight:700;letter-spacing:.3px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.tile .inc{position:absolute;top:10px;right:10px;margin:0;accent-color:var(--accent);cursor:pointer;}
+.tile .av{width:62px;height:62px;margin:1px auto 8px;display:grid;place-items:center;}
+.tile .av svg{width:58px;height:58px;display:block;}
+.tile .nm{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.tile .cc{color:var(--muted);font-size:11px;margin-top:2px;}
+.tile.off{opacity:.55;}
+.tile.off .av{filter:grayscale(1);opacity:.7;}
+.tile.off .nm,.tile.off .cc{color:var(--faint);}
+#empty{color:var(--faint);text-align:center;padding:30px;font-size:13px;}
+
+/* ---- loss chart ---- */
+.losshead{display:flex;align-items:baseline;gap:10px;margin:2px 0 10px;}
+.lossnum{font-family:var(--mono);font-size:26px;font-weight:800;color:var(--green);line-height:1;}
+.lossmeta{font-size:12px;}
+#loss{width:100%;height:230px;display:block;}
+
+/* ---- session setup (model + storage merged) ---- */
+.fld{margin-bottom:14px;}
+.flab{display:block;font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+  color:var(--faint);margin-bottom:6px;}
+select{width:100%;background:var(--inset);color:var(--ink);border:1px solid var(--border);
+  padding:9px 10px;border-radius:8px;font:inherit;}
+.path{background:var(--inset);border:1px solid var(--border);border-radius:8px;
+  padding:8px 10px;font-size:11px;color:var(--ink);word-break:break-all;}
+.foot{color:var(--faint);font-size:11px;margin-top:2px;}
+
+  /* --- carried over: ghost button, reviewer modal, project picker --- */
   button.ghost{background:transparent;border:1px solid var(--border);color:var(--muted);}
   button.ghost:hover{color:var(--ink);border-color:var(--faint);background:transparent;filter:none;}
-  button.danger{background:transparent;border:1px solid #e0b9bd;color:#9d2f3d;}
-  button.danger:hover{background:#f6e6e7;filter:none;}
-  button.mini{padding:3px 9px;font-size:11px;font-weight:600;background:var(--inset);color:var(--muted);border:1px solid var(--border);}
-  button.mini:hover{color:var(--ink);filter:none;}
-
-  /* top bar */
-  #top{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:28px;flex-wrap:wrap;
-    padding:14px 20px;background:rgba(249,247,239,.85);backdrop-filter:blur(8px);
-    border-bottom:1px solid var(--border);box-shadow:0 1px 3px rgba(60,58,40,.05);}
-  .brand{font-size:17px;font-weight:800;letter-spacing:.5px;color:var(--accent);}
-  .brand span{color:var(--muted);font-weight:600;}
-  .addr-row{display:flex;align-items:center;gap:8px;}
-  .addr{font-family:var(--mono);font-size:21px;font-weight:800;color:var(--amber);letter-spacing:.5px;}
-  .code{font-family:var(--mono);font-size:14px;color:#8f7326;letter-spacing:2px;}
-  .proj{font-size:15px;font-weight:700;}
-  .pill{margin-left:auto;display:flex;align-items:center;gap:7px;background:var(--inset);
-    border:1px solid var(--border);border-radius:999px;padding:5px 13px;font-weight:600;font-size:13px;}
-  .pill .dot{width:8px;height:8px;border-radius:50%;background:var(--green);}
-
-  /* layout */
-  #body{display:grid;grid-template-columns:1fr 320px;gap:16px;padding:16px;align-items:start;}
-  @media(max-width:880px){#body{grid-template-columns:1fr;}}
-  #left{display:flex;flex-direction:column;gap:16px;min-width:0;}
-  #right{display:flex;flex-direction:column;gap:16px;}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:16px;box-shadow:0 1px 2px rgba(60,58,40,.04);}
-  .card > h3{margin:0 0 12px;font-size:12px;font-weight:700;letter-spacing:.4px;color:var(--muted);text-transform:uppercase;}
-
-  /* tiles */
-  #tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;}
-  .tile{background:var(--inset);border:1px solid var(--border);border-left:3px solid var(--faint);
-    border-radius:10px;padding:10px;cursor:pointer;transition:.12s;position:relative;}
-  .tile:hover{transform:translateY(-1px);border-color:var(--faint);box-shadow:0 2px 6px rgba(60,58,40,.07);}
-  .tile .row{display:flex;align-items:center;gap:6px;height:16px;}
-  .tile .crown{color:var(--amber);font-size:10px;font-weight:700;flex:1;overflow:hidden;white-space:nowrap;}
-  .tile .dot{width:9px;height:9px;border-radius:50%;background:var(--faint);}
-  .tile .dot.on{background:var(--green);animation:blink 1.5s ease-in-out infinite;}
-  @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-  .tile .av{display:block;margin:6px auto 4px;width:76px;height:76px;}
-  .tile.off .av{filter:grayscale(1);opacity:.45;}
-  .tile .nm{text-align:center;font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-  .tile.off .nm{color:var(--muted);}
-  .tile .cc{text-align:center;color:var(--muted);font-size:11px;margin-top:1px;}
-  .tile .inc{position:absolute;top:9px;right:9px;accent-color:var(--accent);cursor:pointer;}
-  #empty{color:var(--faint);text-align:center;padding:26px;font-size:13px;}
-
-  /* training panel */
-  .stat{display:flex;justify-content:space-between;padding:3px 0;font-size:13px;}
-  .stat b{font-family:var(--mono);font-weight:600;color:var(--ink);}
-  .runchip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;}
-  .runchip .d{width:8px;height:8px;border-radius:50%;background:var(--faint);}
-  .runchip.on .d{background:var(--green);animation:blink 1.5s infinite;}
-  #trainbtn{width:100%;margin-top:12px;padding:11px;font-size:14px;}
-  #resetbtn{width:100%;margin-top:8px;}
-  select{width:100%;background:var(--inset);color:var(--ink);border:1px solid var(--border);
-    padding:8px;border-radius:8px;font:inherit;}
-
-  /* loss plot */
-  .losshead{display:flex;align-items:baseline;gap:10px;margin-bottom:8px;}
-  .lossnum{font-family:var(--mono);font-size:26px;font-weight:800;color:var(--green);}
-  #loss{width:100%;height:230px;display:block;}
-
   /* review modal */
   #modal{position:fixed;inset:0;background:rgba(38,40,30,.5);display:none;align-items:center;justify-content:center;z-index:20;}
   #mcard{background:var(--panel);border:1px solid var(--border);border-radius:14px;width:min(92vw,720px);padding:18px;box-shadow:0 12px 40px rgba(40,42,30,.22);}
@@ -265,46 +290,49 @@ PAGE = r"""<!doctype html>
 <body>
 <div id="top">
   <div class="brand">MOSS<span>·HUB</span></div>
-  <div><div class="cap">Connect address · share this</div>
-    <div class="addr-row"><span class="addr" id="addr">—</span>
-      <button class="mini" onclick="copyAddr()">copy</button></div></div>
-  <div><div class="cap">Session code</div><div class="code" id="code">—</div></div>
-  <div><div class="cap">Project</div><div class="proj" id="proj">—</div>
-    <div class="muted" id="subproj" style="font-size:11px"></div></div>
-  <div class="pill"><span class="dot"></span><span id="count">0 connected</span></div>
+  <div class="tg"><span class="cap">Connect address · share this</span>
+    <span class="addr-row"><span class="addr" id="addr">—</span>
+      <button class="mini" onclick="copyAddr()">copy</button></span></div>
+  <div class="tg"><span class="cap">Session code</span><span class="code" id="code">—</span></div>
+  <div class="tg"><span class="cap">Project</span><span class="proj" id="proj">—</span>
+    <span class="subproj" id="subproj"></span></div>
+</div>
+
+<div id="strip">
+  <div class="metric"><span class="mlab">Status</span>
+    <span class="runchip" id="runchip"><span class="d"></span><span id="runtxt">Idle</span></span></div>
+  <div class="metric"><span class="mlab">Epoch</span><span class="mval" id="tround">0</span></div>
+  <div class="metric"><span class="mlab">Loss</span><span class="mval" id="tloss">—</span></div>
+  <div class="metric"><span class="mlab">Contributors</span><span class="mval" id="tcontrib">0</span></div>
+  <div class="metric"><span class="mlab">Connected</span><span class="mval" id="count">0</span></div>
+  <div class="ctrls">
+    <button id="trainbtn" onclick="toggleTrain()">Start training</button>
+    <button id="resetbtn" class="danger" onclick="doReset()">Reset model</button>
+  </div>
 </div>
 
 <div id="body">
   <div id="left">
-    <div class="card"><h3>Connected users</h3>
+    <div class="card">
+      <div class="cardhead"><h3>Connected users</h3>
+        <span class="hint">Click a tile to review crops · uncheck to exclude from training</span></div>
       <div id="tiles"></div>
       <div id="empty">No users connected yet — share the connect address to invite collaborators.</div>
-      <div class="muted" style="font-size:11px;margin-top:10px">Click a tile to review that user's crops. Uncheck to exclude them from training.</div>
-    </div>
-    <div class="card"><h3>Training loss</h3>
-      <div class="losshead"><span class="lossnum" id="lossnum">—</span>
-        <span class="muted" id="lossmeta"></span></div>
-      <canvas id="loss"></canvas>
     </div>
   </div>
 
   <div id="right">
-    <div class="card"><h3>Training</h3>
-      <div class="stat"><span class="muted">Status</span>
-        <span class="runchip" id="runchip"><span class="d"></span><span id="runtxt">Idle</span></span></div>
-      <div class="stat"><span class="muted">Round (epoch)</span><b id="tround">0</b></div>
-      <div class="stat"><span class="muted">Loss</span><b id="tloss">—</b></div>
-      <div class="stat"><span class="muted">Contributing users</span><b id="tcontrib">0</b></div>
-      <button id="trainbtn" onclick="toggleTrain()">Start training</button>
-      <button id="resetbtn" class="danger" onclick="doReset()">Reset model</button>
+    <div class="card"><h3>Training loss</h3>
+      <div class="losshead"><span class="lossnum" id="lossnum">—</span>
+        <span class="muted lossmeta" id="lossmeta"></span></div>
+      <canvas id="loss"></canvas>
     </div>
-    <div class="card"><h3>Session model</h3>
-      <div class="muted" style="font-size:12px;margin-bottom:8px">Trained by the hub; all clients predict with it.</div>
-      <select id="model" onchange="setModel()"></select>
-    </div>
-    <div class="card"><h3>Storage</h3>
-      <div class="muted" style="font-size:11px">Main folder (crops · models)</div>
-      <div class="mono" id="datadir" style="font-size:11px;color:var(--ink);word-break:break-all;margin-top:3px">—</div>
+    <div class="card"><h3>Session setup</h3>
+      <div class="fld" style="margin-top:12px"><span class="flab">Model</span>
+        <select id="model" onchange="setModel()"></select></div>
+      <div class="fld" style="margin-bottom:6px"><span class="flab">Storage folder · crops &amp; models</span>
+        <div class="path mono" id="datadir">—</div></div>
+      <div class="foot">Trained by the hub; all clients predict with it.</div>
     </div>
   </div>
 </div>
@@ -393,6 +421,7 @@ function render(s){
   const idle=(s.active===false);
   document.getElementById('picker').style.display=idle?'flex':'none';
   document.getElementById('body').style.display=idle?'none':'';
+  document.getElementById('strip').style.display=idle?'none':'';
   if(idle){renderPicker(s);
     document.getElementById('addr').textContent='—';
     document.getElementById('code').textContent='—';
@@ -404,7 +433,7 @@ function render(s){
   document.getElementById('code').textContent=s.code;
   document.getElementById('proj').textContent=s.project_name||'— waiting for owner —';
   document.getElementById('subproj').textContent=s.session_subproject?(s.session_subproject+' · crop '+s.crop_size):'';
-  document.getElementById('count').textContent=(s.online_count===s.total_count)?(s.online_count+' connected'):(s.online_count+' online · '+s.total_count+' total');
+  document.getElementById('count').textContent=(s.online_count===s.total_count)?(''+s.total_count):(s.online_count+'/'+s.total_count);
   document.getElementById('datadir').textContent=s.data_dir;
   const t=s.training||{};
   document.getElementById('tround').textContent=t.round||0;
@@ -426,10 +455,10 @@ function render(s){
   document.getElementById('empty').style.display=s.users.length?'none':'block';
   s.users.forEach(u=>{CUR_NAMES[u.uid]=u.name;
     const d=document.createElement('div');d.className='tile'+(u.online?'':' off');
-    d.style.borderLeftColor=u.included?u.color:'var(--faint)';
-    d.innerHTML='<div class="row"><span class="crown">'+(u.is_owner?'♛ owner':'')+'</span>'+
+    d.style.setProperty('--u',u.included?u.color:'var(--faint)');
+    d.innerHTML='<div class="thead"><span class="dot'+(u.online?' on':'')+'"></span>'+
+      '<span class="crown">'+(u.is_owner?'♛ owner':'')+'</span></div>'+
       '<input class="inc" type="checkbox" '+(u.included?'checked':'')+' title="include in training">'+
-      '<span class="dot '+(u.online?'on':'')+'"></span></div>'+
       '<div class="av">'+u.animal_svg+'</div>'+
       '<div class="nm">'+u.name+'</div><div class="cc">'+u.crops+' crop'+(u.crops===1?'':'s')+'</div>';
     d.querySelector('.inc').onclick=(e)=>{e.stopPropagation();toggle(u.uid,e.target.checked);};
