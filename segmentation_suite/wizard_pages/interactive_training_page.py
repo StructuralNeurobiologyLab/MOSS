@@ -2799,10 +2799,8 @@ class InteractiveTrainingPage(QWidget):
             # trains identically to MOSS.
             if self._multi_user_enabled and self._sync_client and self._sync_client.is_connected:
                 if not self._is_host:
-                    send_arr = self._build_send_crop(
-                        self.current_architecture or 'unet', idx, img_crop_uint8,
-                        crop_y, crop_x, crop_h, crop_w)
-                    self._sync_client.send_training_data(send_arr, mask_after_crop, idx)
+                    self._send_all_training_variants(
+                        idx, img_crop_uint8, mask_after_crop, crop_y, crop_x, crop_h, crop_w)
                     status_msg += " (sent to host)"
                 # Host doesn't need to send - crop is already saved locally
 
@@ -3174,32 +3172,28 @@ class InteractiveTrainingPage(QWidget):
             crops.append(crop)
         return np.stack(crops, axis=0)
 
-    def _build_send_crop(self, arch: str, idx: int, img_crop_2d: np.ndarray,
-                         crop_y: int, crop_x: int, crop_h: int, crop_w: int):
-        """Build the crop array to transmit for the SESSION architecture: the plain
-        2D crop for a 2D arch, or the multi-channel (C,H,W) 2.5D/dwarf stack (same
-        adjacent-slice selection + per-channel normalization as local training).
-        Falls back to the 2D crop if the context can't be built."""
-        try:
-            from ..models.architectures import (
-                get_n_context_slices, get_slice_spacing, is_3d_architecture)
-            a = (arch or '').lower()
-            if is_3d_architecture(arch) or '25d' not in a:
-                return img_crop_2d   # 2D (or 3D, not wired over the wire) -> single slice
-            if 'dwarf25d' in a:
-                slices = self._load_adjacent_slices(idx, n_flanking=5, spacing=2)  # 11
-            else:
-                n = get_n_context_slices(arch)
-                slices = self._load_adjacent_slices(
-                    idx, n_flanking=(n - 1) // 2, spacing=get_slice_spacing(arch))
-            if not slices:
-                print(f"[MultiUser] no adjacent slices for {arch}; sending 2D crop")
-                return img_crop_2d
-            stack = self._build_25d_stack(slices, crop_y, crop_x, crop_h, crop_w)
-            return stack if stack is not None else img_crop_2d
-        except Exception as e:
-            print(f"[MultiUser] could not build {arch} stack ({e}); sending 2D crop")
-            return img_crop_2d
+    def _send_all_training_variants(self, idx: int, img_crop_2d: np.ndarray, mask,
+                                    crop_y: int, crop_x: int, crop_h: int, crop_w: int):
+        """Faithfully mirror MOSS's local capture: send EVERY crop variant to the host
+        so the hub can train ANY architecture from one capture and switching the
+        session model never orphans crops — 2D (1ch), 2.5D (3ch, z-3/z/z+3), dwarf
+        (11ch, spacing 2). The multi-channel stacks are only sent when the volume has
+        the adjacent slices (3D data); a 2D source just sends the single slice."""
+        c = self._sync_client
+        # 2D — always
+        c.send_training_data(img_crop_2d, mask, idx)
+        # 2.5D 3-channel and dwarf 11-channel — same adjacent-slice selection +
+        # per-channel normalization as _save_25d_crop.
+        for n_flanking, spacing, want_c in ((1, 3, 3), (5, 2, 11)):
+            try:
+                slices = self._load_adjacent_slices(idx, n_flanking=n_flanking, spacing=spacing)
+                if not slices:
+                    continue
+                stack = self._build_25d_stack(slices, crop_y, crop_x, crop_h, crop_w)
+                if stack is not None and stack.shape[0] == want_c:
+                    c.send_training_data(stack, mask, idx)
+            except Exception as e:
+                print(f"[MultiUser] {want_c}ch variant skipped: {e}")
 
     def reset_model(self):
         """Reset the model - archive old checkpoint and start fresh."""

@@ -33,7 +33,32 @@ from urllib.parse import urlparse, unquote
 from PyQt6.QtCore import QObject, pyqtSignal
 
 _UID_RE = re.compile(r"^[A-Za-z0-9_]+$")
-_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+\.png$")
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+\.(png|tif|tiff)$")
+
+
+def _crop_to_png(path) -> bytes:
+    """Read a stored crop (LZW TIFF 1/3/11-channel, or PNG) and return PNG bytes the
+    browser can render. Multi-channel -> the center channel; single-channel as-is."""
+    import io
+    import numpy as np
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = None
+    data = path.read_bytes()
+    if data[:2] in (b"II", b"MM"):
+        import tifffile
+        arr = np.asarray(tifffile.imread(io.BytesIO(data)))
+        if arr.ndim == 3:
+            # (C,H,W) if the first axis is the small channel dim, else (H,W,C)
+            if arr.shape[0] <= 16 and arr.shape[0] < arr.shape[-1]:
+                arr = arr[arr.shape[0] // 2]
+            else:
+                arr = arr[..., arr.shape[-1] // 2]
+        img = Image.fromarray(arr.astype(np.uint8))
+    else:
+        img = Image.open(io.BytesIO(data))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 class HubWeb(QObject):
@@ -121,17 +146,22 @@ class HubWeb(QObject):
                     uid = unquote(path[len("/crops/"):]).strip("/")
                     names = []
                     if _UID_RE.match(uid):
-                        d = hub.data_dir / "incoming" / uid / "train_images"
+                        suf, ext = hub._session_variant()
+                        d = hub.data_dir / "incoming" / uid / f"train_images{suf}"
                         if d.exists():
-                            names = sorted((f.name for f in d.glob("*.png")), reverse=True)[:500]
+                            names = sorted((f.name for f in d.glob(f"*.{ext}")), reverse=True)[:500]
                     self._send(200, "application/json", json.dumps(names).encode("utf-8"))
                 elif path.startswith("/crop/") or path.startswith("/mask/"):
                     sub = "train_images" if path.startswith("/crop/") else "train_masks"
                     parts = unquote(path[6:]).split("/", 1)   # len('/crop/')==len('/mask/')==6
                     if len(parts) == 2 and _UID_RE.match(parts[0]) and _NAME_RE.match(parts[1]):
-                        f = hub.data_dir / "incoming" / parts[0] / sub / parts[1]
+                        suf, _ext = hub._session_variant()
+                        f = hub.data_dir / "incoming" / parts[0] / f"{sub}{suf}" / parts[1]
                         if f.exists():
-                            self._send(200, "image/png", f.read_bytes())
+                            try:
+                                self._send(200, "image/png", _crop_to_png(f))
+                            except Exception:
+                                self._send(500, "text/plain", b"render error")
                             return
                     self._send(404, "text/plain", b"not found")
                 else:

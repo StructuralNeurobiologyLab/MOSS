@@ -196,22 +196,23 @@ class HubServer(QObject):
     # locally: 1ch -> train_images/*.png (2D), 3ch -> train_images_25d/*.tif,
     # 11ch -> train_images_dwarf25d/*.tif (C,H,W LZW TIFF). The dataset derives
     # n_channels from the architecture and reads the matching folder.
-    _VARIANT_BY_NC = {1: ("", "png"), 3: ("_25d", "tif"), 11: ("_dwarf25d", "tif")}
+    _VARIANT_BY_NC = {1: ("", "tif"), 3: ("_25d", "tif"), 11: ("_dwarf25d", "tif")}
 
     def _variant_for_nc(self, n_channels: int):
-        return self._VARIANT_BY_NC.get(int(n_channels), ("", "png"))
+        return self._VARIANT_BY_NC.get(int(n_channels), ("", "tif"))
 
     def _session_variant(self):
         """(dir-suffix, ext) for the session's locked architecture — the variant all
         crops in this session use for pooling/counting/training. Uses the SAME source
         the trainer does (prediction_model first) so counting/pooling/training never
-        disagree — e.g. after a resume where architecture lags the switched model."""
+        disagree — e.g. after a resume where architecture lags the switched model.
+        All crops are LZW TIFF (MOSS's format), so ext is always 'tif'."""
         a = (self.prediction_model or self.architecture or "").lower()
         if "dwarf25d" in a:
             return ("_dwarf25d", "tif")
         if "25d" in a:
             return ("_25d", "tif")
-        return ("", "png")
+        return ("", "tif")
 
     def _disk_crop_count(self, uid: str) -> int:
         suf, ext = self._session_variant()

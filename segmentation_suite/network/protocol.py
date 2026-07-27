@@ -439,11 +439,14 @@ def serialize_training_data(image_array, mask_array) -> tuple:
         tifffile.imwrite(mask_buffer, mask_array.astype(np.uint8), compression='lzw')
         mask_bytes = mask_buffer.getvalue()
     else:
+        # 2D single-channel — LZW TIFF too, matching MOSS's local
+        # Image.save(compression='tiff_lzw'). No PNG anywhere; the host writes a
+        # byte-identical .tif.
         img_buffer = io.BytesIO()
-        Image.fromarray(image_array).save(img_buffer, format='PNG', compress_level=6)
+        Image.fromarray(image_array).save(img_buffer, format='TIFF', compression='tiff_lzw')
         img_bytes = img_buffer.getvalue()
         mask_buffer = io.BytesIO()
-        Image.fromarray(mask_array).save(mask_buffer, format='PNG', compress_level=6)
+        Image.fromarray(mask_array).save(mask_buffer, format='TIFF', compression='tiff_lzw')
         mask_bytes = mask_buffer.getvalue()
 
     return img_bytes, mask_bytes
