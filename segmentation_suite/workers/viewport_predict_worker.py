@@ -68,8 +68,17 @@ class ViewportPredictWorker(QThread):
         # Desired thread count for CPU inference (set in run())
         self._desired_num_threads = max(4, (os.cpu_count() or 4) // 2)
 
-        # Check if GPU is available
-        self._gpu_available = torch.cuda.is_available()
+        # Check if a GPU is available — CUDA (Linux) OR MPS (Apple Silicon).
+        self._gpu_available = torch.cuda.is_available() or torch.backends.mps.is_available()
+
+    @staticmethod
+    def _best_gpu_device():
+        """Best available accelerator: CUDA (Linux/Windows) > MPS (Apple) > CPU."""
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        if torch.backends.mps.is_available():
+            return torch.device('mps')
+        return torch.device('cpu')
 
     def set_checkpoint(self, checkpoint_path: str):
         """Set the model checkpoint to use for predictions.
@@ -136,8 +145,8 @@ class ViewportPredictWorker(QThread):
             self._training_active = active
             # Determine target device
             if not active and self._gpu_available:
-                # Training stopped - switch to GPU if available
-                target_device = torch.device('cuda')
+                # Training stopped - use the best available GPU (CUDA or MPS)
+                target_device = self._best_gpu_device()
             else:
                 # Training active or no GPU - use CPU
                 target_device = torch.device('cpu')
@@ -146,7 +155,7 @@ class ViewportPredictWorker(QThread):
             if target_device != self.device:
                 old_device = self.device
                 self.device = target_device
-                self._current_device_is_gpu = (target_device.type == 'cuda')
+                self._current_device_is_gpu = (target_device.type in ('cuda', 'mps'))
                 self._force_reload = True
                 self.model = None  # Clear model to force reload on new device
                 print(f"Predictor: Switching from {old_device} to {target_device} (training_active={active})")
