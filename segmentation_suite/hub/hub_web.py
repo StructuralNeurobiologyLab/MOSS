@@ -25,15 +25,38 @@ Routes:
 from __future__ import annotations
 
 import json
+import os
+import posixpath
 import re
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
 _UID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+\.(png|tif|tiff)$")
+
+
+def _raw_meta(hub) -> dict:
+    """Metadata the client's RemoteZarrImageSource needs to mirror the volume.
+    Built from the hub's own local ZarrImageSource (hub._raw_source); returns
+    {available: False} until an owner has shared/attached a raw volume."""
+    src = getattr(hub, "_raw_source", None)
+    if src is None:
+        return {"available": False}
+    return {
+        "available": True,
+        "num_slices": int(src.num_slices),
+        "height": int(src.height),
+        "width": int(src.width),
+        "pyramid_paths": list(src.pyramid_paths),
+        "downsample_factors": [int(f) for f in src.downsample_factors],
+        "global_min": float(src.global_min),
+        "global_max": float(src.global_max),
+        "missing_pyramids": bool(getattr(src, "_missing_pyramids", False)),
+    }
 
 
 def _crop_to_png(path) -> bytes:
@@ -164,8 +187,116 @@ class HubWeb(QObject):
                                 self._send(500, "text/plain", b"render error")
                             return
                     self._send(404, "text/plain", b"not found")
+                # ---- raw volume: download (file/manifest) + streaming (tile) ----
+                elif path == "/raw/meta":
+                    self._send(200, "application/json",
+                               json.dumps(_raw_meta(hub)).encode("utf-8"))
+                elif path == "/raw/manifest":
+                    self._serve_raw_manifest()
+                elif path.startswith("/raw/file/"):
+                    self._serve_raw_file(unquote(path[len("/raw/file/"):]))
+                elif path == "/raw/tile":
+                    self._serve_raw_tile()
                 else:
                     self._send(404, "text/plain", b"not found")
+
+            # ------------------------------------------------ raw volume serving
+            def _raw_root(self):
+                r = getattr(hub, "_raw_root", None)
+                return Path(r).resolve() if r else None
+
+            def _serve_raw_manifest(self):
+                """List every file under the raw zarr (relpath + size). The
+                downloader uses this to know what to fetch and to skip files it
+                already has. Fine for the download use-case; giant volumes should
+                stream instead of enumerating millions of chunks."""
+                root = self._raw_root()
+                if not root or not root.exists():
+                    self._send(404, "text/plain", b"no raw volume"); return
+                files, total = [], 0
+                for p in root.rglob("*"):
+                    if p.is_file():
+                        sz = p.stat().st_size
+                        files.append({"path": p.relative_to(root).as_posix(), "size": sz})
+                        total += sz
+                self._send(200, "application/json", json.dumps(
+                    {"root": root.name, "count": len(files),
+                     "total_bytes": total, "files": files}).encode("utf-8"))
+
+            def _serve_raw_file(self, subpath: str):
+                """Serve one file under the raw zarr, byte-range capable so a
+                dropped download resumes instead of restarting."""
+                root = self._raw_root()
+                if not root:
+                    self._send(404, "text/plain", b"no raw volume"); return
+                rel = posixpath.normpath("/" + subpath).lstrip("/")   # strip .. and leading /
+                target = (root / rel).resolve()
+                if target != root and not str(target).startswith(str(root) + os.sep):
+                    self._send(403, "text/plain", b"forbidden"); return
+                if not target.is_file():
+                    self._send(404, "text/plain", b"not found"); return
+                self._send_file_range(target)
+
+            def _send_file_range(self, fpath: Path):
+                size = fpath.stat().st_size
+                start, end, partial = 0, size - 1, False
+                rng = self.headers.get("Range")
+                if rng and rng.startswith("bytes="):
+                    try:
+                        s, _, e = rng[len("bytes="):].partition("-")
+                        start = int(s) if s else 0
+                        end = int(e) if e else size - 1
+                        end = min(end, size - 1)
+                        partial = 0 <= start <= end
+                    except ValueError:
+                        start, end, partial = 0, size - 1, False
+                length = max(0, end - start + 1)
+                self.send_response(206 if partial else 200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                if partial:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try:
+                    with open(fpath, "rb") as f:
+                        f.seek(start)
+                        remaining = length
+                        while remaining > 0:
+                            block = f.read(min(1 << 20, remaining))
+                            if not block:
+                                break
+                            self.wfile.write(block)
+                            remaining -= len(block)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def _serve_raw_tile(self):
+                """Streaming fallback: read the requested region with the hub's
+                OWN ZarrImageSource and return it as a gzipped .npy tile."""
+                src = getattr(hub, "_raw_source", None)
+                if src is None:
+                    self._send(404, "text/plain", b"no raw volume"); return
+                q = parse_qs(urlparse(self.path).query)
+                def qi(k, d=0):
+                    v = q.get(k, [None])[0]
+                    return int(v) if v is not None else d
+                kind = q.get("kind", ["tile"])[0]
+                z, level = qi("z"), qi("level")
+                try:
+                    if kind == "slice":
+                        arr = src.get_slice(z, level)
+                    elif kind == "native":
+                        arr, _ = src.get_tile_native(z, qi("y1"), qi("y2"),
+                                                     qi("x1"), qi("x2"), level)
+                    else:
+                        arr = src.get_tile(z, qi("y1"), qi("y2"),
+                                           qi("x1"), qi("x2"), level)
+                    from ..zarr_image_source import encode_tile
+                    self._send(200, "application/octet-stream", encode_tile(arr))
+                except Exception as e:
+                    self._send(500, "text/plain", f"tile error: {e}".encode("utf-8"))
 
             def do_POST(self):
                 path = urlparse(self.path).path

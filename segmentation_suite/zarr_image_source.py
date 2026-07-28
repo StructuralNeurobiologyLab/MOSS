@@ -23,6 +23,29 @@ except Exception as e:
     print(f"[ZarrImageSource] Could not configure zarr async: {e}")
 
 
+def _upscale_tile(tile, target_h: int, target_w: int):
+    """Bilinearly resize a (downsampled) native tile up to the requested full-res
+    size. Shared by ZarrImageSource (local) and RemoteZarrImageSource (hub) so both
+    produce byte-identical pixels — the remote source fetches the small native
+    region and upscales here, so only native bytes cross the wire."""
+    if tile.shape[0] == target_h and tile.shape[1] == target_w:
+        return tile
+    from scipy.ndimage import zoom as scipy_zoom
+    zoom_factors = (target_h / tile.shape[0], target_w / tile.shape[1])
+    tile = scipy_zoom(tile, zoom_factors, order=1)  # Bilinear interpolation
+    # Ensure exact size (zoom might be slightly off)
+    if tile.shape[0] > target_h:
+        tile = tile[:target_h, :]
+    if tile.shape[1] > target_w:
+        tile = tile[:, :target_w]
+    # Pad if needed (shouldn't happen, but be safe)
+    if tile.shape[0] < target_h or tile.shape[1] < target_w:
+        pad_h = max(0, target_h - tile.shape[0])
+        pad_w = max(0, target_w - tile.shape[1])
+        tile = np.pad(tile, ((0, pad_h), (0, pad_w)), mode='edge')
+    return tile
+
+
 class ZarrImageSource:
     """
     Provides access to Zarr volumes with automatic pyramid level selection.
@@ -433,24 +456,103 @@ class ZarrImageSource:
 
         # If downsampled, upscale to match expected size
         if downsample > 1:
-            from scipy.ndimage import zoom as scipy_zoom
-
-            target_h = y2 - y1
-            target_w = x2 - x1
-
-            zoom_factors = (target_h / tile.shape[0], target_w / tile.shape[1])
-            tile = scipy_zoom(tile, zoom_factors, order=1)  # Bilinear interpolation
-
-            # Ensure exact size (zoom might be slightly off)
-            if tile.shape[0] > target_h:
-                tile = tile[:target_h, :]
-            if tile.shape[1] > target_w:
-                tile = tile[:, :target_w]
-
-            # Pad if needed (shouldn't happen, but be safe)
-            if tile.shape[0] < target_h or tile.shape[1] < target_w:
-                pad_h = target_h - tile.shape[0]
-                pad_w = target_w - tile.shape[1]
-                tile = np.pad(tile, ((0, pad_h), (0, pad_w)), mode='edge')
+            tile = _upscale_tile(tile, y2 - y1, x2 - x1)
 
         return tile
+
+
+# --------------------------------------------------------------------------- #
+# Tile wire-codec: a numpy array <-> gzipped .npy bytes. Used by the hub to
+# encode a tile it read locally and by RemoteZarrImageSource to decode it. .npy
+# preserves shape+dtype exactly, so the remote read is byte-identical to a local
+# one; gzip keeps grayscale tiles small on the wire.
+# --------------------------------------------------------------------------- #
+def encode_tile(arr) -> bytes:
+    import io, gzip
+    buf = io.BytesIO()
+    np.save(buf, np.ascontiguousarray(arr), allow_pickle=False)
+    return gzip.compress(buf.getvalue(), compresslevel=4)
+
+
+def decode_tile(data: bytes):
+    import io, gzip
+    return np.load(io.BytesIO(gzip.decompress(data)), allow_pickle=False)
+
+
+class RemoteZarrImageSource:
+    """Read-only image source backed by a MOSS hub serving a volume over HTTP.
+
+    Drop-in for ZarrImageSource in the annotation viewer: same public attributes
+    (num_slices/height/width/pyramid_paths/downsample_factors/global_min/max) and
+    the same get_slice/get_tile/get_tile_native/select_pyramid_level surface. The
+    HUB runs the real ZarrImageSource locally; this client only fetches the native
+    viewport region under the cursor (GET /raw/tile) plus one metadata call (GET
+    /raw/meta), so a terabyte volume streams the same as a tiny one and nothing is
+    stored locally. Pixel-identical to a local open because the hub runs the exact
+    same read code and we share _upscale_tile for the client-side upscale.
+
+    base_url is the hub console origin, e.g. 'http://10.1.3.45:8080'.
+    """
+
+    # Zoom -> pyramid-level selection is pure math on downsample_factors, so we
+    # reuse the local implementation verbatim (keeps the aggressive-downsample
+    # policy in one place).
+    select_pyramid_level = ZarrImageSource.select_pyramid_level
+
+    def __init__(self, base_url: str, timeout: float = 60.0):
+        self.base_url = base_url.rstrip("/")
+        self.zarr_path = self.base_url          # parity with ZarrImageSource
+        self.timeout = timeout
+        meta = self._get_json("/raw/meta")
+        if not meta.get("available"):
+            raise ValueError(f"Hub at {self.base_url} is not serving a raw volume")
+        self.num_slices = int(meta["num_slices"])
+        self.height = int(meta["height"])
+        self.width = int(meta["width"])
+        self.pyramid_paths = list(meta["pyramid_paths"])
+        self.downsample_factors = [int(f) for f in meta["downsample_factors"]]
+        self.global_min = float(meta.get("global_min", 0))
+        self.global_max = float(meta.get("global_max", 255))
+        self._missing_pyramids = bool(meta.get("missing_pyramids", False))
+        self._stats_ready = True                # the hub already computed stats
+        print(f"[RemoteZarrImageSource] {self.base_url}: {self.num_slices} slices, "
+              f"{self.height}x{self.width}, {len(self.pyramid_paths)} pyramid levels")
+
+    # ------------------------------------------------------------------ HTTP
+    def _get(self, path: str) -> bytes:
+        import urllib.request
+        url = self.base_url + path
+        with urllib.request.urlopen(url, timeout=self.timeout) as r:
+            return r.read()
+
+    def _get_json(self, path: str):
+        import json
+        return json.loads(self._get(path).decode("utf-8"))
+
+    def _fetch_region(self, kind: str, z_index: int, pyramid_level: int,
+                      y1=None, y2=None, x1=None, x2=None):
+        from urllib.parse import urlencode
+        q = {"kind": kind, "z": int(z_index), "level": int(pyramid_level)}
+        if y1 is not None:
+            q.update(y1=int(y1), y2=int(y2), x1=int(x1), x2=int(x2))
+        return decode_tile(self._get("/raw/tile?" + urlencode(q)))
+
+    # --------------------------------------------------------------- read API
+    def get_slice(self, z_index: int, pyramid_level: int = 0):
+        if pyramid_level >= len(self.pyramid_paths):
+            pyramid_level = 0
+        return self._fetch_region("slice", z_index, pyramid_level)
+
+    def get_tile_native(self, z_index: int, y1: int, y2: int, x1: int, x2: int,
+                        pyramid_level: int = 0):
+        if pyramid_level >= len(self.pyramid_paths):
+            pyramid_level = 0
+        tile = self._fetch_region("native", z_index, pyramid_level, y1, y2, x1, x2)
+        return tile, self.downsample_factors[pyramid_level]
+
+    def get_tile(self, z_index: int, y1: int, y2: int, x1: int, x2: int,
+                 pyramid_level: int = 0):
+        # Fetch the SMALL native region and upscale client-side (same pixels as
+        # the local get_tile), so only native-resolution bytes cross the wire.
+        native, _ = self.get_tile_native(z_index, y1, y2, x1, x2, pyramid_level)
+        return _upscale_tile(native, y2 - y1, x2 - x1)

@@ -106,6 +106,12 @@ class HubServer(QObject):
         self.crop_size: int = 0   # single hub-wide crop/tile size (0 = unset)
         self.subprojects: list = []
 
+        # Raw volume the hub serves to joinees (download via /raw/file, stream via
+        # /raw/tile). One shared store per project at data_dir/raw.zarr; read with
+        # the hub's OWN ZarrImageSource so served pixels == local MOSS pixels.
+        self._raw_source = None     # ZarrImageSource | None
+        self._raw_root = None       # Path to the served zarr dir | None
+
         self._users: Dict[str, _User] = {}        # user_id -> _User
         self._ws_to_uid: Dict[object, str] = {}
         self._pending_td: Dict[str, dict] = {}     # user_id -> in-flight training-data frames
@@ -455,11 +461,36 @@ class HubServer(QObject):
         self._active = True
         self._activate_session(resume=False)
 
+    def _raw_zarr_path(self) -> Path:
+        """Canonical location of the session's raw volume on the hub — one shared
+        store per project, served to joinees for download/stream."""
+        return self.data_dir / "raw.zarr"
+
+    def attach_raw(self, zarr_path=None) -> bool:
+        """Open a raw volume with the hub's OWN ZarrImageSource so it can be served
+        over HTTP. Defaults to the canonical data_dir/raw.zarr. Idempotent; a
+        no-op returning False if the store is absent or unreadable."""
+        p = Path(zarr_path) if zarr_path else self._raw_zarr_path()
+        if not p.exists():
+            return False
+        try:
+            from ..zarr_image_source import ZarrImageSource
+            self._raw_source = ZarrImageSource(p)
+            self._raw_root = Path(p)
+            _log(f"raw volume attached: {p} ({self._raw_source.num_slices} slices, "
+                 f"{self._raw_source.height}x{self._raw_source.width})")
+            return True
+        except Exception as e:
+            _log(f"could not attach raw volume at {p}: {e}")
+            self._raw_source, self._raw_root = None, None
+            return False
+
     def _activate_session(self, resume: bool):
         """Bring the chosen project online (shared by CLI --data-dir and the
         web picker): make dirs, optionally resume the manifest, announce it."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "incoming").mkdir(exist_ok=True)
+        self.attach_raw()   # re-serve raw.zarr if this project already has one
         if resume:
             self._resumed = self._load_manifest()
         self.session_started.emit(self.code, str(self.data_dir), self.connect_address())
