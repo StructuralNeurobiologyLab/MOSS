@@ -43,6 +43,43 @@ class HubTrainer(QObject):
     def checkpoint_path(self) -> str:
         return str(self._model_dir() / get_checkpoint_filename(self._arch()))
 
+    def _expected_model_channels(self) -> int:
+        """Input channels the current architecture's model expects (1 / 3 / 11 / 12)."""
+        from ..models.architectures import (
+            get_n_context_slices, uses_z_coord, is_3d_architecture)
+        arch = self._arch()
+        if is_3d_architecture(arch):
+            return 1
+        return get_n_context_slices(arch) + (1 if uses_z_coord(arch) else 0)
+
+    def _checkpoint_compatible(self, ckpt_path: str) -> bool:
+        """True if the checkpoint's first-conv input-channel count matches what the
+        current architecture needs. A mismatch = a stale checkpoint (e.g. a dwarf25d
+        checkpoint trained back when only 1-channel 2D crops were sent) that would
+        crash load_state_dict on resume."""
+        try:
+            import torch
+            data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            sd = data.get("model_state_dict", data) if isinstance(data, dict) else data
+            w = sd.get("inc.double_conv.0.weight")
+            if w is None or w.dim() < 2:
+                return True   # can't determine — let the worker try
+            return int(w.shape[1]) == self._expected_model_channels()
+        except Exception:
+            return True       # if unsure, don't block
+
+    def _archive_checkpoint(self, ckpt_path: str, tag: str):
+        """Move an unusable checkpoint aside so training can start fresh."""
+        p = Path(ckpt_path)
+        if p.exists():
+            dst = p.with_name(f"{p.stem}_{tag}.pth")
+            try:
+                os.replace(p, dst)
+                print(f"[HubTrainer] {p.name} channel-mismatched -> archived as "
+                      f"{dst.name}; training fresh")
+            except OSError as e:
+                print(f"[HubTrainer] could not archive {p.name}: {e}")
+
     def is_running(self) -> bool:
         return self.worker is not None and self.worker.isRunning()
 
@@ -54,6 +91,14 @@ class HubTrainer(QObject):
             os.environ["FORCE_CPU"] = "1"    # honored by models.unet.get_device()
         ckpt = self.checkpoint_path()
         pool = self.hub._pool_root()
+        # Resume only from a COMPATIBLE checkpoint. If the saved checkpoint's input
+        # channels don't match the architecture (a stale checkpoint from an earlier
+        # run with a different crop variant), archive it and start fresh instead of
+        # crashing load_state_dict with a size mismatch.
+        resume_ckpt = ckpt if (resume and os.path.exists(ckpt)) else None
+        if resume_ckpt and not self._checkpoint_compatible(ckpt):
+            self._archive_checkpoint(ckpt, "incompatible")
+            resume_ckpt = None
         cfg = {
             # Pass ALL SIX training-dir keys, exactly like local MOSS. TrainWorker
             # derives n_channels from the architecture string and reads the matching
@@ -71,7 +116,7 @@ class HubTrainer(QObject):
             "num_epochs": self.hub.train_epochs,
             "batch_size": self.hub.train_batch_size,
             "learning_rate": self.hub.train_lr,
-            "resume_checkpoint": ckpt if (resume and os.path.exists(ckpt)) else None,
+            "resume_checkpoint": resume_ckpt,
             "weights_export_interval": self.hub.broadcast_interval,
         }
         w = TrainWorker(cfg)
