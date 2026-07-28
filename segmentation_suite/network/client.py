@@ -145,6 +145,24 @@ class SyncClient(QObject):
         self._training_data_metadata: Optional[dict] = None
         self._training_data_buffer: list = []  # Holds [image_bytes, mask_bytes]
 
+        # Serializes every websocket send. A logical message can be several frames
+        # (a JSON header followed by binary image+mask, or header+weights, or a
+        # chunked stream). Multiple sends are scheduled as independent coroutines on
+        # one event loop (run_coroutine_threadsafe), so without this lock their
+        # frames interleave at await points on the single socket — cross-pairing a
+        # header with another message's binary frames. That is exactly how a crop's
+        # image and mask got swapped when the 2D / 2.5D / dwarf variants of one
+        # capture were sent back-to-back. Hold this across all frames of a message.
+        self._send_lock: Optional[asyncio.Lock] = None
+
+    def _sendlock(self) -> asyncio.Lock:
+        """Lazily create the send lock on the client's event-loop thread. Safe to
+        create lazily: all sends run on that single loop, so the None-check and
+        assignment never race (no await between them)."""
+        if self._send_lock is None:
+            self._send_lock = asyncio.Lock()
+        return self._send_lock
+
     def connect_direct(self, host_ip: str, port: int, user_name: str) -> bool:
         """
         Connect directly to a host.
@@ -693,7 +711,8 @@ class SyncClient(QObject):
                 type=MessageType.SESSION_INFO,
                 payload={"architecture": architecture}
             )
-            await self._websocket.send(msg.to_json())
+            async with self._sendlock():
+                await self._websocket.send(msg.to_json())
             _log(f"Sent architecture info: {architecture}")
         except Exception as e:
             _log(f"Failed to send architecture: {e}")
@@ -720,7 +739,8 @@ class SyncClient(QObject):
             msg = create_project_register_message(
                 project_name, subproject, architecture, prediction_model, subprojects,
                 crop_size)
-            await self._websocket.send(msg.to_json())
+            async with self._sendlock():
+                await self._websocket.send(msg.to_json())
             _log(f"Sent PROJECT_REGISTER: {project_name}/{subproject}")
         except Exception as e:
             _log(f"Failed to send project register: {e}")
@@ -764,10 +784,10 @@ class SyncClient(QObject):
                 header = create_weights_push_message(
                     self.user_id, epoch, loss, num_samples
                 )
-                await self._websocket.send(header.to_json())
-
-                # Send weights as binary
-                await self._websocket.send(weights_data)
+                async with self._sendlock():
+                    await self._websocket.send(header.to_json())
+                    # Send weights as binary
+                    await self._websocket.send(weights_data)
 
                 self.sync_status.emit(f"Sent weights (epoch {epoch})")
 
@@ -802,17 +822,20 @@ class SyncClient(QObject):
         start_msg.payload["user_id"] = self.user_id
         start_msg.payload["display_name"] = self.display_name
 
-        await self._websocket.send(start_msg.to_json())
+        # Hold the send lock across the whole chunked stream (start + all chunks +
+        # end) so no other message's frames can interleave into it.
+        async with self._sendlock():
+            await self._websocket.send(start_msg.to_json())
 
-        # Send each chunk
-        for i, chunk in enumerate(chunks):
-            await self._websocket.send(chunk)
-            if (i + 1) % 2 == 0 or i == total_chunks - 1:
-                _log(f"Sent chunk {i + 1}/{total_chunks}")
+            # Send each chunk
+            for i, chunk in enumerate(chunks):
+                await self._websocket.send(chunk)
+                if (i + 1) % 2 == 0 or i == total_chunks - 1:
+                    _log(f"Sent chunk {i + 1}/{total_chunks}")
 
-        # Send chunk end message
-        end_msg = create_chunk_end_message(transfer_id)
-        await self._websocket.send(end_msg.to_json())
+            # Send chunk end message
+            end_msg = create_chunk_end_message(transfer_id)
+            await self._websocket.send(end_msg.to_json())
 
         self.sync_status.emit(f"Sent weights (epoch {epoch}, {total_chunks} chunks)")
 
@@ -838,7 +861,8 @@ class SyncClient(QObject):
                 payload={"user_id": self.user_id}
             )
             _log("Requesting global model from server")
-            await self._websocket.send(msg.to_json())
+            async with self._sendlock():
+                await self._websocket.send(msg.to_json())
         except Exception as e:
             _log(f"Error requesting global model: {e}")
 
@@ -891,12 +915,12 @@ class SyncClient(QObject):
                 n_channels=n_channels,
             )
 
-            # Send header
-            await self._websocket.send(header.to_json())
-
-            # Send image bytes then mask bytes
-            await self._websocket.send(img_bytes)
-            await self._websocket.send(mask_bytes)
+            # Send header + image + mask as one atomic unit so a concurrent
+            # variant send can't interleave and swap image/mask frames.
+            async with self._sendlock():
+                await self._websocket.send(header.to_json())
+                await self._websocket.send(img_bytes)
+                await self._websocket.send(mask_bytes)
 
             total_kb = (len(img_bytes) + len(mask_bytes)) / 1024
             self.sync_status.emit(f"Sent training crop ({total_kb:.1f}KB)")

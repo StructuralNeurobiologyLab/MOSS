@@ -130,7 +130,8 @@ class NucleiPatchDataset(Dataset):
     def _load_all(self):
         """Load and cache all images."""
         print(f"Loading {len(self.images)} image-mask pairs (n_channels={self.n_channels})...")
-        for fname in self.images:
+        loaded = []
+        for fname in list(self.images):
             ip = os.path.join(self.img_dir, fname)
             mp = os.path.join(self.mask_dir, fname)
 
@@ -142,6 +143,16 @@ class NucleiPatchDataset(Dataset):
                 mask = io.imread(mp).astype(np.float32)
             except Exception as e:
                 print(f"Failed to read {fname}: {e}")
+                continue
+
+            # Defensive: a MOSS mask is always 2D (H,W). If it isn't, this crop is
+            # corrupt — e.g. a network frame-swap put a multi-channel image stack in
+            # the mask slot. Skip the whole pair with a warning instead of feeding a
+            # 3D mask into np.argwhere (-> 3-col coords -> "too many values to unpack"
+            # crash in __getitem__) and poisoning training with garbage foreground.
+            if mask.ndim != 2:
+                print(f"[dataset] SKIP corrupt pair {fname}: mask shape {mask.shape} "
+                      f"is not 2D (image shape {img.shape}) — likely a swapped/garbled crop")
                 continue
 
             # Handle multi-channel images (2.5D)
@@ -177,6 +188,11 @@ class NucleiPatchDataset(Dataset):
             if len(pos) > 0:
                 self._positive_pixels[fname] = pos
 
+            loaded.append(fname)
+
+        # Sample only from pairs that actually loaded (skipped/corrupt ones removed),
+        # so __getitem__ never draws a missing/corrupt fname.
+        self.images = loaded
         print(f"Cached {len(self._img_cache)} pairs successfully.")
 
     def __len__(self):
