@@ -47,6 +47,10 @@ class MessageType(Enum):
     # Hub redesign (authoritative standalone hub)
     PROJECT_REGISTER = "project_register"        # Owner -> Hub: project/subproject/model identity
     SET_PREDICTION_MODEL = "set_prediction_model"  # Hub -> Client: authoritative prediction model
+    RAW_REGISTER = "raw_register"                # Owner -> Hub: share the session's raw volume
+    RAW_UPLOAD_REQUEST = "raw_upload_request"    # Hub -> Owner: I can't see your data, please upload it
+    RAW_UPLOAD_DENIED = "raw_upload_denied"      # Hub -> Owner: not enough hub storage for the upload
+    RAW_UPLOAD_COMPLETE = "raw_upload_complete"  # Owner -> Hub: upload finished, attach + serve it
 
 
 # Maximum chunk size for WebSocket messages (16MB to stay under Cloudflare's 32MB limit)
@@ -195,12 +199,15 @@ def create_welcome_message(session_id: str, user_list: list,
                            prediction_model: str = None,
                            crop_size: int = None,
                            session_configured: bool = False,
-                           is_owner: bool = False) -> Message:
+                           is_owner: bool = False,
+                           raw: dict = None) -> Message:
     """Create a WELCOME message with session info.
 
     The hub uses the extended fields to tell a joining client which local
     subproject to adopt for this session, which model to predict with
-    (authoritative), and whether this client is the session owner.
+    (authoritative), and whether this client is the session owner. `raw` (when
+    the owner has shared a volume) advertises the downloadable/streamable raw
+    data: {ready, format, num_slices, height, width, dtype, size_bytes, http_url}.
     """
     payload = {
         "session_id": session_id,
@@ -216,10 +223,39 @@ def create_welcome_message(session_id: str, user_list: list,
         payload["prediction_model"] = prediction_model
     if crop_size:
         payload["crop_size"] = crop_size
+    if raw:
+        payload["raw"] = raw
     return Message(
         type=MessageType.WELCOME,
         payload=payload
     )
+
+
+def create_raw_register_message(path: str, fmt: str = "zarr",
+                                size_bytes: int = 0) -> Message:
+    """Owner -> Hub: offer to share the session's raw volume. `path` is the owner's
+    local raw store; the hub references it in place if it can see that path (0-copy),
+    otherwise it needs an upload. size_bytes feeds the hub's storage pre-flight guard."""
+    return Message(
+        type=MessageType.RAW_REGISTER,
+        payload={"path": path, "format": fmt, "size_bytes": int(size_bytes)},
+    )
+
+
+def create_raw_upload_request_message(http_url: str) -> Message:
+    """Hub -> Owner: the hub can't see your raw path; upload it to this HTTP base."""
+    return Message(type=MessageType.RAW_UPLOAD_REQUEST, payload={"http_url": http_url})
+
+
+def create_raw_upload_denied_message(need_bytes: int, free_bytes: int) -> Message:
+    """Hub -> Owner: refusing the upload — not enough free space on the hub."""
+    return Message(type=MessageType.RAW_UPLOAD_DENIED,
+                   payload={"need_bytes": int(need_bytes), "free_bytes": int(free_bytes)})
+
+
+def create_raw_upload_complete_message() -> Message:
+    """Owner -> Hub: all raw files uploaded; attach the store and start serving it."""
+    return Message(type=MessageType.RAW_UPLOAD_COMPLETE, payload={})
 
 
 def create_project_register_message(project_name: str, subproject: str,

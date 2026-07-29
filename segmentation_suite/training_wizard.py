@@ -260,6 +260,8 @@ class TrainingWizard(QMainWindow):
         # Show the "you are owner / you joined" notice at most once per session.
         self._session_notified = False
         self._is_session_owner = False
+        self._session_raw = {}            # raw-volume descriptor advertised by the hub
+        self._raw_prompt_shown = False    # offer the joinee download/stream at most once
 
         layout.addSpacing(scaled(10))
 
@@ -905,6 +907,9 @@ class TrainingWizard(QMainWindow):
         self._session_client.session_subproject_received.connect(self._on_session_subproject_received)
         self._session_client.prediction_model_received.connect(self._on_prediction_model_received)
         self._session_client.crop_size_received.connect(self._on_crop_size_received)
+        self._session_client.raw_available.connect(self._on_raw_available)
+        self._session_client.raw_upload_requested.connect(self._on_raw_upload_requested)
+        self._session_client.raw_upload_denied.connect(self._on_raw_upload_denied)
 
         self._session_client.connect_direct(host_ip, port, name)
         self.session_btn.setEnabled(False)
@@ -967,6 +972,23 @@ class TrainingWizard(QMainWindow):
         self.training_page.unlock_crop_size()
         self.training_page.unlock_training()
         self._unlock_subproject()
+        self._teardown_raw_session()
+
+    def _teardown_raw_session(self):
+        """On ANY disconnect, tear down session-only raw: drop a live STREAMED source
+        (a downloaded local copy is real data and stays), and reset the raw prompt so
+        a reconnect that still has no local raw re-offers Download/Stream."""
+        try:
+            cleared = self.training_page.clear_streamed_raw()
+        except Exception:
+            cleared = False
+        if cleared:
+            try:
+                self.home_page.raw_source_state("none")
+            except Exception:
+                pass
+        self._raw_prompt_shown = False
+        self._session_raw = {}
 
     def _lock_subproject(self, subproject_name: str = None):
         """Lock the subproject panel during a multi-user session."""
@@ -1070,6 +1092,7 @@ class TrainingWizard(QMainWindow):
             project_name, subproject, arch, pred, subprojects, crop)
         print(f"[Wizard] Registered project '{project_name}' subproject '{subproject}' "
               f"crop_size={crop} with hub")
+        self._maybe_offer_share_raw()
 
         self.session_status_label.setText(
             f"● Multi-user OWNER — subproject: {subproject} · crop {crop}")
@@ -1195,6 +1218,186 @@ class TrainingWizard(QMainWindow):
         print(f"[Wizard] Received authoritative crop size: {size}")
         self.training_page.lock_crop_size(size)
 
+    # ------------------------------------------------------ raw volume (joinee side)
+    def _on_raw_available(self, descriptor: dict):
+        """Hub advertises a shared raw volume. Offer a JOINEE whose local project has
+        no raw data the choice to Download (default) / Stream / Skip. Owners are the
+        source, so they're never prompted."""
+        self._session_raw = descriptor or {}
+        if not self._session_raw.get("ready"):
+            return
+        if self._is_session_owner:
+            # Positive confirmation for the OWNER that the hub received the share and
+            # is now serving it (this WELCOME echo arrives after RAW_REGISTER lands).
+            gb = self._session_raw.get("size_bytes", 0) / 1e9
+            n = self._session_raw.get("num_slices", "?")
+            self.session_status_label.setText(
+                f"● Multi-user OWNER — raw data shared ✓  ({n} slices, ~{gb:.1f} GB, "
+                f"serving from hub)")
+            try:
+                self.home_page.raw_source_state("local")
+            except Exception:
+                pass
+            return
+        if self._raw_prompt_shown:
+            return
+        if self.training_page.has_local_raw():
+            return  # already has raw locally — don't offer (per spec)
+        self._raw_prompt_shown = True
+        self._prompt_raw_fetch(self._session_raw)
+
+    def _prompt_raw_fetch(self, descriptor: dict):
+        from PyQt6.QtWidgets import QMessageBox
+        gb = descriptor.get("size_bytes", 0) / 1e9
+        n = descriptor.get("num_slices", "?")
+        box = QMessageBox(self)
+        box.setWindowTitle("Session raw data available")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("This session has raw image data on the hub.")
+        box.setInformativeText(
+            f"{n} slices · ≈{gb:.1f} GB.\n\n"
+            "• Download a local copy — resumable, then works like a normal local project.\n"
+            "• Stream from hub — nothing stored locally; best for very large volumes.")
+        dl = box.addButton("Download local copy", QMessageBox.ButtonRole.AcceptRole)
+        st = box.addButton("Stream from hub", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(dl)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is dl:
+            self._start_raw_fetch(descriptor, "download")
+        elif clicked is st:
+            self._start_raw_fetch(descriptor, "stream")
+        # Skip -> nothing
+
+    def _start_raw_fetch(self, descriptor: dict, mode: str):
+        from PyQt6.QtWidgets import QMessageBox
+        if mode == "download":
+            self.home_page.raw_download_start(int(descriptor.get("size_bytes", 0)))
+
+        def _prog(db, tb, df, tf):
+            self.home_page.raw_download_progress(db, tb, df, tf)
+
+        def _done(m):
+            if mode == "download":
+                self.home_page.raw_download_finish(ok=True)
+            else:
+                self.home_page.raw_source_state("streaming")
+            self.session_status_label.setText(
+                f"● Multi-user collaborator — raw volume "
+                f"{'downloaded' if m == 'download' else 'streaming from hub'}")
+
+        def _err(msg):
+            if mode == "download":
+                self.home_page.raw_download_finish(ok=False)
+            QMessageBox.warning(self, "Raw data",
+                                f"Could not get the session raw data from the hub:\n{msg}")
+
+        self.training_page.attach_raw_from_hub(
+            descriptor, mode=mode,
+            progress_cb=(_prog if mode == "download" else None),
+            on_done=_done, on_error=_err)
+
+    # ------------------------------------------------------ raw volume (owner side)
+    def _maybe_offer_share_raw(self):
+        """Owner: optionally share this project's raw volume so joinees can get it.
+        If the hub runs where the data already lives it's referenced 0-copy."""
+        from PyQt6.QtWidgets import QMessageBox
+        if not self._is_session_owner or not self._session_client:
+            return
+        raw_path = self._local_raw_path()
+        if not raw_path:
+            print("[Wizard] no raw_data.zarr to share for this project")
+            return
+        reply = QMessageBox.question(
+            self, "Share raw data with joinees?",
+            "Share this project's raw image data so people who join can download or "
+            "stream it?\n\n"
+            f"Source:  {raw_path}\n\n"
+            "If the hub runs where this data already lives (this machine, or shared "
+            "storage), nothing is copied — it's referenced in place.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        size = self._dir_size(raw_path)
+        self._session_client.send_raw_register(str(raw_path), "zarr", size)
+        # Immediate feedback; flips to "shared ✓" when the hub echoes it back
+        # (_on_raw_available). Without this the share felt like it did nothing.
+        self.session_status_label.setText("● Multi-user OWNER — sharing raw data with the hub…")
+        QMessageBox.information(
+            self, "Sharing raw data",
+            f"Sharing this project's raw data with the session:\n{raw_path}\n\n"
+            "Joining users will be offered to download or stream it. You'll see "
+            "\"raw data shared ✓\" once the hub confirms it's serving.")
+        print(f"[Wizard] shared raw volume {raw_path} ({size/1e9:.1f} GB) with hub")
+
+    def _on_raw_upload_requested(self, http_url: str):
+        """Hub can't see the owner's data -> upload it (storage already OK'd hub-side).
+        Confirm, then stream it up on a worker with progress; finalize when done."""
+        from PyQt6.QtWidgets import QMessageBox
+        raw_path = self._local_raw_path()
+        if not raw_path or not http_url:
+            return
+        size = self._dir_size(raw_path)
+        reply = QMessageBox.question(
+            self, "Upload raw data to the hub?",
+            f"The hub can't directly reach this project's raw data, so it needs to be "
+            f"uploaded (~{size/1e9:.1f} GB) before others can get it.\n\nUpload now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        from .workers.raw_upload_worker import RawUploadWorker
+        self.home_page.raw_upload_start(size)
+        self.session_status_label.setText("● Multi-user OWNER — uploading raw data to the hub…")
+        worker = RawUploadWorker(http_url, str(raw_path))
+        worker.progress.connect(
+            lambda a, b, c, d: self.home_page.raw_upload_progress(a, b, c, d))
+
+        def _done():
+            self.home_page.raw_upload_finish(ok=True)
+            if self._session_client:
+                self._session_client.send_raw_upload_complete()   # hub attaches + advertises
+            self.session_status_label.setText(
+                "● Multi-user OWNER — raw data uploaded ✓ (serving from hub)")
+
+        def _err(m):
+            self.home_page.raw_upload_finish(ok=False)
+            QMessageBox.warning(self, "Raw upload", f"Upload to the hub failed:\n{m}")
+
+        worker.finished_ok.connect(_done)
+        worker.failed.connect(_err)
+        self._raw_upload_worker = worker   # keep a ref so it isn't GC'd mid-run
+        worker.start()
+
+    def _on_raw_upload_denied(self, info: dict):
+        """Hub refused the upload — not enough free space there."""
+        from PyQt6.QtWidgets import QMessageBox
+        need = (info or {}).get("need_bytes", 0) / 1e9
+        free = (info or {}).get("free_bytes", 0) / 1e9
+        self.session_status_label.setText("● Multi-user OWNER — raw share failed (hub full)")
+        QMessageBox.warning(
+            self, "Not enough hub storage",
+            f"The hub doesn't have room for this raw data.\n\n"
+            f"Needs ~{need:.1f} GB, but only ~{free:.1f} GB is free on the hub.\n\n"
+            "Run the hub where the data already lives, or on storage with more room.")
+
+    def _local_raw_path(self):
+        if not self.training_page.project_dir:
+            return None
+        p = Path(self.training_page.project_dir)
+        for name in ("raw_data.zarr", "train_images.zarr"):
+            if (p / name).exists():
+                return p / name
+        return None
+
+    def _dir_size(self, path) -> int:
+        try:
+            return sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
+        except Exception:
+            return 0
+
     def _on_session_disconnected(self):
         """Handle disconnection."""
         print("[Wizard] Disconnected from session")
@@ -1203,6 +1406,7 @@ class TrainingWizard(QMainWindow):
         self.training_page.unlock_architecture()
         self.training_page.unlock_prediction_architecture()
         self.training_page.unlock_crop_size()
+        self._teardown_raw_session()
 
     def _on_session_error(self, error: str):
         """Handle a session error (queued cross-thread signal from SyncClient).

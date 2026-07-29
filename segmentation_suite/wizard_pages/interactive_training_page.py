@@ -613,6 +613,121 @@ class InteractiveTrainingPage(QWidget):
         except Exception as e:
             print(f"[Training] Failed to adopt session subproject '{subproject_name}': {e}")
 
+    # ---------------------------------------------- raw volume from the hub (joinee)
+    def has_local_raw(self) -> bool:
+        """True if this project already has raw imagery locally — so a joinee is NOT
+        offered a hub download. A fresh project joined just to collaborate is empty."""
+        if getattr(self, "zarr_source", None) is not None:
+            return True
+        if getattr(self, "image_files", None):
+            return True
+        if self.project_dir:
+            p = Path(self.project_dir)
+            if (p / "raw_data.zarr").exists() or (p / "train_images.zarr").exists():
+                return True
+        return False
+
+    def is_streaming(self) -> bool:
+        """True if the current raw source is a live hub stream (not a local copy)."""
+        from ..zarr_image_source import RemoteZarrImageSource
+        return isinstance(getattr(self, "zarr_source", None), RemoteZarrImageSource)
+
+    def clear_streamed_raw(self) -> bool:
+        """Drop a live STREAMED raw source on disconnect (a downloaded LOCAL copy is
+        real data and is left untouched). Leaves the canvas empty so a disconnected
+        joinee plainly has no raw data. Returns True if a stream was cleared."""
+        if not self.is_streaming():
+            return False
+        self.zarr_source = None
+        self.use_zarr = False
+        self.image_files = []
+        self.image_source = None
+        # Blank the canvas. The canvas holds its OWN reference to the (remote) zarr
+        # source (canvas.set_zarr_source) and keeps rendering the last tile, so we
+        # must clear it — set_image(zeros) resets the canvas's _zarr_source to None
+        # and shows an empty frame. (set_mask/None would crash; use a zero array.)
+        try:
+            import numpy as np
+            h, w = getattr(self, "_max_image_size", None) or (512, 512)
+            blank = np.zeros((int(h), int(w)), dtype=np.uint8)
+            self.canvas.set_image(blank)
+            self.canvas.set_mask(blank.copy())
+            if hasattr(self.canvas, "set_suggestion"):
+                self.canvas.set_suggestion(None)
+            self.canvas.update()
+        except Exception as e:
+            print(f"[Training] canvas blank on disconnect failed: {e}")
+        print("[Training] streamed raw source cleared + canvas blanked on disconnect")
+        return True
+
+    def _wire_raw_source(self, source, source_desc: dict):
+        """Point the viewer at an opened raw source (a local ZarrImageSource after a
+        download, or a RemoteZarrImageSource when streaming) and refresh the canvas.
+        Mirrors the zarr-init in set_config so a joinee sees the shared volume."""
+        self.zarr_source = source
+        self.use_zarr = True
+        n = int(source.num_slices)
+        self._max_image_size = (source.height, source.width)
+        self.image_files = [Path(f"zarr_slice_{i:05d}") for i in range(n)]
+        self.image_source = source_desc
+        self.window_start = 0
+        self.window_end = n
+        self.current_slice_index = max(0, min(getattr(self, "current_slice_index", 0), n - 1))
+        try:
+            self.load_current_slice()
+        except Exception as e:
+            print(f"[Training] raw source wired but initial render failed: {e}")
+
+    def attach_raw_from_hub(self, descriptor: dict, mode: str = "download",
+                            progress_cb=None, on_done=None, on_error=None):
+        """Make the hub's shared raw volume available to this joinee.
+
+        mode 'download' -> resumable background download into project_dir/raw_data.zarr
+        (a real local store opened by the normal reader); returns the worker so the
+        caller can wire a progress bar / cancel. mode 'stream' -> open it remotely
+        (RemoteZarrImageSource), no local copy; returns None. Callbacks: progress_cb
+        (download only) and on_done(mode)/on_error(msg)."""
+        url = (descriptor or {}).get("http_url")
+        if not url or not self.project_dir:
+            if on_error:
+                on_error("no raw volume advertised, or no local project open")
+            return None
+
+        if mode == "stream":
+            try:
+                from ..zarr_image_source import RemoteZarrImageSource
+                self._wire_raw_source(RemoteZarrImageSource(url), {"type": "remote", "url": url})
+                if on_done:
+                    on_done("stream")
+            except Exception as e:
+                if on_error:
+                    on_error(f"stream failed: {e}")
+            return None
+
+        # download (primary)
+        from ..workers.raw_download_worker import RawDownloadWorker
+        dest = Path(self.project_dir) / "raw_data.zarr"
+
+        def _finished(path):
+            try:
+                from ..zarr_image_source import ZarrImageSource
+                self._wire_raw_source(ZarrImageSource(path), {"type": "zarr", "path": str(path)})
+                if on_done:
+                    on_done("download")
+            except Exception as e:
+                if on_error:
+                    on_error(f"downloaded but failed to open: {e}")
+
+        worker = RawDownloadWorker(url, dest)
+        worker.finished_ok.connect(_finished)
+        if progress_cb:
+            worker.progress.connect(progress_cb)
+        if on_error:
+            worker.failed.connect(on_error)
+        self._raw_download_worker = worker   # keep a reference so it isn't GC'd mid-run
+        worker.start()
+        return worker
+
     def lock_prediction_architecture(self, architecture: str):
         """Lock the prediction-model dropdown to a hub-dictated model (red, disabled).
 
@@ -1922,7 +2037,14 @@ class InteractiveTrainingPage(QWidget):
 
             # Create dummy file list (indices only, not actual files)
             self.image_files = [Path(f"zarr_slice_{i:05d}") for i in range(num_slices)]
-            self.image_source = {'type': 'zarr', 'path': str(self.zarr_source.zarr_path)}
+            from ..zarr_image_source import RemoteZarrImageSource
+            if isinstance(self.zarr_source, RemoteZarrImageSource):
+                # A streamed source is session-only — record it as remote, NEVER as a
+                # local path (else it leaks into project.json's raw_images_dir and
+                # looks like persistent local data).
+                self.image_source = {'type': 'remote', 'url': str(self.zarr_source.zarr_path)}
+            else:
+                self.image_source = {'type': 'zarr', 'path': str(self.zarr_source.zarr_path)}
 
             print(f"[Scan] Loaded Zarr with {num_slices} slices, size: {self._max_image_size}")
         else:

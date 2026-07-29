@@ -27,6 +27,7 @@ from .protocol import (
     create_hello_message, create_weights_push_message, create_goodbye_message,
     create_chunk_start_message, create_chunk_end_message,
     create_training_data_message, create_project_register_message,
+    create_raw_register_message,
     serialize_training_data,
     chunk_data, needs_chunking, MAX_CHUNK_SIZE
 )
@@ -98,6 +99,9 @@ class SyncClient(QObject):
     session_subproject_received = pyqtSignal(str)  # local subproject to adopt for this session
     prediction_model_received = pyqtSignal(str)    # authoritative prediction model (locked)
     crop_size_received = pyqtSignal(int)           # authoritative crop/tile size (locked)
+    raw_available = pyqtSignal(dict)               # hub is serving a raw volume (descriptor); {} = none
+    raw_upload_requested = pyqtSignal(str)         # hub can't see owner's data -> upload it (http_url)
+    raw_upload_denied = pyqtSignal(dict)           # hub refused the upload (need_bytes/free_bytes)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -612,6 +616,13 @@ class SyncClient(QObject):
                 if crop_size:
                     _log(f"Authoritative crop size: {crop_size}")
                     self.crop_size_received.emit(int(crop_size))
+                # Raw-volume availability: the hub is serving a shared volume the
+                # joinee can download/stream. {} / absent = nothing shared.
+                raw = msg.payload.get("raw") or {}
+                if raw.get("ready"):
+                    _log(f"Hub raw volume available: {raw.get('num_slices')} slices "
+                         f"@ {raw.get('http_url')}")
+                self.raw_available.emit(raw)
                 self.sync_status.emit(f"Joined session {self.session_id}")
 
             elif msg.type == MessageType.SET_PREDICTION_MODEL:
@@ -619,6 +630,15 @@ class SyncClient(QObject):
                 if arch:
                     _log(f"Prediction model set by hub: {arch}")
                     self.prediction_model_received.emit(arch)
+
+            elif msg.type == MessageType.RAW_UPLOAD_REQUEST:
+                url = msg.payload.get("http_url", "")
+                _log(f"Hub requests raw upload -> {url}")
+                self.raw_upload_requested.emit(url)
+
+            elif msg.type == MessageType.RAW_UPLOAD_DENIED:
+                _log(f"Hub denied raw upload: {msg.payload}")
+                self.raw_upload_denied.emit(dict(msg.payload or {}))
 
             elif msg.type == MessageType.USER_LIST:
                 user_list = msg.payload.get("users", [])
@@ -744,6 +764,43 @@ class SyncClient(QObject):
             _log(f"Sent PROJECT_REGISTER: {project_name}/{subproject}")
         except Exception as e:
             _log(f"Failed to send project register: {e}")
+
+    def send_raw_register(self, path: str, fmt: str = "zarr", size_bytes: int = 0):
+        """Owner -> Hub: offer to share the session's raw volume (the hub references
+        it in place if it can see `path`, else it needs an upload)."""
+        if not self._connected or not self._loop:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_raw_register_async(path, fmt, size_bytes), self._loop)
+
+    async def _send_raw_register_async(self, path, fmt, size_bytes):
+        if not self._websocket:
+            return
+        try:
+            msg = create_raw_register_message(path, fmt, size_bytes)
+            async with self._sendlock():
+                await self._websocket.send(msg.to_json())
+            _log(f"Sent RAW_REGISTER: {path} ({fmt}, {size_bytes} B)")
+        except Exception as e:
+            _log(f"Failed to send raw register: {e}")
+
+    def send_raw_upload_complete(self):
+        """Owner -> Hub: all raw files uploaded; attach + serve."""
+        if not self._connected or not self._loop:
+            return
+        asyncio.run_coroutine_threadsafe(self._send_raw_upload_complete_async(), self._loop)
+
+    async def _send_raw_upload_complete_async(self):
+        if not self._websocket:
+            return
+        try:
+            from .protocol import create_raw_upload_complete_message
+            msg = create_raw_upload_complete_message()
+            async with self._sendlock():
+                await self._websocket.send(msg.to_json())
+            _log("Sent RAW_UPLOAD_COMPLETE")
+        except Exception as e:
+            _log(f"Failed to send raw upload complete: {e}")
 
     def send_weights(self, weights: dict, epoch: int, loss: float,
                     num_samples: int = 1):

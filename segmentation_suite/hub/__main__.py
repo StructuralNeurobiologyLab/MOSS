@@ -107,7 +107,43 @@ def main():
     if web and args.web_port > 0:
         from .hub_web import HubWeb
         web_srv = HubWeb(backend, host=args.host, port=args.web_port)
+        # Let the backend advertise the raw-volume HTTP URL with the right port.
+        try:
+            backend.web_port = args.web_port
+        except Exception:
+            pass
         web_srv.start()
+
+    # Ctrl-C handling. Qt's event loop otherwise swallows SIGINT, so the hub can't
+    # be stopped from the terminal. Install a handler (first Ctrl-C = graceful stop,
+    # second = force) and a periodic timer so the loop wakes often enough for Python
+    # to actually run the handler.
+    import signal
+    from PyQt6.QtCore import QTimer
+    _sig = {"n": 0}
+
+    def _on_sigint(*_a):
+        _sig["n"] += 1
+        if _sig["n"] >= 2:
+            print("\n[Hub] force quit")
+            os._exit(1)
+        print("\n[Hub] shutting down… (Ctrl-C again to force)")
+        try:
+            backend.stop()
+        except Exception:
+            pass
+        try:
+            if web_srv:
+                web_srv.stop()
+        except Exception:
+            pass
+        app.quit()
+
+    import os
+    signal.signal(signal.SIGINT, _on_sigint)
+    _wake = QTimer()
+    _wake.timeout.connect(lambda: None)   # give Python a chance to see the signal
+    _wake.start(300)
 
     backend.start()
     return app.exec()

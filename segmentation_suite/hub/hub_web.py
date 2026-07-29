@@ -300,6 +300,12 @@ class HubWeb(QObject):
 
             def do_POST(self):
                 path = urlparse(self.path).path
+                # Owner -> hub raw-volume UPLOAD: stream the body straight to disk,
+                # block-by-block (NEVER read the whole Content-Length into RAM — a
+                # zarr chunk stream can be huge). Handled before the small-body read.
+                if path.startswith("/raw/upload/"):
+                    self._recv_raw_file(unquote(path[len("/raw/upload/"):]))
+                    return
                 ln = int(self.headers.get("Content-Length", "0") or 0)
                 body = self.rfile.read(ln).decode("utf-8") if ln else ""
                 kind = {"/toggle": "toggle", "/model": "model",
@@ -311,6 +317,33 @@ class HubWeb(QObject):
                     self._send(200, "application/json", b'{"ok":true}')
                 else:
                     self._send(404, "text/plain", b"not found")
+
+            def _recv_raw_file(self, relpath: str):
+                """Receive one uploaded zarr file into data_dir/raw.zarr/<relpath>,
+                streamed block-by-block. Path-sandboxed against traversal."""
+                rp = getattr(hub, "_raw_zarr_path", None)
+                root = rp() if callable(rp) else None
+                if root is None:
+                    self._send(404, "text/plain", b"no upload target"); return
+                root = Path(root)
+                rel = posixpath.normpath("/" + relpath).lstrip("/")
+                target = (root / rel).resolve()
+                if target != root.resolve() and not str(target).startswith(str(root.resolve()) + os.sep):
+                    self._send(403, "text/plain", b"forbidden"); return
+                target.parent.mkdir(parents=True, exist_ok=True)
+                ln = int(self.headers.get("Content-Length", "0") or 0)
+                try:
+                    with open(target, "wb") as f:
+                        remaining = ln
+                        while remaining > 0:
+                            block = self.rfile.read(min(1 << 20, remaining))
+                            if not block:
+                                break
+                            f.write(block)
+                            remaining -= len(block)
+                except Exception as e:
+                    self._send(500, "text/plain", f"write error: {e}".encode("utf-8")); return
+                self._send(200, "application/json", b'{"ok":true}')
 
         return Handler
 

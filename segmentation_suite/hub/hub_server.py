@@ -109,8 +109,12 @@ class HubServer(QObject):
         # Raw volume the hub serves to joinees (download via /raw/file, stream via
         # /raw/tile). One shared store per project at data_dir/raw.zarr; read with
         # the hub's OWN ZarrImageSource so served pixels == local MOSS pixels.
-        self._raw_source = None     # ZarrImageSource | None
-        self._raw_root = None       # Path to the served zarr dir | None
+        self._raw_source = None       # ZarrImageSource | None
+        self._raw_root = None         # Path to the served zarr dir | None
+        self._raw_ready = False       # True once a shared volume is attached + serveable
+        self._raw_needs_upload = False  # owner shared but the hub can't see the path
+        self._raw_size_bytes = 0      # owner-reported store size (storage guard + progress)
+        self.web_port = 8080          # HTTP console port; set by __main__, used in raw http_url
 
         self._users: Dict[str, _User] = {}        # user_id -> _User
         self._ws_to_uid: Dict[object, str] = {}
@@ -166,6 +170,7 @@ class HubServer(QObject):
                 "owner_id": self._owner_id,
                 "registered": self._registered,
                 "users": self._known_users,
+                "raw_size_bytes": self._raw_size_bytes,
             }
             self._manifest_path().write_text(json.dumps(data, indent=2))
         except Exception as e:
@@ -192,6 +197,7 @@ class HubServer(QObject):
         self._owner_id = data.get("owner_id", "")
         self._known_users = data.get("users", {}) or {}
         self._registered = bool(data.get("registered", False))
+        self._raw_size_bytes = int(data.get("raw_size_bytes", 0))
         self._next_join_index = max(
             [int(u.get("join_index", 0)) for u in self._known_users.values()],
             default=-1) + 1
@@ -477,13 +483,42 @@ class HubServer(QObject):
             from ..zarr_image_source import ZarrImageSource
             self._raw_source = ZarrImageSource(p)
             self._raw_root = Path(p)
+            self._raw_ready = True
             _log(f"raw volume attached: {p} ({self._raw_source.num_slices} slices, "
                  f"{self._raw_source.height}x{self._raw_source.width})")
             return True
         except Exception as e:
             _log(f"could not attach raw volume at {p}: {e}")
-            self._raw_source, self._raw_root = None, None
+            self._raw_source, self._raw_root, self._raw_ready = None, None, False
             return False
+
+    def _raw_descriptor(self) -> dict:
+        """Raw-volume advertisement for WELCOME + web_state. Returns {} when nothing
+        is shared/ready, so joinees are only offered a volume that actually exists."""
+        src = self._raw_source
+        if src is None or not self._raw_ready:
+            return {}
+        return {
+            "ready": True,
+            "format": "zarr",
+            "num_slices": int(src.num_slices),
+            "height": int(src.height),
+            "width": int(src.width),
+            "size_bytes": int(self._raw_size_bytes),
+            "http_url": f"http://{self._adv_host}:{self.web_port}",
+        }
+
+    def _free_bytes(self, path) -> int:
+        """Free space on the filesystem holding `path` (for the storage pre-flight
+        guard before any raw copy). Walks up to the nearest existing parent."""
+        import shutil
+        p = Path(path)
+        while not p.exists() and p != p.parent:
+            p = p.parent
+        try:
+            return int(shutil.disk_usage(str(p)).free)
+        except Exception:
+            return 0
 
     def _activate_session(self, resume: bool):
         """Bring the chosen project online (shared by CLI --data-dir and the
@@ -570,6 +605,10 @@ class HubServer(QObject):
             await self._on_hello(websocket, msg)
         elif msg.type == MessageType.PROJECT_REGISTER:
             await self._on_project_register(websocket, msg)
+        elif msg.type == MessageType.RAW_REGISTER:
+            await self._on_raw_register(websocket, msg)
+        elif msg.type == MessageType.RAW_UPLOAD_COMPLETE:
+            await self._on_raw_upload_complete(websocket, msg)
         elif msg.type == MessageType.TRAINING_DATA:
             uid = self._ws_to_uid.get(websocket)
             if uid:
@@ -689,6 +728,7 @@ class HubServer(QObject):
             crop_size=self.crop_size or None,   # global — sent to owner too
             session_configured=self._registered,  # owner skips setup popup if already configured
             is_owner=user.is_owner,
+            raw=self._raw_descriptor() or None,   # advertise a shared raw volume (if any)
         )
         await self._safe_send(user.ws, welcome.to_json())
 
@@ -719,6 +759,88 @@ class HubServer(QObject):
             self.prediction_model_set.emit(self.prediction_model)
         self._save_manifest()
         # Re-welcome everyone so late-arriving identity reaches earlier joiners.
+        for u in list(self._users.values()):
+            await self._send_welcome(u)
+
+    async def _on_raw_register(self, websocket, msg: Message):
+        """Owner offers to share the session's raw volume. If the hub can see the
+        owner's store on its own filesystem (owner hosting locally, or a shared
+        mount like ceph), reference it in place at data_dir/raw.zarr — 0 bytes
+        copied, works for terabytes. Otherwise the data must be uploaded to the
+        hub (deferred to the upload path); flag it and let the owner's client
+        drive the storage-guarded copy."""
+        uid = self._ws_to_uid.get(websocket)
+        user = self._users.get(uid)
+        if not user or not user.is_owner:
+            _log("ignoring RAW_REGISTER from non-owner")
+            return
+        self._raw_size_bytes = int(msg.payload.get("size_bytes", 0)) or self._raw_size_bytes
+
+        if self._raw_ready and self._raw_source is not None:
+            # Already serving a volume for this session — just (re)advertise it.
+            for u in list(self._users.values()):
+                await self._send_welcome(u)
+            return
+
+        import os as _os
+        dest = self._raw_zarr_path()
+        path = msg.payload.get("path", "") or ""
+        src_path = Path(path).expanduser() if path else None
+        # MOSS_HUB_FORCE_UPLOAD=1 forces the upload path even on one machine, so the
+        # upload flow can be exercised locally (the hub can normally see local paths).
+        force_upload = bool(_os.environ.get("MOSS_HUB_FORCE_UPLOAD"))
+
+        referenced = False
+        if src_path is not None and src_path.exists() and not force_upload:
+            # REFERENCE-IN-PLACE (0-copy): symlink data_dir/raw.zarr -> owner's store.
+            try:
+                if not (dest.exists() or dest.is_symlink()):
+                    dest.symlink_to(src_path.resolve(), target_is_directory=True)
+                if self.attach_raw(dest):
+                    self._raw_needs_upload = False
+                    referenced = True
+                    _log(f"raw shared by reference-in-place: {dest} -> {src_path}")
+                else:
+                    _log(f"raw path {src_path} not a readable zarr; ignoring share")
+            except OSError as e:
+                _log(f"reference-in-place link failed ({e}); will request upload")
+
+        if not referenced:
+            # Hub can't see (or was told to upload) the owner's data -> UPLOAD it,
+            # storage-guarded: refuse if it won't fit, else ask the owner to upload.
+            from ..network.protocol import (create_raw_upload_request_message,
+                                            create_raw_upload_denied_message)
+            self._raw_needs_upload = True
+            if dest.is_symlink():
+                dest.unlink()   # don't let an upload write through a stale reference
+            free = self._free_bytes(self.data_dir)
+            need = self._raw_size_bytes
+            if need and need > free:
+                _log(f"raw upload DENIED: need {need/1e9:.1f} GB > free {free/1e9:.1f} GB")
+                await self._safe_send(websocket,
+                    create_raw_upload_denied_message(need, free).to_json())
+            else:
+                http_url = f"http://{self._adv_host}:{self.web_port}"
+                _log(f"raw upload requested (need ~{need/1e9:.1f} GB, free {free/1e9:.1f} GB)")
+                await self._safe_send(websocket,
+                    create_raw_upload_request_message(http_url).to_json())
+
+        self._save_manifest()
+        for u in list(self._users.values()):
+            await self._send_welcome(u)
+
+    async def _on_raw_upload_complete(self, websocket, msg: Message):
+        """Owner finished uploading the raw store -> attach it + advertise so joinees
+        can download/stream it."""
+        uid = self._ws_to_uid.get(websocket)
+        user = self._users.get(uid)
+        if not user or not user.is_owner:
+            return
+        if self.attach_raw(self._raw_zarr_path()):
+            self._raw_needs_upload = False
+            _log("raw upload complete -> attached + serving")
+        else:
+            _log("raw upload complete but the uploaded store did not open")
         for u in list(self._users.values()):
             await self._send_welcome(u)
 
@@ -972,4 +1094,5 @@ class HubServer(QObject):
             "online_count": len(online),
             "total_count": len(self._known_users),
             "training": self.training_state(),
+            "raw": self._raw_descriptor(),   # {} when no shared volume
         }

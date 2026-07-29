@@ -51,6 +51,66 @@ def fetch_manifest(base_url: str, timeout: float = 300.0) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
+def upload_raw(base_url: str, src_dir, progress_cb=None, should_stop=None,
+               timeout: float = 300.0, block_size: int = 1 << 20) -> bool:
+    """Upload a local zarr store (src_dir) TO the hub, for the case where the hub
+    can't see the owner's data (different machine, no shared filesystem). Mirrors
+    download_raw in reverse: POST each file to /raw/upload/<relpath>, streamed;
+    resumable — skip files the hub already has at the right size (via /raw/manifest).
+
+    Returns True when the whole store is on the hub; False if aborted (call again
+    to resume). Raises on network/IO errors. Bulk goes over HTTP, never the WS.
+    """
+    import urllib.error
+    from urllib.parse import quote
+    base_url = base_url.rstrip("/")
+    src_dir = Path(src_dir)
+
+    files = [p for p in src_dir.rglob("*") if p.is_file()]
+    total_files = len(files)
+    total_bytes = sum(p.stat().st_size for p in files)
+
+    # What does the hub already have? (resume) — a partial upload shows up in its
+    # manifest; skip files already present at the right size.
+    have = {}
+    try:
+        for f in fetch_manifest(base_url, timeout=timeout).get("files", []):
+            have[f["path"]] = int(f["size"])
+    except Exception:
+        have = {}
+
+    done_bytes = 0
+    done_files = 0
+    for p in files:
+        rel = p.relative_to(src_dir).as_posix()
+        sz = p.stat().st_size
+        if have.get(rel) == sz:
+            done_bytes += sz
+            done_files += 1
+    if progress_cb:
+        progress_cb(done_bytes, total_bytes, done_files, total_files)
+
+    for p in files:
+        if should_stop and should_stop():
+            return False
+        rel = p.relative_to(src_dir).as_posix()
+        sz = p.stat().st_size
+        if have.get(rel) == sz:
+            continue  # already on the hub (counted above)
+        url = base_url + "/raw/upload/" + quote(rel)
+        with open(p, "rb") as fh:
+            req = urllib.request.Request(url, data=fh, method="POST")
+            req.add_header("Content-Type", "application/octet-stream")
+            req.add_header("Content-Length", str(sz))
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp.read()
+        done_bytes += sz
+        done_files += 1
+        if progress_cb:
+            progress_cb(done_bytes, total_bytes, done_files, total_files)
+    return True
+
+
 def download_raw(base_url: str, dest_dir, progress_cb=None, should_stop=None,
                  timeout: float = 300.0, block_size: int = 1 << 20) -> bool:
     """Resumably download the hub's raw zarr into dest_dir (a local zarr store).

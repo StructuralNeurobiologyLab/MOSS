@@ -962,6 +962,64 @@ class HomePage(QWidget):
         if folder:
             self.raw_data_input.setText(folder)
 
+    # ------------------------------------------- raw-volume download from the hub
+    # Drives the dashboard's "Raw EM Data" card (self.raw_data_card) so a joinee
+    # sees "Downloading data from hub" with a live bar in the home tab's data area.
+    def raw_download_start(self, total_bytes: int):
+        gb = (total_bytes or 0) / 1e9
+        self.raw_data_card.set_progress(0, f"Downloading data from hub…  (≈{gb:.1f} GB)")
+
+    def raw_download_progress(self, done_bytes: int, total_bytes: int,
+                              done_files: int, total_files: int):
+        pct = int(done_bytes * 100 / total_bytes) if total_bytes else 0
+        self.raw_data_card.set_progress(
+            pct, f"Downloading data from hub — {done_files}/{total_files} files ({pct}%)")
+
+    def raw_download_finish(self, ok: bool):
+        if ok:
+            self.raw_source_state("local")
+            try:
+                self.refresh()   # re-scan so the dashboard reflects the new local raw data
+            except Exception:
+                pass
+        else:
+            self.raw_data_card.set_status(False, "Download from hub failed")
+
+    def raw_upload_start(self, total_bytes: int):
+        gb = (total_bytes or 0) / 1e9
+        self.raw_data_card.set_progress(0, f"Uploading to hub…  (≈{gb:.1f} GB)")
+
+    def raw_upload_progress(self, done_bytes: int, total_bytes: int,
+                            done_files: int, total_files: int):
+        pct = int(done_bytes * 100 / total_bytes) if total_bytes else 0
+        self.raw_data_card.set_progress(
+            pct, f"Uploading to hub — {done_files}/{total_files} files ({pct}%)")
+
+    def raw_upload_finish(self, ok: bool):
+        if ok:
+            self.raw_source_state("local")   # owner still has it locally
+        else:
+            self.raw_data_card.set_status(False, "Upload to hub failed")
+
+    def raw_source_state(self, state: str):
+        """Reflect the raw-volume state on the dashboard 'Raw EM Data' card so the
+        user always sees what they have: 'local' (downloaded copy), 'streaming'
+        (live from hub, not saved), or 'none'."""
+        c = self.raw_data_card
+        c.progress_bar.setVisible(False)
+        if state == "local":
+            c.status_label.setText("Local copy")
+            c.status_label.setStyleSheet("color: #4CAF50;")
+            c.details_label.setText("Downloaded from hub — stored in this project.")
+        elif state == "streaming":
+            c.status_label.setText("Streaming (live)")
+            c.status_label.setStyleSheet("color: #2196F3;")
+            c.details_label.setText("Live from hub — NOT saved locally; disconnecting clears it.")
+        else:  # none
+            c.status_label.setText("Not found")
+            c.status_label.setStyleSheet("color: #f44336;")
+            c.details_label.setText("No raw data. Join the session to download or stream.")
+
     def _create_project(self):
         """Create a new project."""
         project_name = self.project_name_input.text().strip()
@@ -1048,8 +1106,21 @@ class HomePage(QWidget):
         if not self.project_dir:
             return
 
-        # Look for TIFF files
-        tiff_files = list(self.project_dir.glob("**/*.tif")) + list(self.project_dir.glob("**/*.tiff"))
+        # Look for genuine RAW tiffs only — NEVER training crops, masks, or
+        # subproject data. A blind recursive glob would grab a painted mask or a
+        # training crop and convert it into a bogus raw_data.zarr: e.g. a streaming
+        # joinee has no local raw zarr, so the "zarr exists?" guard below passes and
+        # a stray mask tif (subprojects/<sp>/masks/*.tif) gets auto-converted.
+        def _is_raw_tif(p):
+            for part in p.relative_to(self.project_dir).parts[:-1]:   # ancestor dirs only
+                if part in ("masks", "subprojects", "sam2_features"):
+                    return False
+                if part.startswith("train_images") or part.startswith("train_masks"):
+                    return False
+            return True
+        tiff_files = [p for p in (list(self.project_dir.glob("**/*.tif")) +
+                                  list(self.project_dir.glob("**/*.tiff")))
+                      if _is_raw_tif(p)]
         if not tiff_files:
             return
 
