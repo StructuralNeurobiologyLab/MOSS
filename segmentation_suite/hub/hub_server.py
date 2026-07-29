@@ -10,8 +10,8 @@ hub's disk under incoming/<user_id>/. It speaks the same wire protocol the
 existing SyncClient already uses (HELLO / WELCOME / TRAINING_DATA / GLOBAL_MODEL),
 plus the hub additions (PROJECT_REGISTER, SET_PREDICTION_MODEL, extended WELCOME).
 
-It exposes the exact signal/method surface that MockHubBackend does, so the Hub
-GUI is unchanged whether driven by the mock or by this real server.
+It exposes a fixed signal/method surface consumed by the Hub GUI (hub_window) and
+the web console (hub_web), keeping those decoupled from the server internals.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ class _User:
 
 
 class HubServer(QObject):
-    # Signal surface mirrors MockHubBackend exactly.
+    # Signal surface consumed by the Hub GUI (hub_window) and web console (hub_web).
     session_started = pyqtSignal(str, str, str)         # code, data_dir, connect_addr
     project_registered = pyqtSignal(str, list)          # project_name, subprojects
     user_connected = pyqtSignal(str, str, bool, int)    # user_id, name, is_owner, join_index

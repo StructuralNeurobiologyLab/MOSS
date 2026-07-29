@@ -6,7 +6,6 @@ The hub has two interchangeable interfaces — launch exactly ONE:
 
     python -m segmentation_suite.hub                     # web console (default)
     python -m segmentation_suite.hub --gui               # Qt window instead
-    python -m segmentation_suite.hub --mock              # Qt window, simulated data
 
 Project selection:
 
@@ -35,8 +34,6 @@ def main():
     # Interface: web console (default) OR the Qt window (--gui). Never both.
     parser.add_argument("--gui", action="store_true",
                         help="Launch the Qt window interface instead of the web console")
-    parser.add_argument("--mock", action="store_true",
-                        help="Qt window with a simulated backend (visual dev only, implies --gui)")
     parser.add_argument("--web-port", type=int, default=8080,
                         help="Port for the browser console (web mode)")
     # Project selection
@@ -62,7 +59,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
 
-    gui = args.gui or args.mock          # exactly one interface
+    gui = args.gui                       # web console (default) OR the Qt window
     web = not gui
 
     # Qt needs an event loop either way (backend uses QTimer/signals). Use a
@@ -74,28 +71,24 @@ def main():
         from PyQt6.QtCore import QCoreApplication
         app = QCoreApplication(sys.argv)
 
-    if args.mock:
-        from .mock_backend import MockHubBackend
-        backend = MockHubBackend(data_dir=args.data_dir or "~/moss_hub_demo")
-    else:
-        data_dir = args.data_dir
-        # The Qt window has no project picker — it needs a concrete project.
-        if gui and not data_dir:
-            data_dir = "~/moss_hub_demo"
-        resume = False
-        if data_dir:
-            manifest = Path(data_dir).expanduser() / "session.json"
-            resume = (args.resume or manifest.exists()) and not args.fresh
-            if resume and manifest.exists():
-                print(f"[Hub] resuming saved session in {data_dir}")
-        from .hub_server import HubServer
-        backend = HubServer(data_dir=data_dir, projects_dir=args.projects_dir,
-                            host=args.host, port=args.port, resume=resume)
-        backend.force_cpu = args.cpu
-        backend.train_epochs = args.epochs
-        backend.broadcast_interval = args.broadcast_interval
-        backend.train_batch_size = args.batch_size
-        backend.train_lr = args.lr
+    data_dir = args.data_dir
+    # The Qt window has no project picker — it needs a concrete project.
+    if gui and not data_dir:
+        data_dir = "~/moss_hub_demo"
+    resume = False
+    if data_dir:
+        manifest = Path(data_dir).expanduser() / "session.json"
+        resume = (args.resume or manifest.exists()) and not args.fresh
+        if resume and manifest.exists():
+            print(f"[Hub] resuming saved session in {data_dir}")
+    from .hub_server import HubServer
+    backend = HubServer(data_dir=data_dir, projects_dir=args.projects_dir,
+                        host=args.host, port=args.port, resume=resume)
+    backend.force_cpu = args.cpu
+    backend.train_epochs = args.epochs
+    backend.broadcast_interval = args.broadcast_interval
+    backend.train_batch_size = args.batch_size
+    backend.train_lr = args.lr
 
     window = None
     if gui:

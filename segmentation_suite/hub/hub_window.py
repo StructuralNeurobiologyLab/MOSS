@@ -9,9 +9,8 @@ tile), and the controls that make the hub authoritative: include/exclude a
 user's crops, reset the model, and dictate the prediction model every client
 must use.
 
-The window is driven entirely by a backend object exposing the signals/methods
-documented in mock_backend.MockHubBackend, so it runs on a laptop against the
-mock and against the real HubServer later without change.
+The window is driven entirely by a backend object (HubServer) exposing a fixed set
+of signals/methods, so the GUI code stays decoupled from the server internals.
 """
 
 from __future__ import annotations
