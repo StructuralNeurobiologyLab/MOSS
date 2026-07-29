@@ -232,13 +232,15 @@ def create_welcome_message(session_id: str, user_list: list,
 
 
 def create_raw_register_message(path: str, fmt: str = "zarr",
-                                size_bytes: int = 0) -> Message:
+                                size_bytes: int = 0, n_files: int = 0) -> Message:
     """Owner -> Hub: offer to share the session's raw volume. `path` is the owner's
     local raw store; the hub references it in place if it can see that path (0-copy),
-    otherwise it needs an upload. size_bytes feeds the hub's storage pre-flight guard."""
+    otherwise it needs an upload. size_bytes feeds the hub's storage pre-flight guard;
+    n_files lets the hub show 'Uploading N of M files'."""
     return Message(
         type=MessageType.RAW_REGISTER,
-        payload={"path": path, "format": fmt, "size_bytes": int(size_bytes)},
+        payload={"path": path, "format": fmt,
+                 "size_bytes": int(size_bytes), "n_files": int(n_files)},
     )
 
 

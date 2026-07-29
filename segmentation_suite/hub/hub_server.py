@@ -112,8 +112,13 @@ class HubServer(QObject):
         self._raw_source = None       # ZarrImageSource | None
         self._raw_root = None         # Path to the served zarr dir | None
         self._raw_ready = False       # True once a shared volume is attached + serveable
+        self._raw_complete = False    # store is fully present (finalized upload OR 0-copy ref).
+                                      # A PARTIAL upload must never be attached/served (restart-safe).
         self._raw_needs_upload = False  # owner shared but the hub can't see the path
         self._raw_size_bytes = 0      # owner-reported store size (storage guard + progress)
+        self._raw_expected_files = 0  # owner-reported file count (for "Uploading N of M")
+        self._raw_count_cache = 0     # cached count of files received so far
+        self._raw_count_ts = 0.0      # monotonic time of the last received-count refresh
         self.web_port = 8080          # HTTP console port; set by __main__, used in raw http_url
 
         self._users: Dict[str, _User] = {}        # user_id -> _User
@@ -171,6 +176,8 @@ class HubServer(QObject):
                 "registered": self._registered,
                 "users": self._known_users,
                 "raw_size_bytes": self._raw_size_bytes,
+                "raw_complete": self._raw_complete,
+                "raw_expected_files": self._raw_expected_files,
             }
             self._manifest_path().write_text(json.dumps(data, indent=2))
         except Exception as e:
@@ -198,6 +205,8 @@ class HubServer(QObject):
         self._known_users = data.get("users", {}) or {}
         self._registered = bool(data.get("registered", False))
         self._raw_size_bytes = int(data.get("raw_size_bytes", 0))
+        self._raw_complete = bool(data.get("raw_complete", False))
+        self._raw_expected_files = int(data.get("raw_expected_files", 0))
         self._next_join_index = max(
             [int(u.get("join_index", 0)) for u in self._known_users.values()],
             default=-1) + 1
@@ -492,21 +501,44 @@ class HubServer(QObject):
             self._raw_source, self._raw_root, self._raw_ready = None, None, False
             return False
 
+    def _raw_received_files(self) -> int:
+        """Count files currently in the raw store (received so far during an upload),
+        cached ~2s so the /state poll stays cheap even on ceph."""
+        import time
+        rz = self._raw_zarr_path()
+        now = time.monotonic()
+        if now - self._raw_count_ts < 2.0:
+            return self._raw_count_cache
+        try:
+            n = sum(1 for p in rz.rglob("*") if p.is_file()) if rz.exists() else 0
+        except Exception:
+            n = self._raw_count_cache
+        self._raw_count_cache, self._raw_count_ts = n, now
+        return n
+
     def _raw_descriptor(self) -> dict:
-        """Raw-volume advertisement for WELCOME + web_state. Returns {} when nothing
-        is shared/ready, so joinees are only offered a volume that actually exists."""
+        """Raw-volume STATE for WELCOME + web_state. `ready:True` (+ the metadata a
+        joinee needs) ONLY when a COMPLETE store is attached and serving, so joinees
+        can never fetch half a dataset. A partial upload reports state 'uploading'
+        (received/expected files); nothing shared -> 'none'."""
+        http = f"http://{self._adv_host}:{self.web_port}"
         src = self._raw_source
-        if src is None or not self._raw_ready:
-            return {}
-        return {
-            "ready": True,
-            "format": "zarr",
-            "num_slices": int(src.num_slices),
-            "height": int(src.height),
-            "width": int(src.width),
-            "size_bytes": int(self._raw_size_bytes),
-            "http_url": f"http://{self._adv_host}:{self.web_port}",
-        }
+        if src is not None and self._raw_ready and self._raw_complete:
+            return {
+                "state": "ready", "ready": True, "format": "zarr",
+                "num_slices": int(src.num_slices),
+                "height": int(src.height), "width": int(src.width),
+                "size_bytes": int(self._raw_size_bytes), "http_url": http,
+            }
+        rz = self._raw_zarr_path()
+        if self._raw_needs_upload or (rz.exists() and not self._raw_complete):
+            return {
+                "state": "uploading", "ready": False,
+                "received_files": self._raw_received_files(),
+                "expected_files": int(self._raw_expected_files),
+                "size_bytes": int(self._raw_size_bytes), "http_url": http,
+            }
+        return {"state": "none", "ready": False}
 
     def _free_bytes(self, path) -> int:
         """Free space on the filesystem holding `path` (for the storage pre-flight
@@ -525,9 +557,13 @@ class HubServer(QObject):
         web picker): make dirs, optionally resume the manifest, announce it."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "incoming").mkdir(exist_ok=True)
-        self.attach_raw()   # re-serve raw.zarr if this project already has one
         if resume:
-            self._resumed = self._load_manifest()
+            self._resumed = self._load_manifest()   # restores _raw_complete / _raw_expected_files
+        # Only serve a COMPLETE raw store (finalized upload OR 0-copy reference). A
+        # PARTIAL upload from an interrupted/crashed session stays UNATTACHED — never
+        # serve half a volume; the console shows 'uploading' and the owner can resume.
+        if self._raw_complete:
+            self.attach_raw()
         self.session_started.emit(self.code, str(self.data_dir), self.connect_address())
         _log(f"session {self.code} · data_dir={self.data_dir} · connect at ws://{self.connect_address()}")
         if self._adv_host == "127.0.0.1":
@@ -775,6 +811,7 @@ class HubServer(QObject):
             _log("ignoring RAW_REGISTER from non-owner")
             return
         self._raw_size_bytes = int(msg.payload.get("size_bytes", 0)) or self._raw_size_bytes
+        self._raw_expected_files = int(msg.payload.get("n_files", 0)) or self._raw_expected_files
 
         if self._raw_ready and self._raw_source is not None:
             # Already serving a volume for this session — just (re)advertise it.
@@ -798,6 +835,7 @@ class HubServer(QObject):
                     dest.symlink_to(src_path.resolve(), target_is_directory=True)
                 if self.attach_raw(dest):
                     self._raw_needs_upload = False
+                    self._raw_complete = True   # a 0-copy reference is whole immediately
                     referenced = True
                     _log(f"raw shared by reference-in-place: {dest} -> {src_path}")
                 else:
@@ -811,6 +849,7 @@ class HubServer(QObject):
             from ..network.protocol import (create_raw_upload_request_message,
                                             create_raw_upload_denied_message)
             self._raw_needs_upload = True
+            self._raw_complete = False   # partial until the owner finalizes the upload
             if dest.is_symlink():
                 dest.unlink()   # don't let an upload write through a stale reference
             free = self._free_bytes(self.data_dir)
@@ -836,11 +875,14 @@ class HubServer(QObject):
         user = self._users.get(uid)
         if not user or not user.is_owner:
             return
+        self._raw_complete = True   # finalize: the uploaded store is now whole
         if self.attach_raw(self._raw_zarr_path()):
             self._raw_needs_upload = False
             _log("raw upload complete -> attached + serving")
         else:
+            self._raw_complete = False   # didn't open -> not actually usable
             _log("raw upload complete but the uploaded store did not open")
+        self._save_manifest()
         for u in list(self._users.values()):
             await self._send_welcome(u)
 

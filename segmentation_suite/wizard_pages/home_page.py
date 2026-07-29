@@ -972,6 +972,7 @@ class HomePage(QWidget):
     def raw_download_progress(self, done_bytes: int, total_bytes: int,
                               done_files: int, total_files: int):
         pct = int(done_bytes * 100 / total_bytes) if total_bytes else 0
+        pct = max(0, min(100, pct))
         self.raw_data_card.set_progress(
             pct, f"Downloading data from hub — {done_files}/{total_files} files ({pct}%)")
 
@@ -991,7 +992,10 @@ class HomePage(QWidget):
 
     def raw_upload_progress(self, done_bytes: int, total_bytes: int,
                             done_files: int, total_files: int):
-        pct = int(done_bytes * 100 / total_bytes) if total_bytes else 0
+        # Prefer file-count for the headline % (bounded + monotonic; byte totals can
+        # drift if the source files are re-stat'd at a slightly different size).
+        pct = int(done_files * 100 / total_files) if total_files else 0
+        pct = max(0, min(100, pct))
         self.raw_data_card.set_progress(
             pct, f"Uploading to hub — {done_files}/{total_files} files ({pct}%)")
 

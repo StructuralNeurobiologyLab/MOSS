@@ -193,6 +193,8 @@ class HubWeb(QObject):
                                json.dumps(_raw_meta(hub)).encode("utf-8"))
                 elif path == "/raw/manifest":
                     self._serve_raw_manifest()
+                elif path == "/raw/upload_manifest":
+                    self._serve_raw_upload_manifest()
                 elif path.startswith("/raw/file/"):
                     self._serve_raw_file(unquote(path[len("/raw/file/"):]))
                 elif path == "/raw/tile":
@@ -222,6 +224,24 @@ class HubWeb(QObject):
                 self._send(200, "application/json", json.dumps(
                     {"root": root.name, "count": len(files),
                      "total_bytes": total, "files": files}).encode("utf-8"))
+
+            def _serve_raw_upload_manifest(self):
+                """Files currently in the upload TARGET (data_dir/raw.zarr), regardless
+                of whether the store is attached/serving yet — lets an interrupted
+                upload resume by skipping files the hub already received. Returns an
+                empty list (200) when nothing's been received, so resume starts clean."""
+                rp = getattr(hub, "_raw_zarr_path", None)
+                root = rp() if callable(rp) else None
+                files, total = [], 0
+                if root and Path(root).exists():
+                    root = Path(root)
+                    for p in root.rglob("*"):
+                        if p.is_file():
+                            sz = p.stat().st_size
+                            files.append({"path": p.relative_to(root).as_posix(), "size": sz})
+                            total += sz
+                self._send(200, "application/json", json.dumps(
+                    {"count": len(files), "total_bytes": total, "files": files}).encode("utf-8"))
 
             def _serve_raw_file(self, subpath: str):
                 """Serve one file under the raw zarr, byte-range capable so a
@@ -490,6 +510,7 @@ select{width:100%;background:var(--inset);color:var(--ink);border:1px solid var(
   <div class="tg"><span class="cap">Session code</span><span class="code" id="code">—</span></div>
   <div class="tg"><span class="cap">Project</span><span class="proj" id="proj">—</span>
     <span class="subproj" id="subproj"></span></div>
+  <div class="tg"><span class="cap">Raw data</span><span class="proj" id="rawstat">—</span></div>
 </div>
 
 <div id="strip">
@@ -629,6 +650,11 @@ function render(s){
   document.getElementById('subproj').textContent=s.session_subproject?(s.session_subproject+' · crop '+s.crop_size):'';
   document.getElementById('count').textContent=(s.online_count===s.total_count)?(''+s.total_count):(s.online_count+'/'+s.total_count);
   document.getElementById('datadir').textContent=s.data_dir;
+  const rw=s.raw||{};
+  let rtxt='none';
+  if(rw.state==='ready'){rtxt='✓ ready — '+(rw.num_slices||'?')+' slices';}
+  else if(rw.state==='uploading'){rtxt='↑ uploading '+(rw.received_files||0)+' / '+(rw.expected_files||'?')+' files';}
+  document.getElementById('rawstat').textContent=rtxt;
   const t=s.training||{};
   document.getElementById('tround').textContent=t.round||0;
   document.getElementById('tloss').textContent=t.loss?t.loss.toFixed(4):'—';

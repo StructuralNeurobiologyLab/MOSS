@@ -51,8 +51,16 @@ def fetch_manifest(base_url: str, timeout: float = 300.0) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
+def fetch_upload_manifest(base_url: str, timeout: float = 300.0) -> dict:
+    """GET /raw/upload_manifest: files already in the hub's UPLOAD TARGET (even
+    before it's attached/serving). Used for resumable upload — skip what's there."""
+    with _open(base_url.rstrip("/") + "/raw/upload_manifest", timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 def upload_raw(base_url: str, src_dir, progress_cb=None, should_stop=None,
-               timeout: float = 300.0, block_size: int = 1 << 20) -> bool:
+               timeout: float = 300.0, block_size: int = 1 << 20,
+               concurrency: int = 8) -> bool:
     """Upload a local zarr store (src_dir) TO the hub, for the case where the hub
     can't see the owner's data (different machine, no shared filesystem). Mirrors
     download_raw in reverse: POST each file to /raw/upload/<relpath>, streamed;
@@ -70,33 +78,40 @@ def upload_raw(base_url: str, src_dir, progress_cb=None, should_stop=None,
     total_files = len(files)
     total_bytes = sum(p.stat().st_size for p in files)
 
-    # What does the hub already have? (resume) — a partial upload shows up in its
-    # manifest; skip files already present at the right size.
+    # What does the hub already have? (resume) — the UPLOAD manifest lists files in
+    # the target even before it's attached, so an interrupted upload skips what's
+    # already there instead of re-sending everything.
     have = {}
     try:
-        for f in fetch_manifest(base_url, timeout=timeout).get("files", []):
+        for f in fetch_upload_manifest(base_url, timeout=timeout).get("files", []):
             have[f["path"]] = int(f["size"])
     except Exception:
         have = {}
 
-    done_bytes = 0
-    done_files = 0
-    for p in files:
-        rel = p.relative_to(src_dir).as_posix()
-        sz = p.stat().st_size
-        if have.get(rel) == sz:
-            done_bytes += sz
-            done_files += 1
-    if progress_cb:
-        progress_cb(done_bytes, total_bytes, done_files, total_files)
+    import threading
+    lock = threading.Lock()
+    st = {"bytes": 0, "files": 0, "err": None, "stop": False}
 
+    def _emit():
+        if progress_cb:
+            progress_cb(st["bytes"], total_bytes, st["files"], total_files)
+
+    # Partition (resume): skip files the hub already has; queue the rest.
+    todo = []
     for p in files:
-        if should_stop and should_stop():
-            return False
         rel = p.relative_to(src_dir).as_posix()
         sz = p.stat().st_size
         if have.get(rel) == sz:
-            continue  # already on the hub (counted above)
+            st["bytes"] += sz
+            st["files"] += 1
+        else:
+            todo.append((p, rel, sz))
+    _emit()
+
+    def _upload(item):
+        if st["stop"] or (should_stop and should_stop()):
+            return
+        p, rel, sz = item
         url = base_url + "/raw/upload/" + quote(rel)
         with open(p, "rb") as fh:
             req = urllib.request.Request(url, data=fh, method="POST")
@@ -104,28 +119,51 @@ def upload_raw(base_url: str, src_dir, progress_cb=None, should_stop=None,
             req.add_header("Content-Length", str(sz))
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 resp.read()
-        done_bytes += sz
-        done_files += 1
-        if progress_cb:
-            progress_cb(done_bytes, total_bytes, done_files, total_files)
-    return True
+        with lock:
+            st["bytes"] += sz
+            st["files"] += 1
+            _emit()
+
+    _run_parallel(todo, _upload, concurrency, st, lock)
+    if st["err"]:
+        raise st["err"]
+    return not st["stop"] and not (should_stop and should_stop())
+
+
+def _run_parallel(items, fn, concurrency: int, st: dict, lock):
+    """Run fn(item) over items with a bounded thread pool. First exception is
+    captured into st['err'] and sets st['stop'] so the rest wind down. The hub's
+    HTTP server is multi-threaded, so concurrent transfers are a big speedup on a
+    many-small-files zarr."""
+    import threading  # noqa: F401 (lock is a threading.Lock created by the caller)
+    from concurrent.futures import ThreadPoolExecutor
+    if not items:
+        return
+    with ThreadPoolExecutor(max_workers=max(1, int(concurrency))) as ex:
+        futures = [ex.submit(fn, it) for it in items]
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception as e:
+                with lock:
+                    if st["err"] is None:
+                        st["err"] = e
+                    st["stop"] = True
 
 
 def download_raw(base_url: str, dest_dir, progress_cb=None, should_stop=None,
-                 timeout: float = 300.0, block_size: int = 1 << 20) -> bool:
+                 timeout: float = 300.0, block_size: int = 1 << 20,
+                 concurrency: int = 8) -> bool:
     """Resumably download the hub's raw zarr into dest_dir (a local zarr store).
 
-    Args:
-        base_url:    hub console origin, e.g. 'http://10.1.3.45:8080'
-        dest_dir:    local directory to materialize the zarr into (created if needed)
-        progress_cb: optional callable(done_bytes, total_bytes, done_files, total_files)
-        should_stop: optional callable()->bool; True aborts, leaving a resumable partial
-        block_size:  read/write block size
+    Files are fetched CONCURRENTLY (`concurrency` workers) — a big speedup on a
+    many-small-files zarr, since the transfer is otherwise per-file-latency bound.
+    Per-file Range-resume; files already complete are skipped.
 
-    Returns:
-        True if the whole volume is present locally; False if aborted mid-way
-        (call again to resume). Raises on network/IO errors.
+    Returns True when the whole volume is local; False if aborted mid-way (call
+    again to resume). Raises on network/IO errors.
     """
+    import threading
     base_url = base_url.rstrip("/")
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -135,55 +173,55 @@ def download_raw(base_url: str, dest_dir, progress_cb=None, should_stop=None,
     total_files = len(files)
     total_bytes = int(manifest.get("total_bytes", sum(f["size"] for f in files)))
 
-    # Account for anything already on disk (resume): count valid bytes and
-    # completed files so the progress bar starts where the last run stopped.
-    done_bytes = 0
-    done_files = 0
+    lock = threading.Lock()
+    st = {"bytes": 0, "files": 0, "err": None, "stop": False}
+
+    def _emit():
+        if progress_cb:
+            progress_cb(st["bytes"], total_bytes, st["files"], total_files)
+
+    # Partition (resume): count complete files, pre-count partials, queue the rest.
+    todo = []
     for f in files:
         lp = dest_dir / f["path"]
-        if lp.is_file():
-            existing = lp.stat().st_size
-            if existing == f["size"]:
-                done_files += 1
-                done_bytes += f["size"]
-            elif existing < f["size"]:
-                done_bytes += existing        # partial, will resume
-            # existing > size: corrupt overshoot -> refetch clean, count 0 now
+        existing = lp.stat().st_size if lp.is_file() else 0
+        if existing == f["size"]:
+            st["bytes"] += f["size"]
+            st["files"] += 1
+        else:
+            if 0 < existing < f["size"]:
+                st["bytes"] += existing        # partial already on disk
+            todo.append(f)
+    _emit()
 
-    if progress_cb:
-        progress_cb(done_bytes, total_bytes, done_files, total_files)
-
-    for f in files:
-        if should_stop and should_stop():
-            return False
+    def _fetch(f):
+        if st["stop"] or (should_stop and should_stop()):
+            return
         rel, size = f["path"], int(f["size"])
         lp = dest_dir / rel
-        have = lp.stat().st_size if lp.is_file() else 0
-        if have == size:
-            continue                          # already complete (counted above)
         lp.parent.mkdir(parents=True, exist_ok=True)
-
+        have = lp.stat().st_size if lp.is_file() else 0
         headers, mode = {}, "wb"
         if 0 < have < size:
             headers["Range"] = f"bytes={have}-"   # resume this file
             mode = "ab"
         elif have > size:
-            have = 0                              # overshoot -> start over
-
+            have = 0                              # overshoot -> refetch clean
         url = base_url + "/raw/file/" + quote(rel)
         with _open(url, headers=headers, timeout=timeout) as r, open(lp, mode) as out:
             while True:
-                if should_stop and should_stop():
-                    return False
+                if st["stop"] or (should_stop and should_stop()):
+                    return
                 block = r.read(block_size)
                 if not block:
                     break
                 out.write(block)
-                done_bytes += len(block)
-                if progress_cb:
-                    progress_cb(done_bytes, total_bytes, done_files, total_files)
-        done_files += 1
-        if progress_cb:
-            progress_cb(done_bytes, total_bytes, done_files, total_files)
+        with lock:
+            st["bytes"] += (size - have)          # newly written bytes for this file
+            st["files"] += 1
+            _emit()
 
-    return True
+    _run_parallel(todo, _fetch, concurrency, st, lock)
+    if st["err"]:
+        raise st["err"]
+    return not st["stop"] and not (should_stop and should_stop())

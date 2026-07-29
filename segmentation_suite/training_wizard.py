@@ -1321,7 +1321,8 @@ class TrainingWizard(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         size = self._dir_size(raw_path)
-        self._session_client.send_raw_register(str(raw_path), "zarr", size)
+        n_files = self._dir_file_count(raw_path)
+        self._session_client.send_raw_register(str(raw_path), "zarr", size, n_files)
         # Immediate feedback; flips to "shared ✓" when the hub echoes it back
         # (_on_raw_available). Without this the share felt like it did nothing.
         self.session_status_label.setText("● Multi-user OWNER — sharing raw data with the hub…")
@@ -1395,6 +1396,12 @@ class TrainingWizard(QMainWindow):
     def _dir_size(self, path) -> int:
         try:
             return sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
+        except Exception:
+            return 0
+
+    def _dir_file_count(self, path) -> int:
+        try:
+            return sum(1 for f in Path(path).rglob("*") if f.is_file())
         except Exception:
             return 0
 

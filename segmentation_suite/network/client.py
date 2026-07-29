@@ -765,19 +765,20 @@ class SyncClient(QObject):
         except Exception as e:
             _log(f"Failed to send project register: {e}")
 
-    def send_raw_register(self, path: str, fmt: str = "zarr", size_bytes: int = 0):
+    def send_raw_register(self, path: str, fmt: str = "zarr", size_bytes: int = 0,
+                          n_files: int = 0):
         """Owner -> Hub: offer to share the session's raw volume (the hub references
         it in place if it can see `path`, else it needs an upload)."""
         if not self._connected or not self._loop:
             return
         asyncio.run_coroutine_threadsafe(
-            self._send_raw_register_async(path, fmt, size_bytes), self._loop)
+            self._send_raw_register_async(path, fmt, size_bytes, n_files), self._loop)
 
-    async def _send_raw_register_async(self, path, fmt, size_bytes):
+    async def _send_raw_register_async(self, path, fmt, size_bytes, n_files=0):
         if not self._websocket:
             return
         try:
-            msg = create_raw_register_message(path, fmt, size_bytes)
+            msg = create_raw_register_message(path, fmt, size_bytes, n_files)
             async with self._sendlock():
                 await self._websocket.send(msg.to_json())
             _log(f"Sent RAW_REGISTER: {path} ({fmt}, {size_bytes} B)")
