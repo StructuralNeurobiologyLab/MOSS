@@ -1072,14 +1072,20 @@ class HubServer(QObject):
         import shutil
         if not uid or "/" in uid or "\\" in uid or ".." in name or "/" in name:
             return
+        # Crops live in the session's VARIANT folders (train_images_25d /
+        # _dwarf25d for 2.5D/dwarf models) — the same folders the console reads
+        # from. Discarding from the plain train_images silently missed them.
+        suf, _ext = self._session_variant()
         base = self.data_dir / "incoming" / uid
-        for sub in ("train_images", "train_masks"):
+        moved = 0
+        for sub in (f"train_images{suf}", f"train_masks{suf}"):
             src = base / sub / name
             if src.exists():
                 dst_dir = base / "discarded" / sub
                 dst_dir.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(src), str(dst_dir / name))
-        _log(f"discarded crop {uid}/{name}")
+                moved += 1
+        _log(f"discarded crop {uid}/{name} (variant '{suf or '2D'}', {moved} files moved)")
         self._rebuild_timer.start()   # debounced destructive rebuild
 
     # ================================================================ web view
