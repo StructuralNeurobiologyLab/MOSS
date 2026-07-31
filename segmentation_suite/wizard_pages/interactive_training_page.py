@@ -2741,8 +2741,15 @@ class InteractiveTrainingPage(QWidget):
         # Normal TIFF mode: load from memory or disk
         elif idx in self.images:
             self.canvas.set_image(self.images[idx])
-            if idx in self.masks:
+            if idx in self.masks and self.masks[idx] is not None:
                 self.canvas.set_mask(self.masks[idx])
+            else:
+                # No mask for this slice yet -> BLANK the canvas so the previous
+                # slice's mask can't linger. (set_image above already invalidated the
+                # render cache; the async preload fills this slice's mask in via
+                # _on_mask_loaded if a file exists.) Fixes mask bleed across sections.
+                self.canvas.mask = None
+                self.canvas.update()
             self.update_slice_label()
         else:
             # Need to load this image
@@ -2752,8 +2759,11 @@ class InteractiveTrainingPage(QWidget):
             )
             if idx in self.images:
                 self.canvas.set_image(self.images[idx])
-                if idx in self.masks:
+                if idx in self.masks and self.masks[idx] is not None:
                     self.canvas.set_mask(self.masks[idx])
+                else:
+                    self.canvas.mask = None   # blank — don't linger the prior mask
+                    self.canvas.update()
             self.update_slice_label()
 
         # Request prediction for new slice if enabled
