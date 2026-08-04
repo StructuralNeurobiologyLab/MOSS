@@ -653,7 +653,10 @@ class TrainingWizard(QMainWindow):
         arch_label = QLabel("Architecture (all participants will use this):")
         host_settings_layout.addWidget(arch_label)
         arch_combo = QComboBox()
-        arch_id_map = self.training_page._arch_id_to_name  # {id: display_name}
+        # Same exclusion as the hub: a hosted slab session trains only the host's own
+        # crops and silently discards every joiner's, because slab crops are never sent.
+        from .models.architectures import filter_hub_trainable
+        arch_id_map = filter_hub_trainable(self.training_page._arch_id_to_name)
         arch_ids = []
         for arch_id, display_name in arch_id_map.items():
             arch_combo.addItem(display_name)
@@ -1149,7 +1152,11 @@ class TrainingWizard(QMainWindow):
         # this model and every client predicts with it, so they must be identical.
         lay.addWidget(QLabel("Model (used for both training and prediction):"))
         arch_combo = QComboBox()
-        for arch_id, disp in page._arch_id_to_name.items():
+        # Slab models are excluded: hub crop transfer carries only 2D/2.5D variants, so a
+        # slab session would look configured and never train. Note this also means the
+        # owner's current local architecture may not be pre-selectable here.
+        from .models.architectures import filter_hub_trainable
+        for arch_id, disp in filter_hub_trainable(page._arch_id_to_name).items():
             arch_combo.addItem(disp, arch_id)
         ai = arch_combo.findData(getattr(page, 'current_architecture', ''))
         if ai >= 0:

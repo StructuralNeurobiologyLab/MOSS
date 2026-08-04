@@ -467,7 +467,13 @@ class PredictWorker(QThread):
                                              slab_read_indices, trained_z_window)
 
         z_weights = slab_z_weights(patch_depth, z_jitter)
-        z_starts = slab_z_starts(total_z, patch_depth, z_jitter)
+        # A slab model steps by its trained width -- stepping less would only re-average
+        # the same trained planes. A plain 3D model has no untrained margin, so it keeps
+        # honouring `overlap` as it always did: at patch_depth 32 with overlap 64 that is
+        # a stride of 1, i.e. ~32 votes per plane. Dropping that would quietly change
+        # every existing unet_3d prediction.
+        z_stride = None if z_jitter else max(1, patch_depth - overlap)
+        z_starts = slab_z_starts(total_z, patch_depth, z_jitter, stride=z_stride)
         if z_jitter:
             lo, hi = trained_z_window(patch_depth, z_jitter)
             self.log.emit(f"3D slab prediction: {total_z} slices, {h}x{w}, "

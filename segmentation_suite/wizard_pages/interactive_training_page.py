@@ -3246,12 +3246,17 @@ class InteractiveTrainingPage(QWidget):
         return crops
 
     def _slab_stored_depth(self) -> int:
-        """Stored slab depth D + M for the current architecture, or 0 if not a slab model."""
+        """Stored slab depth D + M for the TRAINING architecture, or 0 if not a slab model.
+
+        Keyed on the training architecture alone: captures exist to feed training, so
+        merely predicting with a slab model should not make every 2D capture write an
+        extra 24-plane slab.
+        """
         from ..models.architectures import (is_slab_architecture, get_3d_patch_depth,
                                             get_z_jitter)
-        for arch in (self.current_architecture, self.prediction_architecture):
-            if arch and is_slab_architecture(arch):
-                return get_3d_patch_depth(arch) + get_z_jitter(arch)
+        arch = self.current_architecture
+        if arch and is_slab_architecture(arch):
+            return get_3d_patch_depth(arch) + get_z_jitter(arch)
         return 0
 
     def _read_slab_planes(self, z_indices: list, py: int, px: int,

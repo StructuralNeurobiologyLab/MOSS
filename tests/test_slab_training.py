@@ -329,6 +329,67 @@ def test_untrained_margins_cannot_leak_into_the_result():
     assert np.abs(acc / wsum[:, None, None] - vol).max() < 1e-6
 
 
+def test_plain_3d_still_honours_overlap_in_z():
+    """A slab model steps by its trained width, but a plain 3D model has no untrained
+    margin and must keep averaging over `overlap`. Stepping by the full depth instead
+    silently changed every existing unet_3d prediction from ~32 votes per plane to 1."""
+    depth, overlap, n_z = 32, 64, 200
+    stride = max(1, depth - overlap)          # what predict_worker passes for z_jitter=0
+    w = slab_z_weights(depth, 0)
+    assert int(w.sum()) == depth              # no untrained margin when there is no jitter
+
+    votes = np.zeros(n_z)
+    for start in slab_z_starts(n_z, depth, 0, stride=stride):
+        for j in range(depth):
+            z = start + j
+            if 0 <= z < n_z:
+                votes[z] += w[j]
+    assert (votes > 0).all()
+    assert votes.mean() > 10, f"lost Z overlap averaging: {votes.mean()} votes/plane"
+
+
+def test_stride_larger_than_the_trained_width_is_clamped_not_gapped():
+    n_z, depth = 200, 16
+    for bad in (50, 999):
+        covered = np.zeros(n_z)
+        w = slab_z_weights(depth, M)
+        for start in slab_z_starts(n_z, depth, M, stride=bad):
+            for j in range(depth):
+                z = start + j
+                if 0 <= z < n_z:
+                    covered[z] += w[j]
+        assert (covered > 0).all(), f"stride {bad} left gaps instead of being clamped"
+
+
+def test_hub_pickers_exclude_slab_architectures():
+    """Hub crop transfer carries only 2D/2.5D variants, so a slab session would start,
+    report itself running and never train -- and switching a live session to one stops
+    the trainer that was running."""
+    from segmentation_suite.models.architectures import (
+        filter_hub_trainable, get_available_architectures, is_hub_trainable)
+    assert is_hub_trainable(ARCH) is False
+    assert is_hub_trainable('unet_deep_dice_25d_v2') is True
+
+    visible = get_available_architectures()
+    hub = filter_hub_trainable(visible)
+    assert ARCH in visible, "should still be selectable for LOCAL training"
+    assert ARCH not in hub, "must not be offered by the hub"
+    # nothing else may be dropped
+    assert set(visible) - set(hub) == {ARCH}
+
+
+def test_hub_window_picker_does_not_offer_slab():
+    from segmentation_suite.hub.hub_window import build_prediction_arch_map
+    assert ARCH not in build_prediction_arch_map()
+
+
+def test_is_slab_implies_is_3d():
+    """Volumetric setup is guarded by IS_3D and then read under IS_SLAB, so the two
+    disagreeing would raise NameError deep inside training."""
+    from segmentation_suite.models.architectures import is_3d_architecture
+    assert is_3d_architecture(ARCH)
+
+
 def test_z_jitter_survives_a_checkpoint_round_trip(tmp_path):
     """Without this the predictor falls back to weighting every plane, margins included."""
     from segmentation_suite.models.slab_inference import read_slab_geometry

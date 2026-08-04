@@ -106,6 +106,13 @@ def _load_architectures():
                 _architecture_patch_size[arch_id] = patch_size
 
             if getattr(module, 'IS_SLAB', False):
+                # A slab model is a 3D model. Callers guard the volumetric setup with
+                # IS_3D and then read it under IS_SLAB, so letting the two disagree
+                # would raise NameError deep inside training rather than here.
+                if not getattr(module, 'IS_3D', False):
+                    print(f"Warning: {filepath.name} sets IS_SLAB without IS_3D; "
+                          f"treating it as 3D")
+                    _architecture_is_3d[arch_id] = True
                 _architecture_is_slab[arch_id] = True
             z_jitter = getattr(module, 'Z_JITTER', None)
             if z_jitter is not None:
@@ -283,6 +290,23 @@ def is_slab_architecture(arch_id: str) -> bool:
     """
     _load_architectures()
     return _architecture_is_slab.get(arch_id, False)
+
+
+def is_hub_trainable(arch_id: str) -> bool:
+    """Can the multi-user hub actually train this architecture?
+
+    False for slab models: hub crop transfer carries only the 2D and 2.5D variants, so
+    a slab session would start, report itself running, and never train. Worse, switching
+    a live session to one stops the current trainer and rebuilds the pool, so the run it
+    replaced cannot simply be resumed. Keep them out of the hub's pickers entirely and
+    train them locally.
+    """
+    return not is_slab_architecture(arch_id)
+
+
+def filter_hub_trainable(architectures: Dict[str, str]) -> Dict[str, str]:
+    """Drop everything the hub cannot train from an {arch_id: display_name} map."""
+    return {k: v for k, v in architectures.items() if is_hub_trainable(k)}
 
 
 def get_z_jitter(arch_id: str) -> int:

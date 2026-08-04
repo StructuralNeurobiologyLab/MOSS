@@ -38,13 +38,15 @@ def build_prediction_arch_map() -> dict:
     from ..models.unet import get_available_architectures
     from ..models.architectures import (
         get_available_architectures as _registry_architectures,
-        is_pretrained_architecture,
+        is_pretrained_architecture, filter_hub_trainable,
     )
     architectures = get_available_architectures()
     for arch_id, name in _registry_architectures(include_hidden=True).items():
         if arch_id not in architectures and is_pretrained_architecture(arch_id):
             architectures[arch_id] = name
-    return architectures
+    # Only what the hub can actually train — offering a slab model here would let one
+    # dropdown click stop a live 2D/2.5D run for a session that then never trains.
+    return filter_hub_trainable(architectures)
 
 
 class HubWindow(QMainWindow):

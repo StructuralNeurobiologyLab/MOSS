@@ -60,7 +60,14 @@ class HubTrainer(QObject):
         try:
             import torch
             data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            sd = data.get("model_state_dict", data) if isinstance(data, dict) else data
+            # TrainWorker saves under "model_state"; older/foreign checkpoints may use
+            # "model_state_dict". Checking only the latter made this guard inert, so a
+            # channel-mismatched checkpoint was never archived and load_state_dict
+            # crashed on resume instead.
+            if isinstance(data, dict):
+                sd = data.get("model_state") or data.get("model_state_dict") or data
+            else:
+                sd = data
             w = sd.get("inc.double_conv.0.weight")
             if w is None or w.dim() < 2:
                 return True   # can't determine — let the worker try

@@ -39,15 +39,21 @@ def slab_z_weights(patch_depth: int, z_jitter: int) -> np.ndarray:
     return w
 
 
-def slab_z_starts(n_z: int, patch_depth: int, z_jitter: int):
+def slab_z_starts(n_z: int, patch_depth: int, z_jitter: int, stride: int = None):
     """Slab start indices covering every z in [0, n_z).
 
     Starts may be negative or run past the end; read the slab with clamped indices
     (see slab_read_indices). The final start is snapped so the tail is covered.
+
+    `stride` defaults to the trained width, which is the largest step that still
+    covers every plane. Pass a smaller one to get overlap-averaging -- the plain 3D
+    path does this to honour its `overlap` setting. A larger stride would leave gaps,
+    so it is clamped.
     """
     D = int(patch_depth)
     lo, hi = trained_z_window(D, z_jitter)
-    stride = hi - lo + 1
+    width = hi - lo + 1
+    stride = width if stride is None else max(1, min(int(stride), width))
     first = -lo                 # trained window opens at z = 0
     last = (n_z - 1) - hi       # trained window closes at z = n_z - 1
     if last <= first:

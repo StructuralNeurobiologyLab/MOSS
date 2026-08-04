@@ -1118,11 +1118,15 @@ class HubServer(QObject):
         try:
             from ..models.unet import get_available_architectures
             from ..models.architectures import (
-                get_available_architectures as _reg, is_pretrained_architecture)
+                get_available_architectures as _reg, is_pretrained_architecture,
+                filter_hub_trainable)
             archm = get_available_architectures()
             for aid, nm in _reg(include_hidden=True).items():
                 if aid not in archm and is_pretrained_architecture(aid):
                     archm[aid] = nm
+            # Slab models cannot be trained through the hub (crop transfer carries only
+            # 2D/2.5D), so they must not reach the web console's model picker either.
+            archm = filter_hub_trainable(archm)
             for aid, disp in archm.items():
                 short = disp.replace("UNet ", "").replace("(", "").replace(")", "")
                 models.append({"id": aid, "name": short})

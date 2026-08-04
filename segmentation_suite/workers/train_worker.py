@@ -1650,8 +1650,13 @@ class TrainWorker(QThread):
                                                             patch_size=patch_size_3d,
                                                             fg_ratio=0.5)
                     else:
+                        # uses_z_coord must match the initial construction above: without
+                        # it a z-coord architecture gets one channel too few after the
+                        # first reload and dies on a shape mismatch. The hub reloads on
+                        # every incoming crop, so it hits this almost immediately.
                         train_ds = NucleiPatchDataset(train_images, train_masks, tile=tile_size, fg_ratio=0.5,
-                                                      n_channels=n_channels)
+                                                      n_channels=n_channels,
+                                                      uses_z_coord=add_z_coord)
                     train_loader = DataLoader(
                         train_ds, batch_size=batch_size, shuffle=True,
                         num_workers=0, pin_memory=False

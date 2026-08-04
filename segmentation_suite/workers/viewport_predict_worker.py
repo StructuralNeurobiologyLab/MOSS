@@ -259,6 +259,18 @@ class ViewportPredictWorker(QThread):
             model_n_ch = self._n_channels + (1 if self._uses_z_coord else 0)
             self.model = load_model(temp_path, n_channels=model_n_ch, device=self.device,
                                    architecture=self.architecture)
+
+            if self._is_slab:
+                # Run the model at the depth it was TRAINED at, not whatever the
+                # architecture currently declares, so the live view and folder
+                # prediction (which already reads the checkpoint) cannot disagree.
+                from ..models.slab_inference import read_slab_geometry
+                depth, _jit = read_slab_geometry(temp_path, self.architecture)
+                if depth != self._3d_patch_depth:
+                    print(f"Predictor: slab depth {depth} from checkpoint "
+                          f"(architecture declares {self._3d_patch_depth})")
+                    self._3d_patch_depth = depth
+
             self._last_reload_time = time.time()
             self._last_checkpoint_mtime = os.path.getmtime(self.checkpoint_path)
             self._last_checkpoint_size = orig_size
