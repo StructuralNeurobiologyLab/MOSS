@@ -1291,10 +1291,36 @@ class TrainWorker(QThread):
                                                 z_jitter=z_jitter, fg_ratio=0.5,
                                                 train=True)
                     if not train_ds.volumes:
-                        msg = (f"No usable slab pairs in {train_images}. Capture 3D GT "
-                               f"crops for this architecture (stored depth "
-                               f"{patch_depth + z_jitter}) before training.")
+                        # Slab folders are crop-size suffixed (train_images_512_slab),
+                        # so the commonest cause is capturing at one crop size and
+                        # training at another. Say so, and name the sizes that do have
+                        # data, instead of sending the user to 3D GT mode -- which is
+                        # the one workflow that cannot feed this model.
+                        msg = f"No usable slab pairs in {train_images}."
                         self.log.emit(f"ERROR: {msg}")
+                        try:
+                            import glob as _glob
+                            parent = os.path.dirname(train_images.rstrip('/'))
+                            found = []
+                            for d in sorted(_glob.glob(os.path.join(parent, 'train_images*_slab'))):
+                                n = len([f for f in os.listdir(d)
+                                         if f.lower().endswith(('.tif', '.tiff'))])
+                                if n:
+                                    found.append((os.path.basename(d), n))
+                            if found:
+                                self.log.emit(
+                                    "  Slab crops DO exist, but for a different crop size:")
+                                for name, n in found:
+                                    self.log.emit(f"    {name}: {n} crops")
+                                self.log.emit(
+                                    "  Set the crop size to match, then train again.")
+                            else:
+                                self.log.emit(
+                                    "  Select this architecture and capture crops as usual "
+                                    "(Tab); each capture also writes a slab. Do not use "
+                                    "3D GT mode — its dense masks are incompatible.")
+                        except Exception:
+                            pass
                         self.finished.emit(False, msg)
                         return
                 else:
