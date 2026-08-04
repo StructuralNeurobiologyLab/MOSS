@@ -37,14 +37,46 @@ def test_geometry_defaults_are_valid():
     assert get_z_jitter(ARCH) <= get_3d_patch_depth(ARCH) - 2
 
 
-@pytest.mark.parametrize("depth,jitter", [(8, 8), (16, 20), (14, 8), (6, 4)])
+@pytest.mark.parametrize("depth,jitter", [(8, 8), (16, 20), (14, 8), (6, 4),
+                                          (16, 5), (16, 7), (16, -2)])
 def test_invalid_geometry_is_rejected(depth, jitter):
-    """M >= D-1 puts the label plane outside the slab; D % 4 breaks the skip connections.
+    """M >= D-1 puts the label plane outside the slab; D % 4 breaks the skip
+    connections; an odd M makes the trained range asymmetric so it no longer
+    coincides with the symmetric inference window.
 
     D=8/M=8 is the specific configuration that crashes the Ais reference.
     """
     with pytest.raises(ValueError):
         validate_slab_geometry(ARCH, depth, jitter)
+
+
+def test_geometry_validation_refuses_to_guess_the_z_divisor():
+    """Architectures are exec'd from file and never enter sys.modules, so Z_DOWNSAMPLE
+    must be captured at load time. Silently assuming a divisor would pass a bad depth
+    through to fail inside forward()."""
+    with pytest.raises(ValueError, match="Z_DOWNSAMPLE"):
+        validate_slab_geometry('unet_deep_dice_v2', 16, 8)
+
+
+def test_slab_checkpoint_name_is_not_mistaken_for_the_plain_3d_arch():
+    """'unet_3d' is a substring of 'unet_3d_slab', so a naive substring test picks the
+    wrong architecture and builds a model the weights do not fit."""
+    from segmentation_suite.models.architectures import get_checkpoint_filename
+    name = get_checkpoint_filename(ARCH).lower()
+    assert 'unet_3d' in name          # the trap
+    # mirrors the ordering in segmentation_combined_page._detect_architecture
+    detected = 'unet_3d_slab' if 'unet_3d_slab' in name else (
+        'unet_3d' if 'unet_3d' in name else 'unet')
+    assert detected == ARCH
+
+
+def test_unknown_loss_name_raises_instead_of_falling_back_to_bce():
+    """A mistyped PREFERRED_LOSS would feed the ignore sentinel into plain BCE."""
+    from segmentation_suite.workers.train_worker import get_loss_function
+    for name in ('bce', 'dice', 'bce_dice', 'masked_bce_dice'):
+        assert get_loss_function(name) is not None
+    with pytest.raises(ValueError):
+        get_loss_function('masked_bce_dic')
 
 
 # ------------------------------------------------------------------------ the model
@@ -200,6 +232,29 @@ def test_wrong_depth_slabs_are_skipped_not_silently_cropped(tmp_path):
 
     ds = SlabPatchDataset(str(idir), str(mdir), patch_depth=D, patch_size=16, z_jitter=M)
     assert ds.volumes == ['good.tif']
+
+
+def test_overhanging_crop_pads_the_mask_with_ignore_not_a_reflection(tmp_path):
+    """Reflect-padding the mask would assert real labels over image content that was
+    itself fabricated by the pad."""
+    import tifffile
+    idir, mdir = tmp_path / 'img', tmp_path / 'msk'
+    idir.mkdir(); mdir.mkdir()
+    # stored slab XY (24) smaller than the requested patch (32) forces padding
+    tifffile.imwrite(idir / 'a.tif', np.zeros((D + M, 24, 24), np.float32))
+    mask = np.full((24, 24), 255, np.uint8)
+    tifffile.imwrite(mdir / 'a.tif', mask)
+
+    ds = SlabPatchDataset(str(idir), str(mdir), patch_depth=D, patch_size=32, z_jitter=M)
+    for _ in range(20):
+        _, label = ds[0]
+        plane = label[0][torch.nonzero(
+            (label[0] != IGNORE_LABEL).reshape(D, -1).sum(1)).flatten()[0]]
+        # XY augmentation relocates the pad ring, so assert its area rather than its
+        # position: exactly the 32x32 - 24x24 padded voxels must be ignore, and the
+        # real region (mask was all-foreground) must be labelled 1.
+        assert int((plane == IGNORE_LABEL).sum()) == 32 * 32 - 24 * 24
+        assert int((plane == 1.0).sum()) == 24 * 24
 
 
 def test_dataset_rejects_impossible_geometry(tmp_path):

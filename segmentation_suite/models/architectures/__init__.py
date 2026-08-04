@@ -32,6 +32,7 @@ _architecture_patch_depth: Dict[str, int] = {}  # PATCH_DEPTH for 3D models
 _architecture_patch_size: Dict[str, int] = {}  # PATCH_SIZE for 3D models
 _architecture_is_slab: Dict[str, bool] = {}  # IS_SLAB flag for slab-output 3D models
 _architecture_z_jitter: Dict[str, int] = {}  # Z_JITTER margin for slab models
+_architecture_z_downsample: Dict[str, int] = {}  # Z_DOWNSAMPLE (Z pooling factor)
 _architecture_hidden: Dict[str, bool] = {}  # HIDDEN flag - kept but not shown in UI
 _loaded = False
 
@@ -109,6 +110,11 @@ def _load_architectures():
             z_jitter = getattr(module, 'Z_JITTER', None)
             if z_jitter is not None:
                 _architecture_z_jitter[arch_id] = int(z_jitter)
+            # Captured here rather than looked up later: these modules are exec'd from
+            # file and never land in sys.modules, so there is no way back to them.
+            z_down = getattr(module, 'Z_DOWNSAMPLE', None)
+            if z_down is not None:
+                _architecture_z_downsample[arch_id] = int(z_down)
 
             if getattr(module, 'HIDDEN', False):
                 _architecture_hidden[arch_id] = True
@@ -305,13 +311,14 @@ def validate_slab_geometry(arch_id: str, patch_depth: int = None,
     D = get_3d_patch_depth(arch_id) if patch_depth is None else int(patch_depth)
     M = get_z_jitter(arch_id) if z_jitter is None else int(z_jitter)
 
-    module_pools = None
-    try:
-        from importlib import import_module
-        module_pools = getattr(import_module(f'{__name__}.{arch_id}'), 'Z_DOWNSAMPLE', None)
-    except Exception:
-        pass
-    z_down = module_pools or 4
+    # Recorded at load time. A slab architecture that omits Z_DOWNSAMPLE is a bug: we
+    # would otherwise guess a divisor and let a bad depth through to fail inside
+    # forward(), which is exactly what this function exists to prevent.
+    if arch_id not in _architecture_z_downsample:
+        raise ValueError(
+            f"{arch_id}: declares no Z_DOWNSAMPLE, so PATCH_DEPTH cannot be validated. "
+            f"Add Z_DOWNSAMPLE (the product of the model's Z pooling strides).")
+    z_down = _architecture_z_downsample[arch_id]
 
     if D % z_down:
         raise ValueError(
@@ -319,6 +326,13 @@ def validate_slab_geometry(arch_id: str, patch_depth: int = None,
             f"(Z downsampling); skip connections would not align.")
     if M < 0:
         raise ValueError(f"{arch_id}: Z_JITTER={M} must be >= 0.")
+    if M and M % 2:
+        # An odd margin makes the trained range [D//2-M//2, D//2+(M+1)//2] asymmetric,
+        # while the inference top-hat is symmetric about D//2 -- so one trained plane
+        # gets discarded and the two windows stop coinciding.
+        raise ValueError(
+            f"{arch_id}: Z_JITTER={M} must be even, so the trained Z range stays "
+            f"symmetric about PATCH_DEPTH//2 and matches the inference window.")
     if M and M > D - 2:
         raise ValueError(
             f"{arch_id}: Z_JITTER={M} must be <= PATCH_DEPTH-2 ({D - 2}); "

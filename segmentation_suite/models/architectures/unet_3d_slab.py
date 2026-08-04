@@ -36,10 +36,12 @@ ARCHITECTURE_ID = 'unet_3d_slab'
 ARCHITECTURE_NAME = 'UNet 3D Slab (sparse 2D labels)'
 ARCHITECTURE_DESCRIPTION = (
     "True 3D U-Net that predicts a whole Z-slab, trained from ordinary 2D "
-    "annotations. Stores a slab with a Z margin, jitters the annotated plane's "
-    "position during training, and masks the loss on every unlabelled plane, so "
-    "incomplete 3D labels are never mistaken for background. Needs 3D training "
-    "data (train_images_3d/, train_masks_3d/) captured in 3D GT mode."
+    "annotations. Keep painting one slice at a time: select this architecture and "
+    "each normal crop capture also writes a Z-slab to train_images_slab/, with your "
+    "2D mask beside it. Training jitters the annotated plane through the slab and "
+    "masks the loss on every unlabelled plane, so incomplete 3D labels are never "
+    "mistaken for background. Do NOT use 3D GT mode: its dense mask volumes assert "
+    "background on unpainted planes, which is what this model exists to avoid."
 )
 
 PREFERRED_LOSS = 'masked_bce_dice'

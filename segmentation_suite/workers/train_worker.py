@@ -124,8 +124,15 @@ def get_loss_function(loss_type: str) -> nn.Module:
         return BCEDiceLoss()
     elif loss_type == 'masked_bce_dice':
         return MaskedBCEDiceLoss()
-    else:  # Default to BCE
+    elif loss_type == 'bce':
         return nn.BCEWithLogitsLoss()
+    # Do not quietly fall back to BCE. A mistyped PREFERRED_LOSS on a slab model
+    # would feed the IGNORE_LABEL sentinel straight into plain BCE, dragging every
+    # unlabelled voxel toward 2.0 and saturating the output, with nothing in the log
+    # to say so.
+    raise ValueError(
+        f"Unknown loss '{loss_type}'. Expected one of: "
+        f"bce, dice, bce_dice, masked_bce_dice.")
 
 
 class NucleiPatchDataset(Dataset):
@@ -786,8 +793,15 @@ class SlabPatchDataset(Dataset):
         ps, pm = slab[:, y:y1, x:x1], mask[y:y1, x:x1]
         if ps.shape[1] != n or ps.shape[2] != n:
             pad_y, pad_x = n - ps.shape[1], n - ps.shape[2]
-            ps = np.pad(ps, ((0, 0), (0, pad_y), (0, pad_x)), mode="reflect")
-            pm = np.pad(pm, ((0, pad_y), (0, pad_x)), mode="reflect")
+            # 'reflect' needs at least 2 elements along a padded axis; fall back to
+            # edge replication for a degenerate crop rather than raising in a worker.
+            mode = "reflect" if min(ps.shape[1], ps.shape[2]) > 1 else "edge"
+            ps = np.pad(ps, ((0, 0), (0, pad_y), (0, pad_x)), mode=mode)
+            # The mask pads with the ignore value, not by reflection: the image there is
+            # fabricated, so asserting a real label over it would be supervision on
+            # content that does not exist.
+            pm = np.pad(pm, ((0, pad_y), (0, pad_x)),
+                        mode="constant", constant_values=self.ignore_label)
         return ps, pm
 
     def _jitter_crop(self, slab):
