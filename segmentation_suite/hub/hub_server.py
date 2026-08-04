@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -46,6 +47,21 @@ from ..network.session import generate_session_id, get_local_ip
 def _log(msg: str):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] [Hub] {msg}")
+
+
+# Crop stems come from the sender and are used as filenames, so they are validated
+# rather than trusted: no separators or traversal, and restricted to the character set
+# the web reviewer will serve (_NAME_RE in hub_web.py). Returns "" if unusable, and the
+# caller then falls back to a locally generated name.
+_CROP_STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,95}$")
+
+
+def _safe_crop_stem(crop_id) -> str:
+    """Validate a sender-supplied crop id for use as a filename stem."""
+    s = str(crop_id or "").strip()
+    if not s or '/' in s or '\\' in s or '..' in s:
+        return ""
+    return s if _CROP_STEM_RE.match(s) else ""
 
 
 class _User:
@@ -913,9 +929,15 @@ class HubServer(QObject):
         n_channels = int(payload.get("n_channels", 1))
         suf, ext = self._variant_for_nc(n_channels)
         slice_idx = int(payload.get("slice_index", 0))
-        # Faithful MOSS filename: z-index baked in (train_worker parses 'slice(\d+)'
-        # for z-coord archs), unique seq avoids per-user collisions.
-        stem = f"slice{slice_idx:04d}_cap{self._crop_seq}"
+        # Prefer the sender's own crop id, so the two sides share an identifier and a
+        # client can ask what we already hold and re-send only the gaps. Crops are
+        # already namespaced per user by the incoming/<uid>/ directory, so the sender's
+        # stem cannot collide with another user's. Older clients send nothing here; fall
+        # back to our counter, which keeps the z-index that train_worker parses out of
+        # the filename for the z-coord architectures.
+        stem = _safe_crop_stem(payload.get("crop_id", ""))
+        if not stem:
+            stem = f"slice{slice_idx:04d}_cap{self._crop_seq}"
         base = self.data_dir / "incoming" / uid
         img_dir = base / f"train_images{suf}"
         msk_dir = base / f"train_masks{suf}"

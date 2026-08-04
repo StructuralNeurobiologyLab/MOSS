@@ -403,7 +403,8 @@ def needs_chunking(data: bytes) -> bool:
 def create_training_data_message(user_id: str, display_name: str,
                                   crop_size: int, slice_index: int,
                                   chunk_index: int = 0, total_chunks: int = 1,
-                                  n_channels: int = 1) -> Message:
+                                  n_channels: int = 1,
+                                  crop_id: str = "") -> Message:
     """
     Create a TRAINING_DATA message header.
 
@@ -411,6 +412,12 @@ def create_training_data_message(user_id: str, display_name: str,
     `n_channels` tells the host which crop variant this is: 1 = plain 2D (PNG frame);
     3 = 2.5D stack, 11 = dwarf-2.5D stack (multi-channel LZW-TIFF frame). The host
     routes it to the matching training folder (train_images / _25d / _dwarf25d).
+
+    `crop_id` is the sender's own name for this crop (the same stem it wrote locally).
+    The host stores under it, which is what lets a client later ask what the host
+    already holds and re-send only the gaps. Without it the host names crops from its
+    own counter and the two sides share no identifier to reconcile on. Empty means an
+    older client; the host falls back to its counter.
     """
     import time
     return Message(
@@ -423,6 +430,7 @@ def create_training_data_message(user_id: str, display_name: str,
             "n_channels": int(n_channels),
             "chunk_index": chunk_index,
             "total_chunks": total_chunks,
+            "crop_id": str(crop_id or ""),
             "timestamp": int(time.time() * 1000)
         }
     )

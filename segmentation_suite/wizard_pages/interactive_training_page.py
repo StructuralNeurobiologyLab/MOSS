@@ -2951,7 +2951,8 @@ class InteractiveTrainingPage(QWidget):
             if self._multi_user_enabled and self._sync_client and self._sync_client.is_connected:
                 if not self._is_host:
                     self._send_all_training_variants(
-                        idx, img_crop_uint8, mask_after_crop, crop_y, crop_x, crop_h, crop_w)
+                        idx, img_crop_uint8, mask_after_crop, crop_y, crop_x, crop_h, crop_w,
+                        crop_id=crop_id)
                     status_msg += " (sent to host)"
                 # Host doesn't need to send - crop is already saved locally
 
@@ -3432,15 +3433,20 @@ class InteractiveTrainingPage(QWidget):
         return np.stack(crops, axis=0)
 
     def _send_all_training_variants(self, idx: int, img_crop_2d: np.ndarray, mask,
-                                    crop_y: int, crop_x: int, crop_h: int, crop_w: int):
+                                    crop_y: int, crop_x: int, crop_h: int, crop_w: int,
+                                    crop_id: str = ""):
         """Faithfully mirror MOSS's local capture: send EVERY crop variant to the host
         so the hub can train ANY architecture from one capture and switching the
         session model never orphans crops — 2D (1ch), 2.5D (3ch, z-3/z/z+3), dwarf
         (11ch, spacing 2). The multi-channel stacks are only sent when the volume has
-        the adjacent slices (3D data); a 2D source just sends the single slice."""
+        the adjacent slices (3D data); a 2D source just sends the single slice.
+
+        Every variant carries the same crop_id — the stem this capture wrote locally —
+        so the host stores them under names we can later compare against to find gaps.
+        """
         c = self._sync_client
         # 2D — always
-        c.send_training_data(img_crop_2d, mask, idx)
+        c.send_training_data(img_crop_2d, mask, idx, crop_id=crop_id)
         # 2.5D 3-channel and dwarf 11-channel — same adjacent-slice selection +
         # per-channel normalization as _save_25d_crop.
         for n_flanking, spacing, want_c in ((1, 3, 3), (5, 2, 11)):
@@ -3450,7 +3456,7 @@ class InteractiveTrainingPage(QWidget):
                     continue
                 stack = self._build_25d_stack(slices, crop_y, crop_x, crop_h, crop_w)
                 if stack is not None and stack.shape[0] == want_c:
-                    c.send_training_data(stack, mask, idx)
+                    c.send_training_data(stack, mask, idx, crop_id=crop_id)
             except Exception as e:
                 print(f"[MultiUser] {want_c}ch variant skipped: {e}")
 

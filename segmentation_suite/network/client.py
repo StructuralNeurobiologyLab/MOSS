@@ -933,7 +933,8 @@ class SyncClient(QObject):
         except Exception as e:
             _log(f"Error requesting global model: {e}")
 
-    def send_training_data(self, image_array, mask_array, slice_index: int = 0):
+    def send_training_data(self, image_array, mask_array, slice_index: int = 0,
+                           crop_id: str = ""):
         """
         Send training crop data to the host (client only).
 
@@ -965,11 +966,12 @@ class SyncClient(QObject):
 
         self._pending_crop_sends += 1
         asyncio.run_coroutine_threadsafe(
-            self._send_training_data_async(image_array, mask_array, slice_index),
+            self._send_training_data_async(image_array, mask_array, slice_index, crop_id),
             self._loop
         )
 
-    async def _send_training_data_async(self, image_array, mask_array, slice_index: int):
+    async def _send_training_data_async(self, image_array, mask_array, slice_index: int,
+                                        crop_id: str = ""):
         """Async implementation of send_training_data."""
         if not self._websocket:
             self._pending_crop_sends = max(0, self._pending_crop_sends - 1)
@@ -1002,6 +1004,7 @@ class SyncClient(QObject):
                     crop_size=crop_size,
                     slice_index=slice_index,
                     n_channels=n_channels,
+                    crop_id=crop_id,
                 )
                 await self._websocket.send(header.to_json())
                 await self._websocket.send(img_bytes)
