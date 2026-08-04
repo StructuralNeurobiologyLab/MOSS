@@ -410,7 +410,8 @@ def create_training_data_message(user_id: str, display_name: str,
                                   crop_size: int, slice_index: int,
                                   chunk_index: int = 0, total_chunks: int = 1,
                                   n_channels: int = 1,
-                                  crop_id: str = "") -> Message:
+                                  crop_id: str = "",
+                                  variant: str = None) -> Message:
     """
     Create a TRAINING_DATA message header.
 
@@ -424,22 +425,28 @@ def create_training_data_message(user_id: str, display_name: str,
     already holds and re-send only the gaps. Without it the host names crops from its
     own counter and the two sides share no identifier to reconcile on. Empty means an
     older client; the host falls back to its counter.
+
+    `variant` names the folder suffix this crop belongs in ("" plain 2D, "_25d",
+    "_dwarf25d", "_slab") and is authoritative when present. Channel count alone is not
+    a safe discriminator: a 24-plane slab and a hypothetical 24-channel 2.5D stack are
+    indistinguishable by it, and an unrecognized count used to fall through to the plain
+    2D folder silently. None means an older client, and the host infers from n_channels.
     """
     import time
-    return Message(
-        type=MessageType.TRAINING_DATA,
-        payload={
-            "user_id": user_id,
-            "display_name": display_name,
-            "crop_size": crop_size,
-            "slice_index": slice_index,
-            "n_channels": int(n_channels),
-            "chunk_index": chunk_index,
-            "total_chunks": total_chunks,
-            "crop_id": str(crop_id or ""),
-            "timestamp": int(time.time() * 1000)
-        }
-    )
+    payload = {
+        "user_id": user_id,
+        "display_name": display_name,
+        "crop_size": crop_size,
+        "slice_index": slice_index,
+        "n_channels": int(n_channels),
+        "chunk_index": chunk_index,
+        "total_chunks": total_chunks,
+        "crop_id": str(crop_id or ""),
+        "timestamp": int(time.time() * 1000)
+    }
+    if variant is not None:
+        payload["variant"] = str(variant)
+    return Message(type=MessageType.TRAINING_DATA, payload=payload)
 
 
 def create_crop_inventory_request_message(user_id: str) -> Message:

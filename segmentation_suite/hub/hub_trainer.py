@@ -94,14 +94,6 @@ class HubTrainer(QObject):
     def start(self, resume: bool = True):
         if self.is_running():
             return
-        # Slab models need (D+M, H, W) image slabs, and the hub's crop transfer only
-        # carries 2D and 2.5D variants. Refuse here with the reason rather than letting
-        # the worker resolve an empty pool/train_images_slab and report "no data".
-        from ..models.architectures import is_slab_architecture
-        if is_slab_architecture(self._arch()):
-            print(f"[HubTrainer] cannot train '{self._arch()}': the hub does not "
-                  f"transmit 3D slab crops yet. Train slab models locally.")
-            return
         if self.hub.force_cpu:
             os.environ["FORCE_CPU"] = "1"    # honored by models.unet.get_device()
         ckpt = self.checkpoint_path()
@@ -125,6 +117,8 @@ class HubTrainer(QObject):
             "train_masks_25d": str(pool / "train_masks_25d"),
             "train_images_dwarf25d": str(pool / "train_images_dwarf25d"),
             "train_masks_dwarf25d": str(pool / "train_masks_dwarf25d"),
+            "train_images_slab": str(pool / "train_images_slab"),
+            "train_masks_slab": str(pool / "train_masks_slab"),
             "checkpoint_path": ckpt,
             "architecture": self._arch(),
             "tile_size": self.hub.crop_size or 256,

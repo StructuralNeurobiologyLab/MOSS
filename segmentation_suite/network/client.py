@@ -966,7 +966,7 @@ class SyncClient(QObject):
         return self._pending_crop_sends
 
     def send_training_data(self, image_array, mask_array, slice_index: int = 0,
-                           crop_id: str = ""):
+                           crop_id: str = "", variant: str = None):
         """
         Send training crop data to the host (client only).
 
@@ -998,12 +998,13 @@ class SyncClient(QObject):
 
         self._pending_crop_sends += 1
         asyncio.run_coroutine_threadsafe(
-            self._send_training_data_async(image_array, mask_array, slice_index, crop_id),
+            self._send_training_data_async(image_array, mask_array, slice_index,
+                                           crop_id, variant),
             self._loop
         )
 
     async def _send_training_data_async(self, image_array, mask_array, slice_index: int,
-                                        crop_id: str = ""):
+                                        crop_id: str = "", variant: str = None):
         """Async implementation of send_training_data."""
         if not self._websocket:
             self._pending_crop_sends = max(0, self._pending_crop_sends - 1)
@@ -1037,6 +1038,7 @@ class SyncClient(QObject):
                     slice_index=slice_index,
                     n_channels=n_channels,
                     crop_id=crop_id,
+                    variant=variant,
                 )
                 await self._websocket.send(header.to_json())
                 await self._websocket.send(img_bytes)

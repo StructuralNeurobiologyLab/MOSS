@@ -295,13 +295,14 @@ def is_slab_architecture(arch_id: str) -> bool:
 def is_hub_trainable(arch_id: str) -> bool:
     """Can the multi-user hub actually train this architecture?
 
-    False for slab models: hub crop transfer carries only the 2D and 2.5D variants, so
-    a slab session would start, report itself running, and never train. Worse, switching
-    a live session to one stops the current trainer and rebuilds the pool, so the run it
-    replaced cannot simply be resumed. Keep them out of the hub's pickers entirely and
-    train them locally.
+    An architecture is hub-trainable once clients transmit its crop variant and the hub
+    files it in a matching folder. Nothing is excluded at present: slab models were,
+    until crop transfer learned to carry the "_slab" variant.
+
+    Kept as the single place to exclude an architecture again, so the pickers, the
+    session-model setter and the trainer cannot drift apart on the question.
     """
-    return not is_slab_architecture(arch_id)
+    return True
 
 
 def filter_hub_trainable(architectures: Dict[str, str]) -> Dict[str, str]:

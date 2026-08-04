@@ -361,26 +361,60 @@ def test_stride_larger_than_the_trained_width_is_clamped_not_gapped():
         assert (covered > 0).all(), f"stride {bad} left gaps instead of being clamped"
 
 
-def test_hub_pickers_exclude_slab_architectures():
-    """Hub crop transfer carries only 2D/2.5D variants, so a slab session would start,
-    report itself running and never train -- and switching a live session to one stops
-    the trainer that was running."""
+def test_hub_can_now_train_slab_and_offers_it():
+    """Slab was excluded while crop transfer carried only 2D/2.5D variants. It now sends
+    a "_slab" variant, so the hub must offer it rather than silently drop it."""
     from segmentation_suite.models.architectures import (
         filter_hub_trainable, get_available_architectures, is_hub_trainable)
-    assert is_hub_trainable(ARCH) is False
-    assert is_hub_trainable('unet_deep_dice_25d_v2') is True
-
+    assert is_hub_trainable(ARCH) is True
     visible = get_available_architectures()
-    hub = filter_hub_trainable(visible)
-    assert ARCH in visible, "should still be selectable for LOCAL training"
-    assert ARCH not in hub, "must not be offered by the hub"
-    # nothing else may be dropped
-    assert set(visible) - set(hub) == {ARCH}
+    assert set(filter_hub_trainable(visible)) == set(visible)
 
 
-def test_hub_window_picker_does_not_offer_slab():
+def test_hub_window_picker_offers_slab():
     from segmentation_suite.hub.hub_window import build_prediction_arch_map
-    assert ARCH not in build_prediction_arch_map()
+    assert ARCH in build_prediction_arch_map()
+
+
+def test_hub_routes_each_variant_to_its_own_folder():
+    """The host must place a crop by its declared variant, and refuse one it cannot
+    place. Inferring from channel count alone sent unknown counts to the plain-2D
+    folder, where a 24-plane slab would train as a 24-channel 2D image."""
+    from segmentation_suite.hub.hub_server import HubServer
+    place = HubServer._variant_for_payload
+
+    class H:
+        _KNOWN_VARIANTS = HubServer._KNOWN_VARIANTS
+        _VARIANT_BY_NC = HubServer._VARIANT_BY_NC
+        _variant_for_nc = HubServer._variant_for_nc
+
+    h = H()
+    assert place(h, {"variant": "", "n_channels": 1}) == ("", "tif")
+    assert place(h, {"variant": "_25d", "n_channels": 3}) == ("_25d", "tif")
+    assert place(h, {"variant": "_dwarf25d", "n_channels": 11}) == ("_dwarf25d", "tif")
+    assert place(h, {"variant": "_slab", "n_channels": 24}) == ("_slab", "tif")
+    # an unknown declared variant is refused, not guessed
+    assert place(h, {"variant": "_bogus", "n_channels": 3}) is None
+    # older clients (no declared variant) still infer from channel count
+    assert place(h, {"n_channels": 11}) == ("_dwarf25d", "tif")
+    # ...but an unrecognized count is now refused instead of silently becoming 2D
+    assert place(h, {"n_channels": 24}) is None
+
+
+def test_session_variant_maps_slab_to_its_own_suffix():
+    """If a slab session fell through to ("", "tif"), pooling, per-user counting and
+    discard would all operate on the 2D folder instead."""
+    from segmentation_suite.hub.hub_server import HubServer
+
+    class H:
+        prediction_model = ARCH
+        architecture = None
+    assert HubServer._session_variant(H()) == ("_slab", "tif")
+
+    class H2:
+        prediction_model = 'unet_deep_dice_dwarf25d_v2'
+        architecture = None
+    assert HubServer._session_variant(H2()) == ("_dwarf25d", "tif")
 
 
 def test_is_slab_implies_is_3d():

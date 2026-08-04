@@ -235,8 +235,28 @@ class HubServer(QObject):
     # n_channels from the architecture and reads the matching folder.
     _VARIANT_BY_NC = {1: ("", "tif"), 3: ("_25d", "tif"), 11: ("_dwarf25d", "tif")}
 
+    # Suffixes a crop may legitimately be filed under. Clients name their variant
+    # explicitly; this is what makes an unknown one rejectable rather than guessed at.
+    _KNOWN_VARIANTS = ("", "_25d", "_dwarf25d", "_slab")
+
     def _variant_for_nc(self, n_channels: int):
-        return self._VARIANT_BY_NC.get(int(n_channels), ("", "tif"))
+        """Legacy inference for clients that do not name their variant.
+
+        Returns None for an unrecognized channel count. It used to return the plain-2D
+        folder, so e.g. a 24-plane slab would have been written into train_images/ and
+        trained as a 24-channel 2D image with nothing in the log.
+        """
+        return self._VARIANT_BY_NC.get(int(n_channels))
+
+    def _variant_for_payload(self, payload):
+        """(suffix, ext) for an incoming crop, or None if it cannot be placed."""
+        declared = payload.get("variant")
+        if declared is not None:
+            declared = str(declared)
+            if declared not in self._KNOWN_VARIANTS:
+                return None
+            return (declared, "tif")
+        return self._variant_for_nc(int(payload.get("n_channels", 1)))
 
     def _session_variant(self):
         """(dir-suffix, ext) for the session's locked architecture — the variant all
@@ -245,6 +265,10 @@ class HubServer(QObject):
         disagree — e.g. after a resume where architecture lags the switched model.
         All crops are LZW TIFF (MOSS's format), so ext is always 'tif'."""
         a = (self.prediction_model or self.architecture or "").lower()
+        # Slab first: it is neither a 2D nor a 2.5D variant, and letting it fall through
+        # to ("", "tif") would point pooling, counting and discard at the 2D folder.
+        if "slab" in a:
+            return ("_slab", "tif")
         if "dwarf25d" in a:
             return ("_dwarf25d", "tif")
         if "25d" in a:
@@ -952,9 +976,15 @@ class HubServer(QObject):
         if self.crop_size and incoming_cs and incoming_cs != self.crop_size:
             _log(f"SKIP crop from {user.display_name}: {incoming_cs} != locked {self.crop_size}")
             return
-        self._crop_seq += 1
         n_channels = int(payload.get("n_channels", 1))
-        suf, ext = self._variant_for_nc(n_channels)
+        placed = self._variant_for_payload(payload)
+        if placed is None:
+            _log(f"SKIP crop from {user.display_name}: cannot place variant "
+                 f"{payload.get('variant')!r} / {n_channels}ch. Writing it to the "
+                 f"plain-2D folder would train it as a {n_channels}-channel 2D image.")
+            return
+        suf, ext = placed
+        self._crop_seq += 1
         slice_idx = int(payload.get("slice_index", 0))
         # Prefer the sender's own crop id, so the two sides share an identifier and a
         # client can ask what we already hold and re-send only the gaps. Crops are

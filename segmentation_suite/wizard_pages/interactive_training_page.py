@@ -3510,15 +3510,18 @@ class InteractiveTrainingPage(QWidget):
         m = re.search(r'slice(\d+)', stem)
         idx = int(m.group(1)) if m else 0
 
+        # Each entry names the host-side folder suffix explicitly. Without it the host
+        # infers from channel count and refuses anything it does not recognize, so a
+        # re-sent slab (24 planes) would be dropped.
         variants = [
-            (self.train_images_dir, self.train_masks_dir),
-            (self.train_images_25d_dir, self.train_masks_25d_dir),
-            (self.train_images_dwarf25d_dir, self.train_masks_dwarf25d_dir),
-            (self.train_images_slab_dir, self.train_masks_slab_dir),
+            (self.train_images_dir, self.train_masks_dir, ""),
+            (self.train_images_25d_dir, self.train_masks_25d_dir, "_25d"),
+            (self.train_images_dwarf25d_dir, self.train_masks_dwarf25d_dir, "_dwarf25d"),
+            (self.train_images_slab_dir, self.train_masks_slab_dir, "_slab"),
         ]
 
         sent_any = False
-        for img_dir, msk_dir in variants:
+        for img_dir, msk_dir, suffix in variants:
             if not img_dir or not msk_dir:
                 continue
             ip, mp = img_dir / f"{stem}.tif", msk_dir / f"{stem}.tif"
@@ -3532,7 +3535,8 @@ class InteractiveTrainingPage(QWidget):
                 continue
             if mask.ndim == 3:
                 mask = mask[0] if mask.shape[0] <= 4 else mask[..., 0]
-            self._sync_client.send_training_data(img, mask, idx, crop_id=stem)
+            self._sync_client.send_training_data(img, mask, idx, crop_id=stem,
+                                                 variant=suffix)
             sent_any = True
 
         return sent_any
@@ -3550,20 +3554,71 @@ class InteractiveTrainingPage(QWidget):
         so the host stores them under names we can later compare against to find gaps.
         """
         c = self._sync_client
+        # Each variant names its own folder rather than letting the host guess from the
+        # channel count — a slab and a same-depth 2.5D stack are indistinguishable by it.
         # 2D — always
-        c.send_training_data(img_crop_2d, mask, idx, crop_id=crop_id)
+        c.send_training_data(img_crop_2d, mask, idx, crop_id=crop_id, variant="")
         # 2.5D 3-channel and dwarf 11-channel — same adjacent-slice selection +
         # per-channel normalization as _save_25d_crop.
-        for n_flanking, spacing, want_c in ((1, 3, 3), (5, 2, 11)):
+        for n_flanking, spacing, want_c, suffix in ((1, 3, 3, "_25d"),
+                                                    (5, 2, 11, "_dwarf25d")):
             try:
                 slices = self._load_adjacent_slices(idx, n_flanking=n_flanking, spacing=spacing)
                 if not slices:
                     continue
                 stack = self._build_25d_stack(slices, crop_y, crop_x, crop_h, crop_w)
                 if stack is not None and stack.shape[0] == want_c:
-                    c.send_training_data(stack, mask, idx, crop_id=crop_id)
+                    c.send_training_data(stack, mask, idx, crop_id=crop_id,
+                                         variant=suffix)
             except Exception as e:
                 print(f"[MultiUser] {want_c}ch variant skipped: {e}")
+
+        # 3D slab — contiguous planes, normalized across the WHOLE slab. Deliberately
+        # not built with _build_25d_stack: that normalizes each plane independently,
+        # which flattens exactly the Z intensity structure the 3D convolutions use.
+        stored_depth = self._slab_stored_depth_for_hub()
+        if stored_depth:
+            try:
+                slab = self._build_slab_stack(idx, crop_y, crop_x, crop_h, crop_w,
+                                              stored_depth)
+                if slab is not None:
+                    c.send_training_data(slab, mask, idx, crop_id=crop_id,
+                                         variant="_slab")
+            except Exception as e:
+                print(f"[MultiUser] slab variant skipped: {e}")
+
+    def _slab_stored_depth_for_hub(self) -> int:
+        """Stored slab depth to transmit, independent of the local training model.
+
+        Captures are sent for EVERY architecture so one capture can train any of them
+        and switching the session model never orphans crops. The depth therefore comes
+        from the slab architecture itself, not from what happens to be selected here.
+        """
+        from ..models.architectures import (get_available_architectures,
+                                            is_slab_architecture,
+                                            get_3d_patch_depth, get_z_jitter)
+        for arch in get_available_architectures(include_hidden=True):
+            if is_slab_architecture(arch):
+                return get_3d_patch_depth(arch) + get_z_jitter(arch)
+        return 0
+
+    def _build_slab_stack(self, idx: int, crop_y: int, crop_x: int,
+                          crop_h: int, crop_w: int, stored_depth: int):
+        """(stored_depth, H, W) uint8 slab centred so the annotated plane is at the
+        stored centre — the same layout and normalization _save_slab_crop writes."""
+        half = stored_depth // 2
+        total = len(self.image_files) if self.image_files else 0
+        if total < 1:
+            return None
+        z_indices = [max(0, min(total - 1, z))
+                     for z in range(idx - half, idx - half + stored_depth)]
+        planes = self._read_slab_planes(z_indices, crop_y, crop_x, crop_h, crop_w)
+        if planes is None:
+            return None
+        slab = np.stack(planes, axis=0).astype(np.float32)
+        lo, hi = slab.min(), slab.max()
+        return (((slab - lo) / (hi - lo) * 255).astype(np.uint8)
+                if hi > lo else slab.astype(np.uint8))
 
     def reset_model(self):
         """Reset the model - archive old checkpoint and start fresh."""
