@@ -3254,6 +3254,46 @@ class InteractiveTrainingPage(QWidget):
                 return get_3d_patch_depth(arch) + get_z_jitter(arch)
         return 0
 
+    def _read_slab_planes(self, z_indices: list, py: int, px: int,
+                          crop_h: int, crop_w: int):
+        """Read just the crop window from each of z_indices. Returns a list or None.
+
+        Reads the window rather than whole slices: a slab is tens of planes deep, and
+        pulling full-resolution slices for each one would cost gigabytes on a large
+        volume (and evict the slice cache the annotator is using).
+        """
+        planes = []
+        for z in z_indices:
+            arr = None
+            try:
+                if self.use_zarr and self.zarr_source is not None:
+                    arr, _ = self.zarr_source.get_tile_native(
+                        z, py, py + crop_h, px, px + crop_w, pyramid_level=0)
+                elif z in self.images:
+                    full = self.images[z]
+                    if py + crop_h > full.shape[0] or px + crop_w > full.shape[1]:
+                        return None
+                    arr = full[py:py + crop_h, px:px + crop_w]
+                elif self.image_files and z < len(self.image_files):
+                    full = np.array(Image.open(self.image_files[z]))
+                    if full.ndim == 3:
+                        full = full.mean(axis=-1)
+                    if py + crop_h > full.shape[0] or px + crop_w > full.shape[1]:
+                        return None
+                    arr = full[py:py + crop_h, px:px + crop_w]
+            except Exception as e:
+                print(f"[slab] failed to read plane {z}: {e}")
+                return None
+
+            if arr is None:
+                return None
+            if arr.ndim == 3:
+                arr = arr.mean(axis=-1)
+            if arr.shape != (crop_h, crop_w):
+                return None
+            planes.append(np.asarray(arr, dtype=np.float32))
+        return planes
+
     def _save_slab_crop(self, slice_idx: int, mask_crop: np.ndarray,
                         py: int, px: int, crop_h: int, crop_w: int,
                         crop_id: str, stored_depth: int) -> bool:
@@ -3274,28 +3314,23 @@ class InteractiveTrainingPage(QWidget):
 
         # stored_depth // 2 slices below, the rest above -> annotated slice lands at
         # index stored_depth // 2 for odd and even depths alike (matches Ais extract_box).
+        # Out-of-volume Z is clamped, so a slice near either end still yields a full slab.
         half = stored_depth // 2
-        slices = self._load_adjacent_slices(slice_idx, n_flanking=half, spacing=1)
-        if slices is None:
-            print(f"[slab] no slab for {crop_id}: could not load "
-                  f"{2 * half + 1} slices around {slice_idx}")
+        total = len(self.image_files) if self.image_files else 0
+        if total < 1:
             return False
-        slices = slices[:stored_depth]
-        if len(slices) != stored_depth:
-            print(f"[slab] no slab for {crop_id}: got {len(slices)} slices, "
-                  f"need {stored_depth}")
+        z_indices = [max(0, min(total - 1, z))
+                     for z in range(slice_idx - half, slice_idx - half + stored_depth)]
+
+        planes = self._read_slab_planes(z_indices, py, px, crop_h, crop_w)
+        if planes is None:
+            print(f"[slab] no slab for {crop_id}: could not read "
+                  f"{stored_depth} planes around {slice_idx}")
             return False
 
         try:
             import tifffile
 
-            planes = []
-            for s in slices:
-                h, w = s.shape
-                if py + crop_h > h or px + crop_w > w:
-                    print(f"[slab] no slab for {crop_id}: crop outside slice bounds")
-                    return False
-                planes.append(s[py:py + crop_h, px:px + crop_w])
             slab = np.stack(planes, axis=0).astype(np.float32)
 
             # Normalize over the WHOLE slab, not per plane: per-plane scaling would
