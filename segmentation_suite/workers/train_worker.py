@@ -735,8 +735,12 @@ class SlabPatchDataset(Dataset):
                 continue
 
             try:
-                img = tifffile.imread(ip).astype(np.float32)
-                mask = tifffile.imread(mp).astype(np.float32)
+                # Kept in their native dtype (uint8 on disk). Promoting to float32 here
+                # would quadruple the cache, and DataLoader workers spawn rather than
+                # fork on macOS/py3.13+, so the whole cache is pickled through a pipe to
+                # every worker. Cast per sample in __getitem__ instead.
+                img = tifffile.imread(ip)
+                mask = tifffile.imread(mp)
             except Exception as e:
                 print(f"Failed to read slab pair {fname}: {e}")
                 continue
@@ -762,8 +766,9 @@ class SlabPatchDataset(Dataset):
                 continue
 
             # Binarize the 2D annotation only. Binarizing after building the label slab
-            # would turn every ignore voxel into foreground.
-            mask = (mask > 0.5).astype(np.float32)
+            # would turn every ignore voxel into foreground. uint8 holds {0,1} and the
+            # ignore value 2 fine, and keeps the cache small.
+            mask = (mask > 0.5).astype(np.uint8)
 
             self._img_cache[ip] = img
             self._mask_cache[mp] = mask
@@ -870,6 +875,11 @@ class SlabPatchDataset(Dataset):
 
         slab, mask = self._crop_xy(slab, mask, y, x)
         slab, z_lab = self._jitter_crop(slab)
+
+        # Cast only the small cropped patch, and before any arithmetic: subtracting on
+        # uint8 would wrap around instead of going negative.
+        slab = slab.astype(np.float32)
+        mask = mask.astype(np.float32)
 
         lo, hi = slab.min(), slab.max()
         slab = (slab - lo) / (hi - lo + 1e-8)
@@ -1362,6 +1372,18 @@ class TrainWorker(QThread):
                 train_workers, val_workers = 4, 2
                 use_persistent = False
                 use_pin_memory = False
+
+            if is_slab:
+                # Slab volumes are large and the dataset caches them, so with the spawn
+                # start method (macOS, and Python 3.14 everywhere) DataLoader pickles the
+                # whole cache down a pipe to every worker at each epoch start -- hundreds
+                # of MB per worker, which is enough to take the process down. Loading in
+                #-process costs little here: a sample is one small crop plus a Z shift.
+                cache_mb = sum(a.nbytes for a in train_ds._img_cache.values()) / 1e6
+                self.log.emit(f"  Slab cache {cache_mb:.0f} MB held in-process; "
+                              f"using 0 dataloader workers to avoid copying it per worker")
+                train_workers, val_workers = 0, 0
+                use_persistent = False
 
             train_loader = DataLoader(
                 train_ds, batch_size=batch_size, shuffle=True,
