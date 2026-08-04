@@ -91,6 +91,11 @@ class SyncClient(QObject):
     model_requested = pyqtSignal(str)  # user_id - emitted when another user requests model (relay mode)
     user_joined_room = pyqtSignal(str)  # display_name - emitted when a user joins (relay mode)
 
+    # Ceiling on queued crop-variant sends. Counted in variants: with 2D + 2.5D + dwarf
+    # + slab that is 4 per capture, so 32 is roughly 8 captures in flight. Sized so the
+    # worst case (all slab, ~14 MB of array + bytes each) stays well under a GB.
+    MAX_PENDING_CROP_SENDS = 32
+
     # New signals for multi-user redesign
     training_data_received = pyqtSignal(bytes, bytes, dict)  # image_bytes, mask_bytes, metadata (host only)
 
@@ -158,6 +163,10 @@ class SyncClient(QObject):
         # image and mask got swapped when the 2D / 2.5D / dwarf variants of one
         # capture were sent back-to-back. Hold this across all frames of a message.
         self._send_lock: Optional[asyncio.Lock] = None
+        # Crop-send backpressure. One capture queues every architecture variant, so this
+        # counts variant sends, not captures.
+        self._pending_crop_sends = 0
+        self._dropped_crop_sends = 0
 
     def _sendlock(self) -> asyncio.Lock:
         """Lazily create the send lock on the client's event-loop thread. Safe to
@@ -940,6 +949,21 @@ class SyncClient(QObject):
             self.error.emit("Not connected")
             return
 
+        # Bound the backlog. Sends are fire-and-forget onto the event loop, so capturing
+        # faster than the link drains used to grow memory without limit -- one capture
+        # queues every architecture variant, and a slab variant is ~6 MB of array plus
+        # ~8 MB of compressed bytes. Refuse rather than accumulate, and say so: a
+        # dropped crop the user knows about is recoverable, a silent 1 GB backlog is not.
+        if self._pending_crop_sends >= self.MAX_PENDING_CROP_SENDS:
+            self._dropped_crop_sends += 1
+            self.sync_status.emit(
+                f"Crop send backlog full ({self._pending_crop_sends} queued) — "
+                f"{self._dropped_crop_sends} not sent. Pause capturing to let it drain.")
+            _log(f"DROPPED crop send: {self._pending_crop_sends} already queued "
+                 f"(total dropped {self._dropped_crop_sends})")
+            return
+
+        self._pending_crop_sends += 1
         asyncio.run_coroutine_threadsafe(
             self._send_training_data_async(image_array, mask_array, slice_index),
             self._loop
@@ -948,6 +972,7 @@ class SyncClient(QObject):
     async def _send_training_data_async(self, image_array, mask_array, slice_index: int):
         """Async implementation of send_training_data."""
         if not self._websocket:
+            self._pending_crop_sends = max(0, self._pending_crop_sends - 1)
             return
 
         try:
@@ -961,21 +986,23 @@ class SyncClient(QObject):
                 n_channels = 1
                 crop_size = int(image_array.shape[0]) if image_array.ndim >= 2 else 256
 
-            # Serialize the training data (PNG for 2D, LZW-TIFF stack for multi-channel)
-            img_bytes, mask_bytes = serialize_training_data(image_array, mask_array)
-
-            # Create message header (n_channels tells the host which variant folder to use)
-            header = create_training_data_message(
-                user_id=self.user_id,
-                display_name=self.display_name,
-                crop_size=crop_size,
-                slice_index=slice_index,
-                n_channels=n_channels,
-            )
-
             # Send header + image + mask as one atomic unit so a concurrent
             # variant send can't interleave and swap image/mask frames.
+            #
+            # Compress INSIDE the lock. Every queued send used to serialize on arrival
+            # and then wait here holding its compressed bytes as well as its source
+            # array, so a burst of captures held both copies of every pending variant at
+            # once. Deep slab variants make that expensive fast (~8 MB of bytes on top of
+            # a 6 MB array each), and only the send actually in flight needs its bytes.
             async with self._sendlock():
+                img_bytes, mask_bytes = serialize_training_data(image_array, mask_array)
+                header = create_training_data_message(
+                    user_id=self.user_id,
+                    display_name=self.display_name,
+                    crop_size=crop_size,
+                    slice_index=slice_index,
+                    n_channels=n_channels,
+                )
                 await self._websocket.send(header.to_json())
                 await self._websocket.send(img_bytes)
                 await self._websocket.send(mask_bytes)
@@ -988,6 +1015,10 @@ class SyncClient(QObject):
             self.error.emit(f"Failed to send training data: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            # Must decrement on every path, or one failed send permanently shrinks the
+            # window and enough of them wedge sending shut.
+            self._pending_crop_sends = max(0, self._pending_crop_sends - 1)
 
     @property
     def is_connected(self) -> bool:
