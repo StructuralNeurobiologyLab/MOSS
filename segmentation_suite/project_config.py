@@ -211,6 +211,8 @@ SUBPROJECT_DIRS = [
     "train_masks_dwarf25d",
     "train_images_3d",
     "train_masks_3d",
+    "train_images_slab",
+    "train_masks_slab",
     "sam2_features",
 ]
 
@@ -413,7 +415,7 @@ def get_training_folder_names(tile_size: int = 256) -> dict:
 
     256 is the legacy default (no suffix). 128 and 512 get a size suffix.
     Returns dict with keys: images, masks, images_25d, masks_25d,
-    images_dwarf25d, masks_dwarf25d.
+    images_dwarf25d, masks_dwarf25d, images_slab, masks_slab.
     """
     suffix = "" if tile_size == 256 else f"_{tile_size}"
     return {
@@ -423,6 +425,11 @@ def get_training_folder_names(tile_size: int = 256) -> dict:
         "masks_25d": f"train_masks{suffix}_25d",
         "images_dwarf25d": f"train_images{suffix}_dwarf25d",
         "masks_dwarf25d": f"train_masks{suffix}_dwarf25d",
+        # 3D slab models: images are (D+M, H, W) slabs, masks stay the ordinary 2D
+        # annotation. Kept apart from train_images_3d, which the multi-slice 3D GT
+        # mode fills with dense mask volumes.
+        "images_slab": f"train_images{suffix}_slab",
+        "masks_slab": f"train_masks{suffix}_slab",
     }
 
 
@@ -451,6 +458,8 @@ def get_subproject_paths(project_dir: str, subproject_name: str, tile_size: int 
         "train_masks_dwarf25d_dir": sp_dir / folders["masks_dwarf25d"],
         "train_images_3d_dir": sp_dir / "train_images_3d",
         "train_masks_3d_dir": sp_dir / "train_masks_3d",
+        "train_images_slab_dir": sp_dir / folders["images_slab"],
+        "train_masks_slab_dir": sp_dir / folders["masks_slab"],
         "sam2_features_dir": sp_dir / "sam2_features",
     }
 

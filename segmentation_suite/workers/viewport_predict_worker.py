@@ -56,6 +56,7 @@ class ViewportPredictWorker(QThread):
         self._is_sam2 = False
         self._is_lsd = False  # LSD boundary model needs watershed post-processing
         self._is_3d = False
+        self._is_slab = False
         self._n_channels = 1
         self._uses_z_coord = False
         self._3d_patch_depth = 32
@@ -112,8 +113,10 @@ class ViewportPredictWorker(QThread):
             self._is_lsd = 'lsd' in architecture.lower()  # LSD needs watershed
             # Get n_channels from architecture metadata
             from ..models.architectures import (get_n_context_slices, uses_z_coord,
-                                                 is_3d_architecture, get_3d_patch_depth, get_3d_patch_size)
+                                                 is_3d_architecture, get_3d_patch_depth, get_3d_patch_size,
+                                                 is_slab_architecture)
             self._is_3d = is_3d_architecture(architecture)
+            self._is_slab = is_slab_architecture(architecture)
             if self._is_3d:
                 self._n_channels = 1
                 self._uses_z_coord = False
@@ -598,6 +601,17 @@ class ViewportPredictWorker(QThread):
             vol = volume.astype(np.float32)
             center_z = vol.shape[0] // 2
 
+            if self._is_slab:
+                # A slab model is only trustworthy in the middle of its slab, so give it
+                # exactly patch_depth planes with the requested slice at index D//2 -- the
+                # centre of the trained Z window. Reflect-padding to a multiple of 16
+                # instead (below) would slide that slice off the trained range.
+                D = self._3d_patch_depth
+                idx = np.clip(np.arange(center_z - D // 2, center_z - D // 2 + D),
+                              0, vol.shape[0] - 1)
+                vol = vol[idx]
+                center_z = D // 2
+
             # Normalize
             v_min, v_max = vol.min(), vol.max()
             if v_max > v_min:
@@ -605,7 +619,7 @@ class ViewportPredictWorker(QThread):
 
             # Pad to multiple of 16 (3D model has fewer levels, needs less padding)
             d, h, w = vol.shape
-            pad_d = (16 - d % 16) % 16
+            pad_d = 0 if self._is_slab else (16 - d % 16) % 16
             pad_h = (16 - h % 16) % 16
             pad_w = (16 - w % 16) % 16
             if pad_d > 0 or pad_h > 0 or pad_w > 0:

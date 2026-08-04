@@ -30,6 +30,8 @@ _architecture_uses_z_coord: Dict[str, bool] = {}  # USES_Z_COORD flag
 _architecture_is_3d: Dict[str, bool] = {}  # IS_3D flag for volumetric models
 _architecture_patch_depth: Dict[str, int] = {}  # PATCH_DEPTH for 3D models
 _architecture_patch_size: Dict[str, int] = {}  # PATCH_SIZE for 3D models
+_architecture_is_slab: Dict[str, bool] = {}  # IS_SLAB flag for slab-output 3D models
+_architecture_z_jitter: Dict[str, int] = {}  # Z_JITTER margin for slab models
 _architecture_hidden: Dict[str, bool] = {}  # HIDDEN flag - kept but not shown in UI
 _loaded = False
 
@@ -101,6 +103,12 @@ def _load_architectures():
             patch_size = getattr(module, 'PATCH_SIZE', None)
             if patch_size is not None:
                 _architecture_patch_size[arch_id] = patch_size
+
+            if getattr(module, 'IS_SLAB', False):
+                _architecture_is_slab[arch_id] = True
+            z_jitter = getattr(module, 'Z_JITTER', None)
+            if z_jitter is not None:
+                _architecture_z_jitter[arch_id] = int(z_jitter)
 
             if getattr(module, 'HIDDEN', False):
                 _architecture_hidden[arch_id] = True
@@ -259,3 +267,59 @@ def get_3d_patch_size(arch_id: str) -> int:
     """Get the XY size for 3D model patches. Default 128."""
     _load_architectures()
     return _architecture_patch_size.get(arch_id, 128)
+
+
+def is_slab_architecture(arch_id: str) -> bool:
+    """Check if the architecture emits a full Z-slab rather than a single slice.
+
+    Slab models are trained from sparse 2D annotations: one plane of each slab
+    carries a real label and the rest are masked out of the loss.
+    """
+    _load_architectures()
+    return _architecture_is_slab.get(arch_id, False)
+
+
+def get_z_jitter(arch_id: str) -> int:
+    """Get the Z margin M for a slab architecture (0 for everything else).
+
+    Training stores slabs of depth PATCH_DEPTH + M and random-crops PATCH_DEPTH
+    out of them, so the annotated plane lands anywhere in
+    [PATCH_DEPTH//2 - M//2, PATCH_DEPTH//2 + M//2]. Only those M+1 output planes
+    are ever supervised, which is exactly the range inference may trust.
+    """
+    _load_architectures()
+    return _architecture_z_jitter.get(arch_id, 0)
+
+
+def validate_slab_geometry(arch_id: str, patch_depth: int = None,
+                           z_jitter: int = None) -> None:
+    """Raise ValueError if a slab configuration cannot produce valid labels.
+
+    Two independent constraints:
+      - D must be a multiple of the model's Z downsampling, or the U-Net skip
+        connections do not align.
+      - M must be <= D - 2, or the jittered label index escapes the slab. (This
+        is a real crash in the Ais reference at D=8, M=8.)
+    """
+    _load_architectures()
+    D = get_3d_patch_depth(arch_id) if patch_depth is None else int(patch_depth)
+    M = get_z_jitter(arch_id) if z_jitter is None else int(z_jitter)
+
+    module_pools = None
+    try:
+        from importlib import import_module
+        module_pools = getattr(import_module(f'{__name__}.{arch_id}'), 'Z_DOWNSAMPLE', None)
+    except Exception:
+        pass
+    z_down = module_pools or 4
+
+    if D % z_down:
+        raise ValueError(
+            f"{arch_id}: PATCH_DEPTH={D} must be a multiple of {z_down} "
+            f"(Z downsampling); skip connections would not align.")
+    if M < 0:
+        raise ValueError(f"{arch_id}: Z_JITTER={M} must be >= 0.")
+    if M and M > D - 2:
+        raise ValueError(
+            f"{arch_id}: Z_JITTER={M} must be <= PATCH_DEPTH-2 ({D - 2}); "
+            f"otherwise the jittered label plane lands outside the {D}-deep slab.")

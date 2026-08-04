@@ -126,8 +126,10 @@ class PredictWorker(QThread):
 
             # Detect architecture variants
             from ..models.architectures import (get_n_context_slices, uses_z_coord,
-                                                 is_3d_architecture, get_3d_patch_depth, get_3d_patch_size)
+                                                 is_3d_architecture, get_3d_patch_depth, get_3d_patch_size,
+                                                 is_slab_architecture)
             is_3d = is_3d_architecture(architecture)
+            is_slab = is_slab_architecture(architecture)
             is_25d = '25d' in architecture.lower() and not is_3d
             is_sam2 = 'sam2' in architecture.lower()
             n_channels = 1 if is_3d else get_n_context_slices(architecture)
@@ -146,6 +148,17 @@ class PredictWorker(QThread):
             else:
                 self.log.emit(f"  Mode: {'2.5D' if is_25d else '2D'} (n_channels={n_channels})")
             model = load_model(checkpoint_path, n_channels=model_n_channels, device=device, architecture=architecture)
+
+            # Slab geometry comes from the checkpoint: a model must be run at the depth
+            # and jitter it was trained with, whatever the architecture now declares.
+            patch_depth, z_jitter = 0, 0
+            if is_3d:
+                if is_slab:
+                    from ..models.slab_inference import read_slab_geometry
+                    patch_depth, z_jitter = read_slab_geometry(checkpoint_path, architecture)
+                    self.log.emit(f"  Slab geometry: depth {patch_depth}, Z-jitter {z_jitter}")
+                else:
+                    patch_depth = get_3d_patch_depth(architecture)
 
             # Initialize SAM2 predictor if needed (for on-the-fly feature extraction)
             sam2_predictor = None
@@ -170,10 +183,10 @@ class PredictWorker(QThread):
 
                 self.log.emit(f"Processing {name}...")
                 if is_3d:
-                    patch_depth = get_3d_patch_depth(architecture)
                     patch_size_3d = get_3d_patch_size(architecture)
                     self._predict_folder_3d(model, input_dir, output_dir, patch_size_3d,
-                                            patch_depth, overlap, name, device)
+                                            patch_depth, overlap, name, device,
+                                            z_jitter=z_jitter)
                 else:
                     self._predict_folder(model, input_dir, output_dir, patch_size, overlap, name, device,
                                         is_25d=is_25d, is_sam2=is_sam2, sam2_predictor=sam2_predictor,
@@ -426,8 +439,13 @@ class PredictWorker(QThread):
             count[y:y+ph, x:x+pw] += 1
 
     def _predict_folder_3d(self, model, input_dir, output_dir, patch_size, patch_depth,
-                           overlap, name, device):
-        """Predict on a folder of images using 3D sliding window."""
+                           overlap, name, device, z_jitter=0):
+        """Predict on a folder of images using a 3D sliding window.
+
+        With z_jitter > 0 (a slab model) only the Z planes that training actually
+        supervised are blended in, and Z advances by that trained width. With
+        z_jitter = 0 every plane is weighted equally, which is the plain 3D behaviour.
+        """
         # Find all images
         image_files = sorted([
             f for f in input_dir.iterdir()
@@ -445,15 +463,25 @@ class PredictWorker(QThread):
             first_img = first_img[..., 0]
         h, w = first_img.shape
 
-        self.log.emit(f"3D prediction: {total_z} slices, {h}x{w}, "
-                      f"patch={patch_depth}x{patch_size}x{patch_size}")
+        from ..models.slab_inference import (slab_z_weights, slab_z_starts,
+                                             slab_read_indices, trained_z_window)
+
+        z_weights = slab_z_weights(patch_depth, z_jitter)
+        z_starts = slab_z_starts(total_z, patch_depth, z_jitter)
+        if z_jitter:
+            lo, hi = trained_z_window(patch_depth, z_jitter)
+            self.log.emit(f"3D slab prediction: {total_z} slices, {h}x{w}, "
+                          f"patch={patch_depth}x{patch_size}x{patch_size}")
+            self.log.emit(f"  blending Z planes [{lo}..{hi}] of {patch_depth} "
+                          f"(the rest were never trained), {len(z_starts)} slabs")
+        else:
+            self.log.emit(f"3D prediction: {total_z} slices, {h}x{w}, "
+                          f"patch={patch_depth}x{patch_size}x{patch_size}")
 
         # Allocate output volume and count arrays
         pred_volume = np.zeros((total_z, h, w), dtype=np.float32)
         count_volume = np.zeros((total_z, h, w), dtype=np.float32)
 
-        # Sliding window parameters
-        stride_z = max(1, patch_depth - overlap)
         stride_xy = max(1, patch_size - overlap)
 
         # Preload all slices (needed for 3D blocks)
@@ -468,32 +496,31 @@ class PredictWorker(QThread):
         # 3D sliding window
         with torch.no_grad():
             total_blocks = 0
-            for z in range(0, total_z, stride_z):
-                z_end = min(z + patch_depth, total_z)
-                z_start = max(0, z_end - patch_depth)  # Ensure full depth patch
-                actual_d = z_end - z_start
+            for slab_i, z_start in enumerate(z_starts):
+                # Clamped read, so a slab may hang off either end of the volume and
+                # still be full depth (matching how training slabs were captured).
+                z_idx = slab_read_indices(z_start, patch_depth, total_z)
 
                 for y in range(0, h, stride_xy):
                     for x in range(0, w, stride_xy):
                         if self.should_stop:
                             return
 
-                        # Extract 3D patch
+                        # Extract 3D patch (full depth via the clamped Z indices)
                         y_end = min(y + patch_size, h)
                         x_end = min(x + patch_size, w)
-                        patch = volume[z_start:z_end, y:y_end, x:x_end]
+                        patch = volume[z_idx, y:y_end, x:x_end]
 
                         ph, pw = patch.shape[1], patch.shape[2]
 
                         if patch.max() == 0:
                             continue
 
-                        # Pad if needed
-                        pad_d = patch_depth - patch.shape[0]
+                        # Pad XY if needed; Z is already exactly patch_depth
                         pad_h = patch_size - ph
                         pad_w = patch_size - pw
-                        if pad_d > 0 or pad_h > 0 or pad_w > 0:
-                            patch = np.pad(patch, ((0, pad_d), (0, pad_h), (0, pad_w)))
+                        if pad_h > 0 or pad_w > 0:
+                            patch = np.pad(patch, ((0, 0), (0, pad_h), (0, pad_w)))
 
                         # Normalize
                         p_min, p_max = patch.min(), patch.max()
@@ -507,13 +534,20 @@ class PredictWorker(QThread):
 
                         pred = torch.sigmoid(model(tensor))[0, 0].cpu().numpy()
 
-                        # Place result (only the valid region)
-                        pred_volume[z_start:z_end, y:y_end, x:x_end] += pred[:actual_d, :ph, :pw]
-                        count_volume[z_start:z_end, y:y_end, x:x_end] += 1
+                        # Accumulate only the trained Z planes, each at its blend weight.
+                        for j in range(patch_depth):
+                            wj = z_weights[j]
+                            if wj <= 0:
+                                continue
+                            z = z_start + j
+                            if not 0 <= z < total_z:
+                                continue
+                            pred_volume[z, y:y_end, x:x_end] += pred[j, :ph, :pw] * wj
+                            count_volume[z, y:y_end, x:x_end] += wj
 
                         total_blocks += 1
 
-                self.progress.emit(name, min(z + stride_z, total_z), total_z)
+                self.progress.emit(name, min(slab_i + 1, len(z_starts)), len(z_starts))
 
         self.log.emit(f"Processed {total_blocks} 3D blocks")
 

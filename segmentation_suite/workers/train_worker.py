@@ -13,6 +13,7 @@ from tqdm import tqdm
 from skimage import io
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -60,12 +61,59 @@ class BCEDiceLoss(nn.Module):
         return self.bce_weight * self.bce(logits, targets) + self.dice_weight * self.dice(logits, targets)
 
 
+# Target value marking a voxel as unlabelled: it contributes neither loss nor
+# gradient. Slab training uses it for every Z plane except the annotated one, since
+# a 2D annotation says nothing about its neighbouring slices - unlabelled is not
+# background. Only ever produced in memory; masks on disk stay plain {0, 1}.
+IGNORE_LABEL = 2.0
+
+
+class MaskedBCEDiceLoss(nn.Module):
+    """BCE + Dice over labelled voxels only; IGNORE_LABEL voxels are skipped.
+
+    Shape-agnostic: works on 2D (N,1,H,W) and 3D slab (N,1,D,H,W) targets, and on
+    fully-labelled targets (where it reduces to the ordinary form), so it is safe
+    to use anywhere.
+
+    Mirrors Ais masked_bce / masked_dice (Ais/models/losses.py), including the
+    global (whole-batch) Dice reduction and the epsilon guards. Differs in taking
+    logits rather than probabilities, because MOSS models do not apply sigmoid.
+    """
+
+    def __init__(self, bce_weight: float = 0.3, dice_weight: float = 0.7,
+                 ignore_label: float = IGNORE_LABEL, eps: float = 1e-6):
+        super().__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        self.ignore_label = ignore_label
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        valid = (targets != self.ignore_label).to(logits.dtype)
+        # Keep the sentinel out of the arithmetic: as a BCE target it would drag
+        # the output toward 2.0 and saturate the sigmoid.
+        clean = torch.where(valid.bool(), targets, torch.zeros_like(targets))
+
+        bce = F.binary_cross_entropy_with_logits(logits, clean, reduction='none')
+        bce = (bce * valid).sum() / (valid.sum() + self.eps)
+
+        tgt = (clean * valid).reshape(-1)
+        pred = (torch.sigmoid(logits) * valid).reshape(-1)
+        numerator = 2.0 * (tgt * pred).sum()
+        denominator = (tgt + pred).sum()
+        coeff = (numerator + self.eps) / (denominator + self.eps)
+        # Nothing labelled in this batch -> no Dice signal rather than a NaN.
+        coeff = torch.where(valid.sum() == 0, torch.ones_like(coeff), coeff)
+
+        return self.bce_weight * bce + self.dice_weight * (1.0 - coeff)
+
+
 def get_loss_function(loss_type: str) -> nn.Module:
     """
     Get the loss function by name.
 
     Args:
-        loss_type: 'bce', 'dice', or 'bce_dice'
+        loss_type: 'bce', 'dice', 'bce_dice', or 'masked_bce_dice'
 
     Returns:
         Loss function module
@@ -74,6 +122,8 @@ def get_loss_function(loss_type: str) -> nn.Module:
         return DiceLoss()
     elif loss_type == 'bce_dice':
         return BCEDiceLoss()
+    elif loss_type == 'masked_bce_dice':
+        return MaskedBCEDiceLoss()
     else:  # Default to BCE
         return nn.BCEWithLogitsLoss()
 
@@ -617,6 +667,208 @@ class Volumetric3DPatchDataset(Dataset):
         return patch_img, patch_msk
 
 
+class SlabPatchDataset(Dataset):
+    """Dataset for 3D slab models trained from sparse 2D annotations.
+
+    On disk (written by the 3D GT capture path):
+        img_dir/<name>.tif   image slab, (D + M, H, W), annotated plane at index (D+M)//2
+        mask_dir/<name>.tif   the ordinary 2D annotation, (H, W)
+
+    The label slab is never stored -- it is built here, per sample, as IGNORE_LABEL
+    everywhere except the single plane that carries the real annotation. A 2D
+    annotation says nothing about neighbouring slices, so treating them as
+    background would train the model on labels that are simply wrong.
+
+    Per sample:
+        1. crop N x N in XY (foreground-biased, like the 2D dataset)
+        2. random-crop D of the D + M stored planes; the annotated plane lands at
+           z_lab = (D+M)//2 - offset, spanning [D//2 - M//2, D//2 + M//2]
+        3. build the label slab, real annotation at z_lab only
+        4. augment in XY only -- a Z flip would move the annotated plane outside
+           the Z range that inference is allowed to trust
+    """
+
+    def __init__(self, img_dir: str, mask_dir: str, patch_depth: int = 16,
+                 patch_size: int = 128, z_jitter: int = 8, fg_ratio: float = 0.5,
+                 train: bool = True, ignore_label: float = IGNORE_LABEL):
+        if z_jitter and z_jitter > patch_depth - 2:
+            raise ValueError(
+                f"z_jitter={z_jitter} must be <= patch_depth-2 ({patch_depth - 2}); "
+                f"otherwise the jittered label plane lands outside the slab.")
+
+        self.img_dir = img_dir
+        self.mask_dir = mask_dir
+        self.patch_depth = int(patch_depth)
+        self.patch_size = int(patch_size)
+        self.z_jitter = int(z_jitter)
+        self.stored_depth = self.patch_depth + self.z_jitter
+        self.fg_ratio = fg_ratio
+        self.train = train
+        self.ignore_label = float(ignore_label)
+
+        self.volumes = sorted([
+            f for f in os.listdir(img_dir)
+            if f.lower().endswith((".tif", ".tiff"))
+        ])
+
+        self._img_cache = {}
+        self._mask_cache = {}
+        self._positive_pixels = {}
+        self._load_all()
+
+    def _load_all(self):
+        import tifffile
+        print(f"Loading {len(self.volumes)} slab pairs "
+              f"(stored depth {self.stored_depth} = D {self.patch_depth} + M {self.z_jitter})...")
+        loaded = []
+        for fname in list(self.volumes):
+            ip = os.path.join(self.img_dir, fname)
+            mp = os.path.join(self.mask_dir, fname)
+            if not os.path.exists(ip) or not os.path.exists(mp):
+                continue
+
+            try:
+                img = tifffile.imread(ip).astype(np.float32)
+                mask = tifffile.imread(mp).astype(np.float32)
+            except Exception as e:
+                print(f"Failed to read slab pair {fname}: {e}")
+                continue
+
+            # The image must be a slab of exactly the stored depth: a mismatch means
+            # it was captured for a different D/M, and cropping it would silently put
+            # the annotation on the wrong plane.
+            if img.ndim != 3:
+                print(f"[slab] SKIP {fname}: image is {img.shape}, expected a 3D slab")
+                continue
+            if img.shape[0] != self.stored_depth:
+                print(f"[slab] SKIP {fname}: slab depth {img.shape[0]} != expected "
+                      f"{self.stored_depth} (D={self.patch_depth} + M={self.z_jitter}). "
+                      f"Re-capture this crop, or train at the depth it was captured for.")
+                continue
+            if mask.ndim != 2:
+                print(f"[slab] SKIP {fname}: mask is {mask.shape}, expected a 2D (H, W) "
+                      f"annotation — the label slab is built during training, not stored")
+                continue
+            if mask.shape != img.shape[1:]:
+                print(f"[slab] SKIP {fname}: mask {mask.shape} does not match slab XY "
+                      f"{img.shape[1:]}")
+                continue
+
+            # Binarize the 2D annotation only. Binarizing after building the label slab
+            # would turn every ignore voxel into foreground.
+            mask = (mask > 0.5).astype(np.float32)
+
+            self._img_cache[ip] = img
+            self._mask_cache[mp] = mask
+            pos = np.argwhere(mask > 0)
+            if len(pos) > 0:
+                self._positive_pixels[fname] = pos
+            loaded.append(fname)
+
+        self.volumes = loaded
+        n_pos = len(self._positive_pixels)
+        print(f"Cached {len(self._img_cache)} slab pairs ({n_pos} with foreground).")
+        if not self.volumes:
+            print("[slab] WARNING: no usable slab pairs — training will produce nothing.")
+
+    def __len__(self):
+        num = len(self.volumes)
+        if num == 0:
+            return 0
+        target_samples = 2000
+        return num * max(1, target_samples // num)
+
+    def _crop_xy(self, slab, mask, y, x):
+        """Crop N x N in XY from a (S, H, W) slab and its (H, W) mask."""
+        n = self.patch_size
+        h, w = slab.shape[1:]
+        y1, x1 = min(y + n, h), min(x + n, w)
+        ps, pm = slab[:, y:y1, x:x1], mask[y:y1, x:x1]
+        if ps.shape[1] != n or ps.shape[2] != n:
+            pad_y, pad_x = n - ps.shape[1], n - ps.shape[2]
+            ps = np.pad(ps, ((0, 0), (0, pad_y), (0, pad_x)), mode="reflect")
+            pm = np.pad(pm, ((0, pad_y), (0, pad_x)), mode="reflect")
+        return ps, pm
+
+    def _jitter_crop(self, slab):
+        """Crop patch_depth planes; return (crop, z_lab).
+
+        offset in [0, M] -> z_lab = stored//2 - offset, i.e. the annotated plane
+        spans [D//2 - M//2, D//2 + M//2]. Validation takes the centred crop so its
+        loss stays comparable between epochs.
+        """
+        max_off = self.stored_depth - self.patch_depth
+        if max_off <= 0:
+            offset = 0
+        elif self.train:
+            offset = random.randint(0, max_off)
+        else:
+            offset = max_off // 2
+        z_lab = self.stored_depth // 2 - offset
+        if not 0 <= z_lab < self.patch_depth:
+            raise RuntimeError(
+                f"label plane {z_lab} outside the {self.patch_depth}-deep slab "
+                f"(stored={self.stored_depth}, offset={offset}) — bad geometry")
+        return slab[offset:offset + self.patch_depth], z_lab
+
+    def _augment_xy(self, slab, mask):
+        """Flip/rotate in XY only. slab is (D, H, W), mask is (H, W)."""
+        if random.random() < 0.5:
+            slab, mask = np.flip(slab, axis=1).copy(), np.flipud(mask).copy()
+        if random.random() < 0.5:
+            slab, mask = np.flip(slab, axis=2).copy(), np.fliplr(mask).copy()
+        k = random.randint(0, 3)
+        if k:
+            slab = np.rot90(slab, k, axes=(1, 2)).copy()
+            mask = np.rot90(mask, k, axes=(0, 1)).copy()
+        if random.random() < 0.3:
+            slab = np.clip(slab * random.uniform(0.8, 1.2) +
+                           random.uniform(-0.1, 0.1), 0, 1).copy()
+        return slab, mask
+
+    def _empty(self):
+        d, n = self.patch_depth, self.patch_size
+        return (torch.zeros((1, d, n, n), dtype=torch.float32),
+                torch.full((1, d, n, n), self.ignore_label, dtype=torch.float32))
+
+    def __getitem__(self, _):
+        if not self.volumes:
+            return self._empty()
+
+        fname = random.choice(self.volumes)
+        ip = os.path.join(self.img_dir, fname)
+        mp = os.path.join(self.mask_dir, fname)
+        if ip not in self._img_cache:
+            return self._empty()
+
+        slab = self._img_cache[ip]
+        mask = self._mask_cache[mp]
+        h, w = slab.shape[1:]
+        n = self.patch_size
+
+        if fname in self._positive_pixels and random.random() < self.fg_ratio:
+            py, px = random.choice(self._positive_pixels[fname])
+            y = max(0, min(int(py) - n // 2, h - n))
+            x = max(0, min(int(px) - n // 2, w - n))
+        else:
+            y = random.randint(0, max(0, h - n))
+            x = random.randint(0, max(0, w - n))
+
+        slab, mask = self._crop_xy(slab, mask, y, x)
+        slab, z_lab = self._jitter_crop(slab)
+
+        lo, hi = slab.min(), slab.max()
+        slab = (slab - lo) / (hi - lo + 1e-8)
+        slab, mask = self._augment_xy(slab, mask)
+
+        # Build the label slab last, so nothing downstream can binarize the sentinel.
+        label = np.full(slab.shape, self.ignore_label, dtype=np.float32)
+        label[z_lab] = mask
+
+        return (torch.tensor(slab.copy()[None, ...], dtype=torch.float32),
+                torch.tensor(label[None, ...], dtype=torch.float32))
+
+
 class TrainWorker(QThread):
     """Background worker for UNet training."""
 
@@ -912,8 +1164,15 @@ class TrainWorker(QThread):
 
             # Detect architecture variants
             from ..models.architectures import (get_n_context_slices, uses_z_coord,
-                                                 is_3d_architecture, get_3d_patch_depth, get_3d_patch_size)
+                                                 is_3d_architecture, get_3d_patch_depth, get_3d_patch_size,
+                                                 is_slab_architecture, get_z_jitter,
+                                                 validate_slab_geometry)
             is_3d = is_3d_architecture(architecture)
+            is_slab = is_slab_architecture(architecture)
+            # Inference needs the Z-jitter to know which output planes were trained,
+            # so it is carried all the way into the checkpoint. 0 for every non-slab model.
+            z_jitter = 0
+            patch_depth = 0
             is_25d = '25d' in architecture.lower() and not is_3d
             is_sam2 = 'sam2' in architecture.lower()
             n_channels = 1 if is_3d else get_n_context_slices(architecture)
@@ -970,23 +1229,66 @@ class TrainWorker(QThread):
             if is_3d:
                 patch_depth = get_3d_patch_depth(architecture)
                 patch_size_3d = get_3d_patch_size(architecture)
-                # Use 3D training directories
-                train_images_3d = train_images.replace('train_images', 'train_images_3d')
-                train_masks_3d = train_masks.replace('train_masks', 'train_masks_3d')
-                if os.path.isdir(train_images_3d) and os.path.isdir(train_masks_3d):
-                    train_images = train_images_3d
-                    train_masks = train_masks_3d
+
+                if is_slab:
+                    # Slab data lives beside the 2D crops it was captured with, so a
+                    # '_512' crop-size suffix is preserved: train_images_512 ->
+                    # train_images_512_slab.
+                    train_images_target = self.config.get(
+                        'train_images_slab', train_images + '_slab')
+                    train_masks_target = self.config.get(
+                        'train_masks_slab', train_masks + '_slab')
+                    hint = ("Enable slab capture and capture some crops (each ordinary "
+                            "2D crop also writes a slab).")
+                else:
+                    train_images_target = train_images.replace('train_images', 'train_images_3d')
+                    train_masks_target = train_masks.replace('train_masks', 'train_masks_3d')
+                    hint = "Use 3D GT mode to capture volumetric training data."
+
+                if os.path.isdir(train_images_target) and os.path.isdir(train_masks_target):
+                    train_images = train_images_target
+                    train_masks = train_masks_target
                 else:
                     self.log.emit(f"ERROR: 3D training folders not found")
-                    self.log.emit(f"  Expected: {train_images_3d}")
-                    self.log.emit(f"  Use 3D GT mode to capture volumetric training data.")
+                    self.log.emit(f"  Expected: {train_images_target}")
+                    self.log.emit(f"  {hint}")
                     self.finished.emit(False, "3D training data not found")
                     return
 
-                self.log.emit(f"Loading 3D training data (patch={patch_depth}x{patch_size_3d}x{patch_size_3d})...")
-                train_ds = Volumetric3DPatchDataset(train_images, train_masks,
-                                                    patch_depth=patch_depth, patch_size=patch_size_3d,
-                                                    fg_ratio=0.5)
+                if is_slab:
+                    z_jitter = get_z_jitter(architecture)
+                    try:
+                        validate_slab_geometry(architecture, patch_depth, z_jitter)
+                    except ValueError as e:
+                        self.log.emit(f"ERROR: invalid slab geometry: {e}")
+                        self.finished.emit(False, str(e))
+                        return
+                    self.log.emit(
+                        f"Loading 3D slab training data "
+                        f"(patch={patch_depth}x{patch_size_3d}x{patch_size_3d}, "
+                        f"stored depth {patch_depth + z_jitter}, Z-jitter {z_jitter})")
+                    self.log.emit(
+                        f"  supervising Z planes "
+                        f"[{patch_depth//2 - z_jitter//2}..{patch_depth//2 + z_jitter//2}] "
+                        f"of {patch_depth}; the rest are masked out of the loss")
+                    train_ds = SlabPatchDataset(train_images, train_masks,
+                                                patch_depth=patch_depth,
+                                                patch_size=patch_size_3d,
+                                                z_jitter=z_jitter, fg_ratio=0.5,
+                                                train=True)
+                    if not train_ds.volumes:
+                        msg = (f"No usable slab pairs in {train_images}. Capture 3D GT "
+                               f"crops for this architecture (stored depth "
+                               f"{patch_depth + z_jitter}) before training.")
+                        self.log.emit(f"ERROR: {msg}")
+                        self.finished.emit(False, msg)
+                        return
+                else:
+                    z_jitter = 0
+                    self.log.emit(f"Loading 3D training data (patch={patch_depth}x{patch_size_3d}x{patch_size_3d})...")
+                    train_ds = Volumetric3DPatchDataset(train_images, train_masks,
+                                                        patch_depth=patch_depth, patch_size=patch_size_3d,
+                                                        fg_ratio=0.5)
                 val_ds = None  # 3D validation not yet supported
             else:
                 if add_z_coord:
@@ -1151,7 +1453,9 @@ class TrainWorker(QThread):
                     bn_warmup_epochs = 3 if training_v2 else num_epochs
                     if (epoch - start_epoch) < bn_warmup_epochs:
                         for module in model.modules():
-                            if isinstance(module, nn.BatchNorm2d):
+                            # _BatchNorm covers BatchNorm2d and BatchNorm3d, so 3D
+                            # models get the same stable live predictions as 2D ones.
+                            if isinstance(module, nn.modules.batchnorm._BatchNorm):
                                 module.eval()  # Freeze running_mean/running_var updates
 
                 train_loss = 0.0
@@ -1241,13 +1545,21 @@ class TrainWorker(QThread):
                 # Emit progress to UI
                 self.progress.emit(epoch + 1, num_epochs, avg_train, val_loss)
 
-                # Save checkpoint
-                torch.save({
+                # Save checkpoint. The slab geometry travels with the weights: without
+                # z_jitter, inference cannot tell which output planes were ever trained
+                # and would blend the untrained margins in at full weight.
+                ckpt_out = {
                     "epoch": epoch,
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "tile_size": tile_size,
-                }, checkpoint_path)
+                }
+                if is_slab:
+                    ckpt_out["architecture"] = architecture
+                    ckpt_out["is_slab"] = True
+                    ckpt_out["patch_depth"] = patch_depth
+                    ckpt_out["z_jitter"] = z_jitter
+                torch.save(ckpt_out, checkpoint_path)
 
                 # Notify that model was updated
                 self.model_updated.emit(checkpoint_path)
@@ -1264,8 +1576,20 @@ class TrainWorker(QThread):
                 if self._reload_requested:
                     self._reload_requested = False
                     self.log.emit("Reloading dataset with new files...")
-                    train_ds = NucleiPatchDataset(train_images, train_masks, tile=tile_size, fg_ratio=0.5,
-                                                  n_channels=n_channels)
+                    if is_slab:
+                        train_ds = SlabPatchDataset(train_images, train_masks,
+                                                    patch_depth=patch_depth,
+                                                    patch_size=patch_size_3d,
+                                                    z_jitter=z_jitter, fg_ratio=0.5,
+                                                    train=True)
+                    elif is_3d:
+                        train_ds = Volumetric3DPatchDataset(train_images, train_masks,
+                                                            patch_depth=patch_depth,
+                                                            patch_size=patch_size_3d,
+                                                            fg_ratio=0.5)
+                    else:
+                        train_ds = NucleiPatchDataset(train_images, train_masks, tile=tile_size, fg_ratio=0.5,
+                                                      n_channels=n_channels)
                     train_loader = DataLoader(
                         train_ds, batch_size=batch_size, shuffle=True,
                         num_workers=0, pin_memory=False

@@ -126,6 +126,8 @@ class InteractiveTrainingPage(QWidget):
         self.train_masks_25d_dir = None   # For 2.5D training masks
         self.train_images_dwarf25d_dir = None  # For deep 2.5D training data (11-channel)
         self.train_masks_dwarf25d_dir = None   # For deep 2.5D training masks
+        self.train_images_slab_dir = None  # For 3D slab training data ((D+M, H, W) slabs)
+        self.train_masks_slab_dir = None   # For 3D slab masks (still ordinary 2D)
         self.masks_dir = None
         self.user_training_masks_dir = None  # User-provided training masks (optional)
         self._pending_images_dir = None  # For lazy loading when page becomes visible
@@ -1869,6 +1871,8 @@ class InteractiveTrainingPage(QWidget):
             self.train_masks_25d_dir = paths["train_masks_25d_dir"]
             self.train_images_dwarf25d_dir = paths["train_images_dwarf25d_dir"]
             self.train_masks_dwarf25d_dir = paths["train_masks_dwarf25d_dir"]
+            self.train_images_slab_dir = paths["train_images_slab_dir"]
+            self.train_masks_slab_dir = paths["train_masks_slab_dir"]
             self.masks_dir = paths["masks_dir"]
             print(f"[Training] Using subproject '{sp_name}' dirs (crop_size={tile_size})")
 
@@ -1894,6 +1898,8 @@ class InteractiveTrainingPage(QWidget):
             self.train_masks_25d_dir = self.project_dir / folders["masks_25d"]
             self.train_images_dwarf25d_dir = self.project_dir / folders["images_dwarf25d"]
             self.train_masks_dwarf25d_dir = self.project_dir / folders["masks_dwarf25d"]
+            self.train_images_slab_dir = self.project_dir / folders["images_slab"]
+            self.train_masks_slab_dir = self.project_dir / folders["masks_slab"]
             self.masks_dir = self.project_dir / 'masks'
 
         self.train_images_dir.mkdir(parents=True, exist_ok=True)
@@ -1902,6 +1908,8 @@ class InteractiveTrainingPage(QWidget):
         self.train_masks_25d_dir.mkdir(parents=True, exist_ok=True)
         self.train_images_dwarf25d_dir.mkdir(parents=True, exist_ok=True)
         self.train_masks_dwarf25d_dir.mkdir(parents=True, exist_ok=True)
+        self.train_images_slab_dir.mkdir(parents=True, exist_ok=True)
+        self.train_masks_slab_dir.mkdir(parents=True, exist_ok=True)
         self.masks_dir.mkdir(parents=True, exist_ok=True)
 
         # Eagerly set checkpoint on predict worker so predictions work without training first
@@ -2913,16 +2921,27 @@ class InteractiveTrainingPage(QWidget):
                                         crop_w=crop_w)
                     saved_dwarf = True
 
+            # Also save a 3D slab version when a slab architecture is selected. Same
+            # single 2D annotation, plus the surrounding image planes.
+            saved_slab = False
+            stored_depth = self._slab_stored_depth()
+            if stored_depth:
+                saved_slab = self._save_slab_crop(idx, mask_after_crop, crop_y, crop_x,
+                                                  crop_h, crop_w, crop_id, stored_depth)
+
             # Count existing training files
             train_count = len(list(self.train_images_dir.glob("*.tif")))
             count_25d = len(list(self.train_images_25d_dir.glob("*.tif"))) if self.train_images_25d_dir else 0
             count_dwarf = len(list(self.train_images_dwarf25d_dir.glob("*.tif"))) if self.train_images_dwarf25d_dir else 0
+            count_slab = len(list(self.train_images_slab_dir.glob("*.tif"))) if self.train_images_slab_dir else 0
 
             status_msg = f"Captured crop! ({crop_w}x{crop_h}) - {train_count} 2D"
             if saved_25d:
                 status_msg += f", {count_25d} 2.5D"
             if saved_dwarf:
                 status_msg += f", {count_dwarf} dwarf"
+            if saved_slab:
+                status_msg += f", {count_slab} slab"
             status_msg += " training samples"
 
             # Multi-user mode: send crop to host. Send the crop version that matches
@@ -3225,6 +3244,74 @@ class InteractiveTrainingPage(QWidget):
                 return None
 
         return crops
+
+    def _slab_stored_depth(self) -> int:
+        """Stored slab depth D + M for the current architecture, or 0 if not a slab model."""
+        from ..models.architectures import (is_slab_architecture, get_3d_patch_depth,
+                                            get_z_jitter)
+        for arch in (self.current_architecture, self.prediction_architecture):
+            if arch and is_slab_architecture(arch):
+                return get_3d_patch_depth(arch) + get_z_jitter(arch)
+        return 0
+
+    def _save_slab_crop(self, slice_idx: int, mask_crop: np.ndarray,
+                        py: int, px: int, crop_h: int, crop_w: int,
+                        crop_id: str, stored_depth: int) -> bool:
+        """Save one 3D-slab training sample from a single 2D annotation.
+
+        Writes a (stored_depth, crop_h, crop_w) image slab with the annotated slice at
+        index stored_depth // 2, and the ordinary 2D mask crop beside it. The label slab
+        (ignore everywhere but the annotated plane) is built during training, not here --
+        the neighbouring slices are genuinely unlabelled, and writing them as background
+        would be a lie the model would happily learn.
+
+        Returns True on success.
+        """
+        if not self.train_images_slab_dir or not self.train_masks_slab_dir:
+            return False
+        if stored_depth < 2:
+            return False
+
+        # stored_depth // 2 slices below, the rest above -> annotated slice lands at
+        # index stored_depth // 2 for odd and even depths alike (matches Ais extract_box).
+        half = stored_depth // 2
+        slices = self._load_adjacent_slices(slice_idx, n_flanking=half, spacing=1)
+        if slices is None:
+            print(f"[slab] no slab for {crop_id}: could not load "
+                  f"{2 * half + 1} slices around {slice_idx}")
+            return False
+        slices = slices[:stored_depth]
+        if len(slices) != stored_depth:
+            print(f"[slab] no slab for {crop_id}: got {len(slices)} slices, "
+                  f"need {stored_depth}")
+            return False
+
+        try:
+            import tifffile
+
+            planes = []
+            for s in slices:
+                h, w = s.shape
+                if py + crop_h > h or px + crop_w > w:
+                    print(f"[slab] no slab for {crop_id}: crop outside slice bounds")
+                    return False
+                planes.append(s[py:py + crop_h, px:px + crop_w])
+            slab = np.stack(planes, axis=0).astype(np.float32)
+
+            # Normalize over the WHOLE slab, not per plane: per-plane scaling would
+            # flatten the Z intensity structure the 3D convolutions are there to use.
+            lo, hi = slab.min(), slab.max()
+            slab_u8 = (((slab - lo) / (hi - lo) * 255).astype(np.uint8)
+                       if hi > lo else slab.astype(np.uint8))
+
+            tifffile.imwrite(str(self.train_images_slab_dir / f"{crop_id}.tif"),
+                             slab_u8, compression='lzw')
+            tifffile.imwrite(str(self.train_masks_slab_dir / f"{crop_id}.tif"),
+                             mask_crop, compression='lzw')
+            return True
+        except Exception as e:
+            print(f"[slab] failed to save slab for {crop_id}: {e}")
+            return False
 
     def _save_25d_crop(self, slices: list, mask_crop: np.ndarray,
                        py: int, px: int, crop_h: int, crop_id: str,
