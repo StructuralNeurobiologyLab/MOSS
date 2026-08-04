@@ -3445,6 +3445,12 @@ class InteractiveTrainingPage(QWidget):
         if not c or not getattr(c, 'is_connected', False):
             self.status_label.setText("Not connected to a hub — nothing to resync")
             return
+        # Callers fire this from session-setup events, so the crop folders may not point
+        # at the session's subproject yet. Refuse rather than diff against the wrong
+        # folder, which would re-send another subproject's crops.
+        if not self.train_masks_dir or not self.train_masks_dir.is_dir():
+            print("[Resync] skipped: training folders not resolved yet")
+            return
         self.status_label.setText("Checking which crops the hub already has...")
         c.request_crop_inventory()
 

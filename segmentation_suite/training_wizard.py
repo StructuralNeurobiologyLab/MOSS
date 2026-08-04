@@ -1194,6 +1194,12 @@ class TrainingWizard(QMainWindow):
         print(f"[Wizard] Adopting session subproject: {subproject_name}")
         self.training_page.adopt_session_subproject(subproject_name)
         self._lock_subproject(subproject_name)
+        # Sweep once the crop folders point at the session's subproject. This is the
+        # trigger that covers a RECONNECT: the hub re-sends WELCOME, so anything queued
+        # when the link dropped is found and re-sent. Sweeping is an inventory request
+        # that no-ops when the hub already holds everything, so firing here as well as
+        # on a model change is harmless.
+        QTimer.singleShot(1200, self.training_page.resync_crops_to_host)
         if self._is_session_owner:
             # Resumed owner is told their own subproject — keep the OWNER label.
             self.session_status_label.setText(
