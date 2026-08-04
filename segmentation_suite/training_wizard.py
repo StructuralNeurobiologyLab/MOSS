@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QStackedWidget, QListWidget, QListWidgetItem,
     QFrame, QMessageBox
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSettings
+from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QTimer
 from PyQt6.QtGui import QFont, QColor, QBrush
 
 from .dpi_scaling import scaled, scaled_font, scaled_window_size, center_on_screen
@@ -1219,6 +1219,10 @@ class TrainingWizard(QMainWindow):
         print(f"[Wizard] Received authoritative model: {architecture}")
         self.training_page.lock_prediction_architecture(architecture)
         self.training_page.lock_architecture(architecture)
+        # The hub pools crops per architecture variant, so a model switch is exactly
+        # when previously sent crops can be missing for the new variant. Sweep for gaps
+        # once the lock has settled; the sweep no-ops when the hub already has them all.
+        QTimer.singleShot(1500, self.training_page.resync_crops_to_host)
 
     def _on_crop_size_received(self, size: int):
         """Hub dictated the authoritative crop size — lock the S/M/L buttons (red)."""

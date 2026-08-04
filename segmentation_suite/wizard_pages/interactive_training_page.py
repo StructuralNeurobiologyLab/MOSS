@@ -6,6 +6,7 @@ Keeps ~200 images in memory, loads more when user approaches the edge.
 
 import os
 import queue
+import re
 import threading
 import numpy as np
 from pathlib import Path
@@ -3432,6 +3433,104 @@ class InteractiveTrainingPage(QWidget):
             crops.append(crop)
         return np.stack(crops, axis=0)
 
+    def resync_crops_to_host(self):
+        """Ask the hub which of our crops it holds; the reply drives the re-send.
+
+        Sends can be refused when the client's backlog is full, and a disconnect loses
+        whatever was queued — but the crop is still on disk here. Without this the
+        annotation is simply missing from the pool and the only remedy is capturing it
+        again by hand.
+        """
+        c = getattr(self, '_sync_client', None)
+        if not c or not getattr(c, 'is_connected', False):
+            self.status_label.setText("Not connected to a hub — nothing to resync")
+            return
+        self.status_label.setText("Checking which crops the hub already has...")
+        c.request_crop_inventory()
+
+    def _on_crop_inventory(self, crop_ids: list, variant: str):
+        """Re-send local crops the hub does not have.
+
+        Reconciles on the 2D mask folder: a crop exists locally iff its mask does, and
+        every variant of one capture shares the crop_id, so one comparison covers them
+        all. Re-sending a capture re-sends all its variants, which is what the hub wants
+        anyway — it stores whichever variant its session model needs.
+        """
+        if not self.train_masks_dir or not self.train_images_dir:
+            return
+        have = set(str(c) for c in (crop_ids or []))
+        local = sorted(p.stem for p in self.train_masks_dir.glob("*.tif"))
+        missing = [s for s in local if s not in have]
+
+        if not missing:
+            self.status_label.setText(
+                f"Hub has all {len(local)} crops — nothing to resync")
+            return
+
+        c = self._sync_client
+        # Respect the send window rather than firing thousands of sends that would just
+        # be refused. One crop queues up to MAX_VARIANTS sends, so stop while there is
+        # still room for a whole crop; a partially sent crop is worse than a deferred one.
+        MAX_VARIANTS = 4
+        sent = 0
+        deferred = []
+        for i, stem in enumerate(missing):
+            if c.pending_crop_sends() > c.MAX_PENDING_CROP_SENDS - MAX_VARIANTS:
+                deferred = missing[i:]
+                break
+            try:
+                if self._resend_one_crop(stem):
+                    sent += 1
+            except Exception as e:
+                print(f"[Resync] {stem} skipped: {e}")
+
+        msg = f"Resync: hub had {len(have)}, sent {sent} of {len(missing)} missing"
+        if deferred:
+            msg += f" ({len(deferred)} left — run resync again once these drain)"
+        self.status_label.setText(msg)
+        print(f"[Resync] variant '{variant or '2D'}': local={len(local)} "
+              f"hub={len(have)} missing={len(missing)} sent={sent} deferred={len(deferred)}")
+
+    def _resend_one_crop(self, stem: str) -> bool:
+        """Re-send every locally saved variant of one crop.
+
+        Reads the variants back off disk rather than rebuilding them from the source
+        volume: the saved crops carry no XY coordinates (see
+        docs/TODO_crop_capture_rework.md), so rebuilding is not possible — but capture
+        already wrote each variant, so re-reading covers 2.5D and slab sessions too.
+        """
+        import tifffile
+
+        m = re.search(r'slice(\d+)', stem)
+        idx = int(m.group(1)) if m else 0
+
+        variants = [
+            (self.train_images_dir, self.train_masks_dir),
+            (self.train_images_25d_dir, self.train_masks_25d_dir),
+            (self.train_images_dwarf25d_dir, self.train_masks_dwarf25d_dir),
+            (self.train_images_slab_dir, self.train_masks_slab_dir),
+        ]
+
+        sent_any = False
+        for img_dir, msk_dir in variants:
+            if not img_dir or not msk_dir:
+                continue
+            ip, mp = img_dir / f"{stem}.tif", msk_dir / f"{stem}.tif"
+            if not ip.exists() or not mp.exists():
+                continue
+            try:
+                img = tifffile.imread(str(ip))
+                mask = tifffile.imread(str(mp))
+            except Exception as e:
+                print(f"[Resync] could not read {ip.name} from {img_dir.name}: {e}")
+                continue
+            if mask.ndim == 3:
+                mask = mask[0] if mask.shape[0] <= 4 else mask[..., 0]
+            self._sync_client.send_training_data(img, mask, idx, crop_id=stem)
+            sent_any = True
+
+        return sent_any
+
     def _send_all_training_variants(self, idx: int, img_crop_2d: np.ndarray, mask,
                                     crop_y: int, crop_x: int, crop_h: int, crop_w: int,
                                     crop_id: str = ""):
@@ -3830,6 +3929,9 @@ class InteractiveTrainingPage(QWidget):
                 client.global_model_received.connect(self._on_global_model_received)
                 client.sync_status.connect(self._on_sync_status)
                 client.error.connect(self._on_sync_error)
+                # Resync replies land here. This is the path a hub joinee takes, so
+                # without it the sweep would silently never run in a hub session.
+                client.crop_inventory_received.connect(self._on_crop_inventory)
                 # In relay mode, host needs to respond when users join or request model
                 if is_host:
                     client.user_joined_room.connect(self._on_user_joined_relay)
@@ -4379,6 +4481,7 @@ class InteractiveTrainingPage(QWidget):
         self._sync_client.error.connect(self._on_session_error)
         self._sync_client.user_list_updated.connect(self._on_session_user_list)
         self._sync_client.sync_status.connect(self._on_session_sync_status)
+        self._sync_client.crop_inventory_received.connect(self._on_crop_inventory)
 
         self._sync_client.connect_to_relay(DEFAULT_RELAY_URL, create_room=True)
         self.session_create_btn.setEnabled(False)
@@ -4440,6 +4543,7 @@ class InteractiveTrainingPage(QWidget):
         self._sync_client.error.connect(self._on_session_error)
         self._sync_client.user_list_updated.connect(self._on_session_user_list)
         self._sync_client.sync_status.connect(self._on_session_sync_status)
+        self._sync_client.crop_inventory_received.connect(self._on_crop_inventory)
 
         self._sync_client.connect_to_relay(DEFAULT_RELAY_URL, room_code=code)
         self.session_create_btn.setEnabled(False)

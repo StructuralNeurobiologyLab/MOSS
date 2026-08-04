@@ -44,6 +44,12 @@ class MessageType(Enum):
     TRAINING_DATA = "training_data"        # Client -> Host: image+mask crop
     TRAINING_DATA_ACK = "training_data_ack"  # Host -> Client: received confirmation
 
+    # Crop resync: a client's send can be refused when its backlog is full, and a
+    # disconnect loses whatever was queued. The crop still exists on the annotator's
+    # disk, so the client asks what the host holds and re-sends only the gaps.
+    CROP_INVENTORY_REQUEST = "crop_inventory_request"  # Client -> Host: what do you have of mine?
+    CROP_INVENTORY = "crop_inventory"                  # Host -> Client: the crop ids I hold
+
     # Hub redesign (authoritative standalone hub)
     PROJECT_REGISTER = "project_register"        # Owner -> Hub: project/subproject/model identity
     SET_PREDICTION_MODEL = "set_prediction_model"  # Hub -> Client: authoritative prediction model
@@ -433,6 +439,32 @@ def create_training_data_message(user_id: str, display_name: str,
             "crop_id": str(crop_id or ""),
             "timestamp": int(time.time() * 1000)
         }
+    )
+
+
+def create_crop_inventory_request_message(user_id: str) -> Message:
+    """Client -> Host: which of my crops do you already have?"""
+    return Message(
+        type=MessageType.CROP_INVENTORY_REQUEST,
+        payload={"user_id": user_id},
+    )
+
+
+def create_crop_inventory_message(user_id: str, crop_ids: list,
+                                  variant: str = "") -> Message:
+    """Host -> Client: the crop ids held for this user, in the session's variant folder.
+
+    `variant` is the folder suffix the host is currently pooling from ("" for plain 2D,
+    "_25d", "_dwarf25d"), so the client can tell which variant the answer describes.
+    Only ids the host actually holds are listed; the client re-sends the difference.
+    """
+    return Message(
+        type=MessageType.CROP_INVENTORY,
+        payload={
+            "user_id": user_id,
+            "variant": variant,
+            "crop_ids": sorted(str(c) for c in crop_ids),
+        },
     )
 
 

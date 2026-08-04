@@ -37,7 +37,7 @@ from ..network.protocol import (
     Message, MessageType,
     create_welcome_message, create_user_list_message,
     create_set_prediction_model_message, create_training_data_ack_message,
-    create_error_message,
+    create_error_message, create_crop_inventory_message,
     serialize_weights, create_global_model_message,
     needs_chunking, chunk_data, create_chunk_start_message, create_chunk_end_message,
 )
@@ -665,10 +665,37 @@ class HubServer(QObject):
             uid = self._ws_to_uid.get(websocket)
             if uid:
                 self._pending_td[uid] = {"payload": msg.payload, "frames": []}
+        elif msg.type == MessageType.CROP_INVENTORY_REQUEST:
+            await self._on_crop_inventory_request(websocket)
         elif msg.type == MessageType.REQUEST_MODEL:
             await self._on_request_model(websocket)
         elif msg.type == MessageType.GOODBYE:
             await self._drop(websocket)
+
+    async def _on_crop_inventory_request(self, websocket):
+        """Answer with the crop ids we hold for this user, in the session's variant.
+
+        A client's send can be refused when its own backlog is full, and a disconnect
+        loses whatever was queued, but the crop is still on the annotator's disk. This
+        lets them compare and re-send only the gaps instead of losing the annotation or
+        re-capturing it by hand.
+        """
+        uid = self._ws_to_uid.get(websocket)
+        if not uid:
+            return
+        suf, ext = self._session_variant()
+        d = self.data_dir / "incoming" / uid / f"train_images{suf}"
+        try:
+            ids = [f.stem for f in d.glob(f"*.{ext}")] if d.is_dir() else []
+        except OSError as e:
+            _log(f"crop inventory for {uid} failed: {e}")
+            ids = []
+        try:
+            await websocket.send(
+                create_crop_inventory_message(uid, ids, variant=suf).to_json())
+            _log(f"crop inventory -> {uid}: {len(ids)} crops (variant '{suf or '2D'}')")
+        except Exception as e:
+            _log(f"could not send crop inventory to {uid}: {e}")
 
     async def _on_hello(self, websocket, msg: Message):
         if not self._active:

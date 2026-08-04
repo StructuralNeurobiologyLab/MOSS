@@ -27,7 +27,7 @@ from .protocol import (
     create_hello_message, create_weights_push_message, create_goodbye_message,
     create_chunk_start_message, create_chunk_end_message,
     create_training_data_message, create_project_register_message,
-    create_raw_register_message,
+    create_raw_register_message, create_crop_inventory_request_message,
     serialize_training_data,
     chunk_data, needs_chunking, MAX_CHUNK_SIZE
 )
@@ -98,6 +98,7 @@ class SyncClient(QObject):
 
     # New signals for multi-user redesign
     training_data_received = pyqtSignal(bytes, bytes, dict)  # image_bytes, mask_bytes, metadata (host only)
+    crop_inventory_received = pyqtSignal(list, str)  # crop_ids the hub holds, variant suffix
 
     # Hub redesign signals (authoritative standalone hub)
     owner_assigned = pyqtSignal(bool)              # True if this client is the session owner
@@ -649,6 +650,12 @@ class SyncClient(QObject):
                 _log(f"Hub denied raw upload: {msg.payload}")
                 self.raw_upload_denied.emit(dict(msg.payload or {}))
 
+            elif msg.type == MessageType.CROP_INVENTORY:
+                ids = msg.payload.get("crop_ids", []) or []
+                variant = msg.payload.get("variant", "")
+                _log(f"Hub holds {len(ids)} of my crops (variant '{variant or '2D'}')")
+                self.crop_inventory_received.emit(list(ids), str(variant))
+
             elif msg.type == MessageType.USER_LIST:
                 user_list = msg.payload.get("users", [])
                 self.user_list_updated.emit(user_list)
@@ -932,6 +939,31 @@ class SyncClient(QObject):
                 await self._websocket.send(msg.to_json())
         except Exception as e:
             _log(f"Error requesting global model: {e}")
+
+    def request_crop_inventory(self):
+        """Ask the host which of our crops it already holds.
+
+        The answer arrives on crop_inventory_received; the caller compares it against
+        the crops on disk and re-sends the gaps.
+        """
+        if not self._connected or not self._loop:
+            return
+        asyncio.run_coroutine_threadsafe(self._request_crop_inventory_async(), self._loop)
+
+    async def _request_crop_inventory_async(self):
+        if not self._websocket:
+            return
+        try:
+            msg = create_crop_inventory_request_message(self.user_id)
+            async with self._sendlock():
+                await self._websocket.send(msg.to_json())
+            _log("Requested crop inventory from hub")
+        except Exception as e:
+            _log(f"Error requesting crop inventory: {e}")
+
+    def pending_crop_sends(self) -> int:
+        """Queued crop-variant sends. 0 means the backlog has drained."""
+        return self._pending_crop_sends
 
     def send_training_data(self, image_array, mask_array, slice_index: int = 0,
                            crop_id: str = ""):
