@@ -1011,6 +1011,17 @@ class HubServer(QObject):
             self.start_training(fresh=True)
 
     def set_prediction_model(self, arch: str):
+        # Defence in depth: the pickers already exclude slab architectures, but a stale
+        # session.json or an older client could still name one. Refuse here rather than
+        # let it through -- _session_variant would map it to the plain-2D suffix, so the
+        # pool, per-user counts and discard would all silently operate on 2D crops, and
+        # the switch would first stop whatever was training.
+        from ..models.architectures import is_hub_trainable
+        if not is_hub_trainable(arch):
+            _log(f"REFUSED session model '{arch}': the hub cannot train slab models "
+                 f"(crop transfer carries only 2D/2.5D variants). Keeping "
+                 f"'{self.prediction_model or self.architecture}'.")
+            return
         changed = arch != (self.prediction_model or self.architecture)
         self.prediction_model = arch
         self.architecture = arch          # training + prediction stay the SAME model

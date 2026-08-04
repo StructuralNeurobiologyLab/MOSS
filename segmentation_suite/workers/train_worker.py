@@ -1649,6 +1649,13 @@ class TrainWorker(QThread):
                                                             patch_depth=patch_depth,
                                                             patch_size=patch_size_3d,
                                                             fg_ratio=0.5)
+                    elif is_sam2 and sam2_dir:
+                        # Without this the reload drops back to a plain dataset, the
+                        # batches stop carrying SAM2 features, and the model is called
+                        # without them from then on.
+                        train_ds = NucleiPatchDatasetSAM2(train_images, train_masks, sam2_dir,
+                                                          tile=tile_size, fg_ratio=0.5,
+                                                          n_channels=n_channels)
                     else:
                         # uses_z_coord must match the initial construction above: without
                         # it a z-coord architecture gets one channel too few after the
