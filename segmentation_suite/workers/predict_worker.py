@@ -439,7 +439,7 @@ class PredictWorker(QThread):
             count[y:y+ph, x:x+pw] += 1
 
     def _predict_folder_3d(self, model, input_dir, output_dir, patch_size, patch_depth,
-                           overlap, name, device, z_jitter=0):
+                           overlap, name, device, z_jitter=0, batch_limit=8):
         """Predict on a folder of images using a 3D sliding window.
 
         With z_jitter > 0 (a slab model) only the Z planes that training actually
@@ -544,14 +544,60 @@ class PredictWorker(QThread):
             if limit > next_z:
                 next_z = limit
 
+        state = {'blocks': 0, 'batch': max(1, int(batch_limit))}
+
+        def run_batch(patch_batch, z_start):
+            """One forward pass for a whole batch of patches from the same slab."""
+            batch_tensor = torch.cat([t for t, _, _, _, _ in patch_batch], dim=0).to(device)
+            preds = torch.sigmoid(model(batch_tensor)).cpu().numpy()
+
+            for idx, (_, y, x, ph, pw) in enumerate(patch_batch):
+                pred = preds[idx, 0]
+                # Accumulate only the trained Z planes, each at its blend weight.
+                for j in range(patch_depth):
+                    wj = z_weights[j]
+                    if wj <= 0:
+                        continue
+                    z = z_start + j
+                    if not 0 <= z < total_z:
+                        continue
+                    total, weight = plane(z)
+                    total[y:y + ph, x:x + pw] += pred[j, :ph, :pw] * wj
+                    weight[y:y + ph, x:x + pw] += wj
+            state['blocks'] += len(patch_batch)
+
+        def run_batch_safe(patch_batch, z_start):
+            """Run a batch, halving it if the GPU cannot hold it.
+
+            Nothing is accumulated until the forward pass has returned, so a failed
+            batch leaves no partial contribution behind and can simply be redone.
+            """
+            if not patch_batch:
+                return
+            try:
+                run_batch(patch_batch, z_start)
+                return
+            except RuntimeError as e:
+                if len(patch_batch) == 1 or 'out of memory' not in str(e).lower():
+                    raise
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            half = max(1, len(patch_batch) // 2)
+            # A size that OOMs once will OOM again, so keep the smaller batch.
+            state['batch'] = min(state['batch'], half)
+            self.log.emit(f"  GPU out of memory; 3D batch reduced to {state['batch']}")
+            for i in range(0, len(patch_batch), half):
+                run_batch_safe(patch_batch[i:i + half], z_start)
+
         # 3D sliding window, one slab at a time
         with torch.no_grad():
-            total_blocks = 0
             for slab_i, z_start in enumerate(z_starts):
                 # Clamped read, so a slab may hang off either end of the volume and
                 # still be full depth (matching how training slabs were captured).
                 z_idx = slab_read_indices(z_start, patch_depth, total_z)
                 slab = [load_slice(int(z)) for z in z_idx]
+
+                patch_batch = []  # (tensor, y, x, ph, pw)
 
                 for y in range(0, h, stride_xy):
                     for x in range(0, w, stride_xy):
@@ -584,23 +630,15 @@ class PredictWorker(QThread):
                         # (D, H, W) -> (1, 1, D, H, W)
                         tensor = torch.tensor(
                             patch[None, None, ...], dtype=torch.float32
-                        ).to(device)
+                        )
+                        patch_batch.append((tensor, y, x, ph, pw))
 
-                        pred = torch.sigmoid(model(tensor))[0, 0].cpu().numpy()
+                        if len(patch_batch) >= state['batch']:
+                            run_batch_safe(patch_batch, z_start)
+                            patch_batch = []
 
-                        # Accumulate only the trained Z planes, each at its blend weight.
-                        for j in range(patch_depth):
-                            wj = z_weights[j]
-                            if wj <= 0:
-                                continue
-                            z = z_start + j
-                            if not 0 <= z < total_z:
-                                continue
-                            total, weight = plane(z)
-                            total[y:y + ph, x:x + pw] += pred[j, :ph, :pw] * wj
-                            weight[y:y + ph, x:x + pw] += wj
-
-                        total_blocks += 1
+                if patch_batch:
+                    run_batch_safe(patch_batch, z_start)
 
                 # Retire everything the remaining slabs can no longer reach, and drop
                 # the slices none of them will read again.
@@ -618,7 +656,7 @@ class PredictWorker(QThread):
                 if device.type == 'cuda' and (slab_i + 1) % 20 == 0:
                     torch.cuda.empty_cache()
 
-        self.log.emit(f"Processed {total_blocks} 3D blocks")
+        self.log.emit(f"Processed {state['blocks']} 3D blocks")
 
         slice_cache.clear()
         planes.clear()

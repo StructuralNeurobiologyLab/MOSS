@@ -19,7 +19,7 @@ from PIL import Image
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from segmentation_suite.models.slab_inference import trained_z_window
+from segmentation_suite.models.slab_inference import slab_z_starts, trained_z_window
 from segmentation_suite.workers.predict_worker import PredictWorker
 
 D, M = 8, 4
@@ -36,9 +36,11 @@ class Threshold:
 
     def __init__(self):
         self.calls = 0
+        self.batch_sizes = []
 
     def __call__(self, x):
         self.calls += 1
+        self.batch_sizes.append(x.shape[0])
         return torch.where(x > 0.5, 20.0, -20.0)
 
 
@@ -69,7 +71,7 @@ def read_masks(folder, n_z):
     ])
 
 
-def predict(tmp_path, n_z, model=None, jitter=M, depth=D, overlap=0,
+def predict(tmp_path, n_z, model=None, jitter=M, depth=D, overlap=0, batch_limit=8,
             h=PATCH, w=PATCH, seed=0, spy=None):
     """Run the worker's 3D path over a freshly written volume."""
     in_dir, out_dir = tmp_path / f"in{n_z}_{seed}", tmp_path / f"out{n_z}_{seed}"
@@ -81,7 +83,8 @@ def predict(tmp_path, n_z, model=None, jitter=M, depth=D, overlap=0,
     if spy is not None:
         spy(worker)
     worker._predict_folder_3d(model, in_dir, out_dir, PATCH, depth, overlap,
-                             'xy', torch.device('cpu'), z_jitter=jitter)
+                             'xy', torch.device('cpu'), z_jitter=jitter,
+                             batch_limit=batch_limit)
     return vol, read_masks(out_dir, n_z), model
 
 
@@ -209,6 +212,69 @@ def test_blank_slices_still_produce_a_mask(tmp_path):
     masks = read_masks(out_dir, n_z)
     assert masks.shape[0] == n_z
     assert masks[6].max() == 0
+
+
+# ------------------------------------------------------------------------ batching
+def test_patches_are_batched_not_run_one_at_a_time(tmp_path):
+    """The whole point of batching: far fewer forward passes than patches."""
+    _, _, model = predict(tmp_path, 40, h=64, w=64, overlap=0, batch_limit=8)
+    patches_per_slab = (64 // PATCH) ** 2
+    n_slabs = len(slab_z_starts(40, D, M))
+    assert model.calls < patches_per_slab * n_slabs
+    assert max(model.batch_sizes) > 1
+
+
+def test_batching_does_not_change_the_result(tmp_path):
+    """Batch size must be a throughput knob only."""
+    vol_a, masks_a, _ = predict(tmp_path, 40, h=32, w=32, batch_limit=1, seed=3)
+    vol_b, masks_b, _ = predict(tmp_path, 40, h=32, w=32, batch_limit=16, seed=3)
+    assert np.array_equal(vol_a, vol_b)
+    assert np.array_equal(masks_a, masks_b)
+
+
+def test_batch_never_mixes_slabs(tmp_path):
+    """Results are placed using the batch's z_start, so a batch spanning two slabs
+    would silently write every patch at the wrong depth."""
+    depths_seen = []
+
+    class Recorder(Threshold):
+        def __call__(self, x):
+            depths_seen.append(x.shape[2])
+            return super().__call__(x)
+
+    predict(tmp_path, 40, h=32, w=32, model=Recorder(), batch_limit=1000)
+    assert set(depths_seen) == {D}
+
+
+def test_oom_falls_back_to_smaller_batches_and_still_completes(tmp_path):
+    """A too-large batch must degrade rather than abort the run. Nothing is
+    accumulated before the forward pass returns, so the retry cannot double-count."""
+
+    class OomOnce(Threshold):
+        def __init__(self):
+            super().__init__()
+            self.raised = False
+
+        def __call__(self, x):
+            if not self.raised and x.shape[0] > 1:
+                self.raised = True
+                raise RuntimeError("CUDA out of memory. Tried to allocate 356.00 GiB")
+            return super().__call__(x)
+
+    model = OomOnce()
+    vol, masks, _ = predict(tmp_path, 40, h=32, w=32, model=model, batch_limit=16)
+    assert model.raised
+    expected = ((vol > 127.5) * 255).astype(np.uint8)
+    assert np.array_equal(masks, expected)
+
+
+def test_non_oom_runtime_errors_are_not_swallowed(tmp_path):
+    class Broken(Threshold):
+        def __call__(self, x):
+            raise RuntimeError("shape mismatch in conv3d")
+
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        predict(tmp_path, 12, model=Broken())
 
 
 # ------------------------------------------------------------------------- plumbing
