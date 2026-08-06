@@ -14,6 +14,30 @@ import torch
 from PyQt6.QtCore import QThread, pyqtSignal
 
 
+# A patch's border is where the convolutions' padding makes it least reliable, so the
+# blend must not weight it like the centre. Never let the window reach zero, though:
+# the outermost rows and columns of a volume are covered only by the patch whose
+# window is zero there, and they would come out blank.
+XY_BLEND_FLOOR = 0.05
+
+
+def build_xy_blend_window(patch_size: int, xy_blend: str = 'hann') -> np.ndarray:
+    """Separable XY blend weights of shape (patch_size, patch_size).
+
+    Hann is constant-overlap-add at 50% overlap, which is the stride the 3D path runs
+    at by default (patch 128, overlap 64), so interior weights sum flat and the blend
+    adds no amplitude ripple of its own. 'tophat' is the old uniform weighting.
+    """
+    if xy_blend == 'tophat':
+        return np.ones((patch_size, patch_size), dtype=np.float32)
+    if xy_blend != 'hann':
+        raise ValueError(f"unknown xy_blend {xy_blend!r}; expected 'hann' or 'tophat'")
+    i = np.arange(patch_size, dtype=np.float32)
+    hann = 0.5 - 0.5 * np.cos(2 * np.pi * i / max(patch_size - 1, 1))
+    hann = np.maximum(hann, XY_BLEND_FLOOR)
+    return np.outer(hann, hann).astype(np.float32)
+
+
 class PredictWorker(QThread):
     """Background worker for UNet prediction on image folders."""
 
@@ -439,7 +463,8 @@ class PredictWorker(QThread):
             count[y:y+ph, x:x+pw] += 1
 
     def _predict_folder_3d(self, model, input_dir, output_dir, patch_size, patch_depth,
-                           overlap, name, device, z_jitter=0, batch_limit=8):
+                           overlap, name, device, z_jitter=0, batch_limit=8,
+                           xy_blend='hann'):
         """Predict on a folder of images using a 3D sliding window.
 
         With z_jitter > 0 (a slab model) only the Z planes that training actually
@@ -450,6 +475,11 @@ class PredictWorker(QThread):
         and freed as soon as no later slab can reach it, so peak memory scales with
         patch_depth instead of with the slice count. Holding the input volume plus the
         two accumulators outright wanted 356 GiB *each* on a 4607x3475x5963 dataset.
+
+        xy_blend selects the XY blend window: 'hann' tapers each patch toward its
+        border, 'tophat' is the old uniform weighting kept for reproducing earlier
+        predictions. Z blending is unaffected -- its hard rectangle is deliberate,
+        because the untrained margins must contribute exactly nothing.
         """
         # Find all images
         image_files = sorted([
@@ -494,6 +524,7 @@ class PredictWorker(QThread):
                           f"patch={patch_depth}x{patch_size}x{patch_size}")
 
         stride_xy = max(1, patch_size - overlap)
+        xy_win = build_xy_blend_window(patch_size, xy_blend)
 
         # Slices are read on demand and kept only while some slab still needs them.
         # Cached in native dtype -- converting to float32 up front quadrupled a uint8
@@ -553,6 +584,9 @@ class PredictWorker(QThread):
 
             for idx, (_, y, x, ph, pw) in enumerate(patch_batch):
                 pred = preds[idx, 0]
+                # A partial patch keeps the leading corner of the window; the trailing
+                # taper is dropped along with the padding it would have covered.
+                win = xy_win[:ph, :pw]
                 # Accumulate only the trained Z planes, each at its blend weight.
                 for j in range(patch_depth):
                     wj = z_weights[j]
@@ -561,9 +595,10 @@ class PredictWorker(QThread):
                     z = z_start + j
                     if not 0 <= z < total_z:
                         continue
+                    wxy = win * wj
                     total, weight = plane(z)
-                    total[y:y + ph, x:x + pw] += pred[j, :ph, :pw] * wj
-                    weight[y:y + ph, x:x + pw] += wj
+                    total[y:y + ph, x:x + pw] += pred[j, :ph, :pw] * wxy
+                    weight[y:y + ph, x:x + pw] += wxy
             state['blocks'] += len(patch_batch)
 
         def run_batch_safe(patch_batch, z_start):

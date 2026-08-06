@@ -20,7 +20,8 @@ from PIL import Image
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from segmentation_suite.models.slab_inference import slab_z_starts, trained_z_window
-from segmentation_suite.workers.predict_worker import PredictWorker
+from segmentation_suite.workers.predict_worker import (
+    XY_BLEND_FLOOR, PredictWorker, build_xy_blend_window)
 
 D, M = 8, 4
 PATCH = 8
@@ -72,10 +73,14 @@ def read_masks(folder, n_z):
 
 
 def predict(tmp_path, n_z, model=None, jitter=M, depth=D, overlap=0, batch_limit=8,
-            h=PATCH, w=PATCH, seed=0, spy=None):
+            h=PATCH, w=PATCH, seed=0, spy=None, xy_blend='hann', vol=None, tag=''):
     """Run the worker's 3D path over a freshly written volume."""
-    in_dir, out_dir = tmp_path / f"in{n_z}_{seed}", tmp_path / f"out{n_z}_{seed}"
-    vol = write_volume(in_dir, n_z, h=h, w=w, seed=seed)
+    in_dir = tmp_path / f"in{n_z}_{seed}_{h}x{w}{tag}"
+    out_dir = tmp_path / f"out{n_z}_{seed}_{h}x{w}{tag}_{xy_blend}"
+    if vol is None:
+        vol = write_volume(in_dir, n_z, h=h, w=w, seed=seed)
+    else:
+        write_given_volume(in_dir, vol)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     worker = PredictWorker({})
@@ -84,8 +89,15 @@ def predict(tmp_path, n_z, model=None, jitter=M, depth=D, overlap=0, batch_limit
         spy(worker)
     worker._predict_folder_3d(model, in_dir, out_dir, PATCH, depth, overlap,
                              'xy', torch.device('cpu'), z_jitter=jitter,
-                             batch_limit=batch_limit)
+                             batch_limit=batch_limit, xy_blend=xy_blend)
     return vol, read_masks(out_dir, n_z), model
+
+
+def write_given_volume(folder, vol):
+    folder.mkdir(parents=True, exist_ok=True)
+    for z in range(vol.shape[0]):
+        Image.fromarray(vol[z]).save(folder / f"s{z:04d}.tif")
+    return vol
 
 
 # ------------------------------------------------------------------- memory bounding
@@ -297,3 +309,118 @@ def test_stop_request_aborts_without_writing_the_rest(tmp_path):
     worker._predict_folder_3d(Threshold(), in_dir, out_dir, PATCH, D, 0, 'xy',
                               torch.device('cpu'), z_jitter=M)
     assert not list(out_dir.glob("*_pred.tif"))
+
+
+# --------------------------------------------------------------------- XY blending
+def seam_ratio(mask, stride):
+    """Edge density on tile-boundary columns over edge density elsewhere.
+
+    The same metric that measured ~6x on a real prediction slice at stride 64. A clean
+    result sits near 1.0: tile boundaries are no edgier than anywhere else.
+    """
+    gx = np.abs(np.diff(mask.astype(np.float32) / 255.0, axis=1)).mean(axis=0)
+    idx = np.arange(len(gx))
+    on = gx[idx % stride == (stride - 1) % stride]
+    off = gx[idx % stride != (stride - 1) % stride]
+    if off.mean() == 0:
+        return 1.0 if on.mean() == 0 else np.inf
+    return float(on.mean() / off.mean())
+
+
+class BadAtBorders:
+    """Correct in the patch centre, wrong in a border band.
+
+    Stands in for the real failure mode: the convolutions' padding makes a patch
+    unreliable near its edge, so a blend that weights the border like the centre
+    prints the tile grid into the output. Ground truth here is 'foreground
+    everywhere', which is what the patch centres say.
+    """
+
+    def __init__(self, band=2):
+        self.band = band
+
+    def __call__(self, x):
+        out = torch.full_like(x, 20.0)
+        b = self.band
+        out[..., :b, :] = -20.0
+        out[..., -b:, :] = -20.0
+        out[..., :, :b] = -20.0
+        out[..., :, -b:] = -20.0
+        return out
+
+
+class ConstantPositive:
+    def __call__(self, x):
+        return torch.full_like(x, 20.0)
+
+
+def test_hann_window_never_reaches_zero():
+    """A zero-weight column would blank the volume's outermost pixels."""
+    win = build_xy_blend_window(PATCH, 'hann')
+    assert win.shape == (PATCH, PATCH)
+    assert win.min() >= XY_BLEND_FLOOR ** 2
+    assert win.max() <= 1.0
+    # Still a genuine taper, not a disguised top-hat.
+    assert win[PATCH // 2, PATCH // 2] > 4 * win[0, 0]
+
+
+def test_tophat_window_is_uniform():
+    win = build_xy_blend_window(PATCH, 'tophat')
+    assert win.min() == win.max() == 1.0
+
+
+def test_unknown_blend_is_rejected():
+    with pytest.raises(ValueError, match="xy_blend"):
+        build_xy_blend_window(PATCH, 'cosine')
+
+
+def test_hann_is_constant_overlap_add_at_half_stride():
+    """At 50% overlap the interior weights must sum flat, or the blend adds its own
+    ripple on top of whatever the model does."""
+    win = build_xy_blend_window(64, 'hann')
+    stride = 32
+    acc = np.zeros(64 * 4, dtype=np.float64)
+    for start in range(0, 64 * 3, stride):
+        acc[start:start + 64] += win[32]           # one row is enough; it is separable
+    interior = acc[64:64 * 3]
+    assert interior.std() / interior.mean() < 0.05
+
+
+@pytest.mark.parametrize("h,w", [(32, 32), (28, 20)])
+def test_taper_suppresses_tile_seams(tmp_path, h, w):
+    """The regression this fix exists for, measured the same way as on the real data."""
+    n_z, overlap = 24, PATCH // 2      # 50% overlap, as the real runs use
+    _, top, _ = predict(tmp_path, n_z, model=BadAtBorders(), overlap=overlap,
+                        h=h, w=w, xy_blend='tophat')
+    _, han, _ = predict(tmp_path, n_z, model=BadAtBorders(), overlap=overlap,
+                        h=h, w=w, xy_blend='hann')
+
+    mid = n_z // 2
+    r_top = seam_ratio(top[mid], PATCH // 2)
+    r_han = seam_ratio(han[mid], PATCH // 2)
+    assert r_han < r_top, f"taper did not reduce seams: {r_han:.2f} vs {r_top:.2f}"
+
+    # The centres all say foreground, so a good blend recovers mostly foreground.
+    wrong_top = (top[mid] != 255).mean()
+    wrong_han = (han[mid] != 255).mean()
+    assert wrong_han < wrong_top / 2, (
+        f"border contamination barely improved: {wrong_han:.3f} vs {wrong_top:.3f}")
+
+
+@pytest.mark.parametrize("h,w", [(PATCH, PATCH), (28, 20), (32, 32)])
+def test_no_pixel_is_left_without_blend_weight(tmp_path, h, w):
+    """A pixel with zero accumulated weight divides down to 0 and prints a black
+    seam. With a model that says foreground everywhere, every pixel must be 255 --
+    including the volume's outermost rows, where the taper is smallest.
+    """
+    _, masks, _ = predict(tmp_path, 20, model=ConstantPositive(),
+                          overlap=PATCH // 2, h=h, w=w)
+    assert masks.min() == 255, (
+        f"{(masks != 255).sum()} pixels lost their weight, "
+        f"first at {np.argwhere(masks != 255)[0].tolist()}")
+
+
+def test_tophat_still_available_for_reproducing_old_predictions(tmp_path):
+    vol, masks, _ = predict(tmp_path, 12, xy_blend='tophat')
+    expected = ((vol > 127.5) * 255).astype(np.uint8)
+    assert np.array_equal(masks, expected)
