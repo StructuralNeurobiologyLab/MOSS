@@ -445,6 +445,11 @@ class PredictWorker(QThread):
         With z_jitter > 0 (a slab model) only the Z planes that training actually
         supervised are blended in, and Z advances by that trained width. With
         z_jitter = 0 every plane is weighted equally, which is the plain 3D behaviour.
+
+        Z is streamed. Slabs are visited in ascending order and a plane is written out
+        and freed as soon as no later slab can reach it, so peak memory scales with
+        patch_depth instead of with the slice count. Holding the input volume plus the
+        two accumulators outright wanted 356 GiB *each* on a 4607x3475x5963 dataset.
         """
         # Find all images
         image_files = sorted([
@@ -474,6 +479,10 @@ class PredictWorker(QThread):
         # every existing unet_3d prediction.
         z_stride = None if z_jitter else max(1, patch_depth - overlap)
         z_starts = slab_z_starts(total_z, patch_depth, z_jitter, stride=z_stride)
+        # First plane of a slab carrying any weight. A slab starting at s cannot touch
+        # any plane below s + w_lo, which is what makes retiring planes early safe.
+        _nonzero = np.nonzero(z_weights)[0]
+        w_lo = int(_nonzero[0]) if len(_nonzero) else 0
         if z_jitter:
             lo, hi = trained_z_window(patch_depth, z_jitter)
             self.log.emit(f"3D slab prediction: {total_z} slices, {h}x{w}, "
@@ -484,28 +493,65 @@ class PredictWorker(QThread):
             self.log.emit(f"3D prediction: {total_z} slices, {h}x{w}, "
                           f"patch={patch_depth}x{patch_size}x{patch_size}")
 
-        # Allocate output volume and count arrays
-        pred_volume = np.zeros((total_z, h, w), dtype=np.float32)
-        count_volume = np.zeros((total_z, h, w), dtype=np.float32)
-
         stride_xy = max(1, patch_size - overlap)
 
-        # Preload all slices (needed for 3D blocks)
-        self.log.emit(f"Loading volume into memory...")
-        volume = np.zeros((total_z, h, w), dtype=np.float32)
-        for i, f in enumerate(image_files):
-            img = np.array(Image.open(f))
-            if img.ndim == 3:
-                img = img[..., 0]
-            volume[i] = img.astype(np.float32)
+        # Slices are read on demand and kept only while some slab still needs them.
+        # Cached in native dtype -- converting to float32 up front quadrupled a uint8
+        # volume for no benefit, since normalization happens per patch anyway.
+        slice_cache = {}
 
-        # 3D sliding window
+        def load_slice(z):
+            arr = slice_cache.get(z)
+            if arr is None:
+                arr = np.array(Image.open(image_files[z]))
+                if arr.ndim == 3:
+                    arr = arr[..., 0]
+                slice_cache[z] = arr
+            return arr
+
+        # Planes still in flight: z -> [weighted sum, accumulated weight].
+        planes = {}
+
+        def plane(z):
+            entry = planes.get(z)
+            if entry is None:
+                entry = [np.zeros((h, w), dtype=np.float32),
+                         np.zeros((h, w), dtype=np.float32)]
+                planes[z] = entry
+            return entry
+
+        next_z = 0  # planes are finalized in ascending z, one output file each
+
+        def flush_upto(limit):
+            """Normalize, write and free every plane below `limit`."""
+            nonlocal next_z
+            limit = min(limit, total_z)
+            for z in range(next_z, limit):
+                entry = planes.pop(z, None)
+                if entry is None:
+                    # Every patch on this plane was blank, which the whole-volume
+                    # version also emitted as an empty mask. Keep doing that: the
+                    # voting step downstream expects one file per slice.
+                    mask_bin = np.zeros((h, w), dtype=np.uint8)
+                else:
+                    total, weight = entry
+                    total /= np.maximum(weight, 1e-8)
+                    mask_bin = ((total > 0.5) * 255).astype(np.uint8)
+                Image.fromarray(mask_bin).save(
+                    output_dir / f"{image_files[z].stem}_pred.tif",
+                    compression='tiff_lzw'
+                )
+            if limit > next_z:
+                next_z = limit
+
+        # 3D sliding window, one slab at a time
         with torch.no_grad():
             total_blocks = 0
             for slab_i, z_start in enumerate(z_starts):
                 # Clamped read, so a slab may hang off either end of the volume and
                 # still be full depth (matching how training slabs were captured).
                 z_idx = slab_read_indices(z_start, patch_depth, total_z)
+                slab = [load_slice(int(z)) for z in z_idx]
 
                 for y in range(0, h, stride_xy):
                     for x in range(0, w, stride_xy):
@@ -515,12 +561,14 @@ class PredictWorker(QThread):
                         # Extract 3D patch (full depth via the clamped Z indices)
                         y_end = min(y + patch_size, h)
                         x_end = min(x + patch_size, w)
-                        patch = volume[z_idx, y:y_end, x:x_end]
+                        patch = np.stack([s[y:y_end, x:x_end] for s in slab])
 
                         ph, pw = patch.shape[1], patch.shape[2]
 
                         if patch.max() == 0:
                             continue
+
+                        patch = patch.astype(np.float32)
 
                         # Pad XY if needed; Z is already exactly patch_depth
                         pad_h = patch_size - ph
@@ -548,24 +596,32 @@ class PredictWorker(QThread):
                             z = z_start + j
                             if not 0 <= z < total_z:
                                 continue
-                            pred_volume[z, y:y_end, x:x_end] += pred[j, :ph, :pw] * wj
-                            count_volume[z, y:y_end, x:x_end] += wj
+                            total, weight = plane(z)
+                            total[y:y + ph, x:x + pw] += pred[j, :ph, :pw] * wj
+                            weight[y:y + ph, x:x + pw] += wj
 
                         total_blocks += 1
 
+                # Retire everything the remaining slabs can no longer reach, and drop
+                # the slices none of them will read again.
+                if slab_i + 1 < len(z_starts):
+                    next_start = z_starts[slab_i + 1]
+                    flush_upto(next_start + w_lo)
+                    keep_from = max(0, next_start)
+                    for z in [k for k in slice_cache if k < keep_from]:
+                        del slice_cache[z]
+                else:
+                    flush_upto(total_z)
+
                 self.progress.emit(name, min(slab_i + 1, len(z_starts)), len(z_starts))
+
+                if device.type == 'cuda' and (slab_i + 1) % 20 == 0:
+                    torch.cuda.empty_cache()
 
         self.log.emit(f"Processed {total_blocks} 3D blocks")
 
-        # Normalize and save per-slice
-        pred_volume /= np.maximum(count_volume, 1e-8)
-
-        for i, image_path in enumerate(image_files):
-            mask_bin = ((pred_volume[i] > 0.5) * 255).astype(np.uint8)
-            output_path = output_dir / f"{image_path.stem}_pred.tif"
-            Image.fromarray(mask_bin).save(output_path, compression='tiff_lzw')
-
-        del volume, pred_volume, count_volume
+        slice_cache.clear()
+        planes.clear()
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
