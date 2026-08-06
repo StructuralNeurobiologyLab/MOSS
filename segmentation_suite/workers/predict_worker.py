@@ -651,16 +651,26 @@ class PredictWorker(QThread):
 
                         patch = patch.astype(np.float32)
 
-                        # Pad XY if needed; Z is already exactly patch_depth
+                        # Pad XY if needed; Z is already exactly patch_depth.
+                        # Reflect rather than zero-fill so the volume border does not
+                        # read as a hard black wall to the convolutions, matching what
+                        # the live viewport predictor already does. Reflect needs at
+                        # least as much data as padding, so narrow strips fall back to
+                        # edge replication.
                         pad_h = patch_size - ph
                         pad_w = patch_size - pw
                         if pad_h > 0 or pad_w > 0:
-                            patch = np.pad(patch, ((0, 0), (0, pad_h), (0, pad_w)))
+                            mode = ('reflect' if pad_h < ph and pad_w < pw
+                                    else 'edge')
+                            patch = np.pad(patch, ((0, 0), (0, pad_h), (0, pad_w)),
+                                           mode=mode)
 
-                        # Normalize
+                        # Normalize exactly as training does (train_worker SlabPatchDataset):
+                        # unconditionally, so a uniform patch becomes zeros. Guarding on
+                        # p_max > p_min instead fed raw intensities -- 200.0, not 0-1 --
+                        # into a network that never saw them, one saturated tile at a time.
                         p_min, p_max = patch.min(), patch.max()
-                        if p_max > p_min:
-                            patch = (patch - p_min) / (p_max - p_min)
+                        patch = (patch - p_min) / (p_max - p_min + 1e-8)
 
                         # (D, H, W) -> (1, 1, D, H, W)
                         tensor = torch.tensor(

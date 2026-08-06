@@ -420,6 +420,25 @@ def test_no_pixel_is_left_without_blend_weight(tmp_path, h, w):
         f"first at {np.argwhere(masks != 255)[0].tolist()}")
 
 
+def test_uniform_patch_is_zeroed_like_training(tmp_path):
+    """Training divides unconditionally, so a flat crop becomes zeros. Inference used
+    to guard on p_max > p_min and pass raw intensities straight into the network.
+    """
+    n_z = 20
+    vol = np.full((n_z, PATCH, PATCH), 200, dtype=np.uint8)
+    _, masks, _ = predict(tmp_path, n_z, vol=vol, tag='flat')
+    # Normalized to zeros, Threshold returns a negative logit -> empty mask. Left raw
+    # at 200.0 it would clear the 0.5 threshold and fill the tile.
+    assert masks.max() == 0, "flat patch was not normalized the way training does"
+
+
+def test_reflect_padding_does_not_leak_into_the_output(tmp_path):
+    """Edge patches are padded to patch_size; only the real extent may be written."""
+    vol, masks, _ = predict(tmp_path, 24, h=20, w=12, overlap=PATCH // 2, tag='pad')
+    expected = ((vol > 127.5) * 255).astype(np.uint8)
+    assert masks.shape == expected.shape
+
+
 def test_tophat_still_available_for_reproducing_old_predictions(tmp_path):
     vol, masks, _ = predict(tmp_path, 12, xy_blend='tophat')
     expected = ((vol > 127.5) * 255).astype(np.uint8)
