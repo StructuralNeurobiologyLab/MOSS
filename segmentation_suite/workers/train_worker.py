@@ -135,6 +135,27 @@ def get_loss_function(loss_type: str) -> nn.Module:
         f"bce, dice, bce_dice, masked_bce_dice.")
 
 
+def _to_hwc(img, n_channels):
+    """Return a 3D crop as (H, W, n_channels), or None if its channel count is wrong.
+
+    Crops are written channels-first (C, H, W) by tifffile. A stack whose C does not
+    match the architecture (e.g. 1-channel crops captured under a 2D model, then
+    trained with a 2.5D one) used to be "fixed" by slicing the LAST axis, which cut
+    the image to an H x n_channels sliver and silently trained a blank predictor.
+    """
+    if img.shape[0] == n_channels and img.shape[0] < img.shape[1]:
+        return np.transpose(img, (1, 2, 0))
+    if img.shape[-1] == n_channels:
+        return img
+    return None
+
+
+def _warn_channel_mismatch(fname, n_channels):
+    print(f"[dataset] SKIP {fname}: image has the wrong channel count for this "
+          f"architecture (expected {n_channels}). It was probably captured while a "
+          f"different architecture was selected - re-capture it.")
+
+
 class NucleiPatchDataset(Dataset):
     """Dataset for training with balanced patch sampling."""
 
@@ -219,18 +240,10 @@ class NucleiPatchDataset(Dataset):
                     # Single channel - replicate to n_channels
                     img = np.stack([img] * self.n_channels, axis=-1)
                 elif img.ndim == 3:
-                    # Check if shape is (C, H, W) and transpose to (H, W, C)
-                    if img.shape[0] == self.n_channels and img.shape[0] < img.shape[1]:
-                        # Likely (C, H, W) format - transpose
-                        img = np.transpose(img, (1, 2, 0))
-                    elif img.shape[-1] != self.n_channels:
-                        # Wrong number of channels - skip or adapt
-                        if img.shape[-1] > self.n_channels:
-                            img = img[..., :self.n_channels]
-                        else:
-                            # Pad with repeated last channel
-                            pad = self.n_channels - img.shape[-1]
-                            img = np.concatenate([img] + [img[..., -1:]] * pad, axis=-1)
+                    img = _to_hwc(img, self.n_channels)
+                    if img is None:
+                        _warn_channel_mismatch(fname, self.n_channels)
+                        continue
             else:
                 # Single channel (2D)
                 if img.ndim == 3:
@@ -411,14 +424,10 @@ class NucleiPatchDatasetSAM2(Dataset):
                 if img.ndim == 2:
                     img = np.stack([img] * self.n_channels, axis=-1)
                 elif img.ndim == 3:
-                    if img.shape[0] == self.n_channels and img.shape[0] < img.shape[1]:
-                        img = np.transpose(img, (1, 2, 0))
-                    elif img.shape[-1] != self.n_channels:
-                        if img.shape[-1] > self.n_channels:
-                            img = img[..., :self.n_channels]
-                        else:
-                            pad = self.n_channels - img.shape[-1]
-                            img = np.concatenate([img] + [img[..., -1:]] * pad, axis=-1)
+                    img = _to_hwc(img, self.n_channels)
+                    if img is None:
+                        _warn_channel_mismatch(fname, self.n_channels)
+                        continue
             else:
                 if img.ndim == 3:
                     img = img.mean(axis=-1)
@@ -437,6 +446,9 @@ class NucleiPatchDatasetSAM2(Dataset):
             if len(pos) > 0:
                 self._positive_pixels[fname] = pos
 
+        # Sample only from pairs that loaded, so skipped crops never become zero tiles.
+        self.images = [f for f in self.images
+                       if os.path.join(self.img_dir, f) in self._img_cache]
         print(f"Cached {len(self._img_cache)} pairs, {loaded_sam2} SAM2 features")
 
     def __len__(self):
@@ -1351,6 +1363,14 @@ class TrainWorker(QThread):
                 else:
                     train_ds = NucleiPatchDataset(train_images, train_masks, tile=tile_size, fg_ratio=0.5,
                                                   n_channels=n_channels, uses_z_coord=add_z_coord)
+
+                if len(train_ds) == 0:
+                    msg = (f"No usable training crops in {train_images} for "
+                           f"n_channels={n_channels}. Crops captured under a different "
+                           f"architecture have the wrong channel count - re-capture them.")
+                    self.log.emit(msg)
+                    self.finished.emit(False, msg)
+                    return
 
                 val_ds = None
                 if val_images and val_masks and os.path.exists(val_images):
